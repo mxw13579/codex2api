@@ -841,6 +841,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				log.Printf("Responses WebSocket upstream close 1009; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
+			if shouldFallbackWebsocketHandshakeForbiddenToHTTP(reqErr, useWebsocket, account.OpenAIResponsesUsesUpstreamWebsocket()) {
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketHandshakeForbiddenFallbackSource)
+				log.Printf("Responses WebSocket handshake 403; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				continue
+			}
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
 			shouldRetry := retryEnabled && retryable && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)

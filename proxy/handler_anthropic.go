@@ -1022,6 +1022,12 @@ func (h *Handler) Messages(c *gin.Context) {
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
+			if shouldFallbackWebsocketHandshakeForbiddenToHTTP(reqErr, useWebsocket, account.OpenAIResponsesUsesUpstreamWebsocket()) {
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketHandshakeForbiddenFallbackSource)
+				log.Printf("上游 WebSocket 握手 403，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				continue
+			}
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
 			shouldRetry := false
 			if retryable {

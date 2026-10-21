@@ -180,6 +180,26 @@ func TestShouldFallbackWebsocketMessageTooBigToHTTP(t *testing.T) {
 	}
 }
 
+func TestShouldFallbackWebsocketHandshakeForbiddenToHTTP(t *testing.T) {
+	handshake403 := errors.New("websocket handshake failed: websocket: bad handshake (HTTP 403 Forbidden); Cf-Ray=a4dd5f194948dc9c-FRA")
+	if !shouldFallbackWebsocketHandshakeForbiddenToHTTP(handshake403, true, false) {
+		t.Fatal("Cloudflare WebSocket handshake 403 should fall back to HTTP")
+	}
+	if shouldFallbackWebsocketHandshakeForbiddenToHTTP(handshake403, false, false) {
+		t.Fatal("an HTTP attempt must not fall back again")
+	}
+	if shouldFallbackWebsocketHandshakeForbiddenToHTTP(handshake403, true, true) {
+		t.Fatal("accounts that require upstream WebSocket must not fall back")
+	}
+	handshake401 := errors.New("websocket handshake failed: websocket: bad handshake (HTTP 401 Unauthorized)")
+	if shouldFallbackWebsocketHandshakeForbiddenToHTTP(handshake401, true, false) {
+		t.Fatal("handshake 401 is an account error and must not use the 403 fallback")
+	}
+	if shouldFallbackWebsocketHandshakeForbiddenToHTTP(errors.New("dial tcp timeout"), true, false) {
+		t.Fatal("plain transport errors must not use the 403 fallback")
+	}
+}
+
 func TestWebsocketMessageTooBigSource(t *testing.T) {
 	readLimitErr := errors.New("websocket read error: websocket: read limit exceeded")
 	if got := classifyTransportFailure(readLimitErr); got != upstreamErrorKindMessageTooBig {

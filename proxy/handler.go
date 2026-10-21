@@ -2238,6 +2238,28 @@ func isWebsocketMessageTooBigOutcome(outcome streamOutcome) bool {
 	return outcome.failureKind == upstreamErrorKindMessageTooBig
 }
 
+const websocketHandshakeForbiddenFallbackSource = "handshake_403"
+
+// isWebsocketHandshakeForbiddenError 识别上游 WebSocket 升级被 HTTP 403 拒绝。
+// Cf-Ray 说明拦截发生在 Cloudflare，多半是出口或升级请求被拦，不是账号失效。
+// proxy 不能反向导入 wsrelay 的类型，所以只匹配稳定的错误文本。
+func isWebsocketHandshakeForbiddenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "websocket handshake failed") && strings.Contains(msg, "(HTTP 403")
+}
+
+// shouldFallbackWebsocketHandshakeForbiddenToHTTP 在同一次请求里把被拦的
+// WebSocket 升级改走 HTTP。必须走上游 WebSocket 的中转账号不能降级。
+func shouldFallbackWebsocketHandshakeForbiddenToHTTP(err error, useWebsocket, accountRequiresUpstreamWS bool) bool {
+	if !useWebsocket || accountRequiresUpstreamWS {
+		return false
+	}
+	return isWebsocketHandshakeForbiddenError(err)
+}
+
 func shouldFallbackWebsocketMessageTooBigToHTTP(outcome streamOutcome, useWebsocket bool, wroteAnyBody bool, ctxErr, writeErr error) bool {
 	if !useWebsocket || !isWebsocketMessageTooBigOutcome(outcome) {
 		return false
@@ -5223,6 +5245,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
+			if shouldFallbackWebsocketHandshakeForbiddenToHTTP(reqErr, useWebsocket, account.OpenAIResponsesUsesUpstreamWebsocket()) {
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketHandshakeForbiddenFallbackSource)
+				log.Printf("上游 WebSocket 握手 403，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/responses, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				continue
+			}
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
 			shouldRetry := false
 			if retryable {
@@ -7297,6 +7325,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
 				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()))
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
+				continue
+			}
+			if shouldFallbackWebsocketHandshakeForbiddenToHTTP(reqErr, useWebsocket, account.OpenAIResponsesUsesUpstreamWebsocket()) {
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketHandshakeForbiddenFallbackSource)
+				log.Printf("上游 WebSocket 握手 403，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/chat/completions, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
 				continue
 			}
 			retryable := isRetryableRequestErrorForContext(c.Request.Context(), reqErr, continuousRetryPolicy)
