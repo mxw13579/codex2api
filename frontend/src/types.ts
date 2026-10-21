@@ -2355,6 +2355,8 @@ export interface SystemSettings {
   smart_pacing_min_concurrency: number
   smart_pacing_windows: string
   ignore_usage_limit_status: boolean
+  /** Codex 瞬时 429 账号级暂停；本分支默认关闭，仅通过管理设置持久化。 */
+  codex_transient_429_cooldown_enabled: boolean
 }
 
 export interface SetupHintsResponse {

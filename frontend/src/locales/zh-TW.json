@@ -586,6 +586,8 @@
     "autoResetCreditsDesc": "分別控制額度窗口用盡和重置券臨期時的自動消耗，兩項預設關閉，每輪每帳號最多消耗一次。",
     "autoResetCreditsOnExhaustionEnabled": "7d 窗口用盡後自動重置",
     "autoResetCreditsOnExhaustionDesc": "每 5 分鐘檢查官方 Codex 帳號（含 Business Pro Lite）。僅當上游確認 7d 長窗口（team 等為 30 天月窗）達到 100%，且有可用重置次數時消耗一次，無需等待券臨期；5h 窗口用盡不會觸發。預設關閉；開啟後立即檢查。",
+    "codexTransient429Cooldown": "瞬時 429 帳號暫停",
+    "codexTransient429CooldownDesc": "本分支預設關閉。開啟沿用原策略：瞬時 429 觸發整個 Codex 帳號的 15s→300s 退避暫停；關閉不再施加此類暫停，並立即解除既有瞬時暫停。真實 usage_limit/5h/7d 配額冷卻及驗證冷卻保留；429 錯誤、重試預算和 Retry-After 仍按原邏輯處理。關閉可能增加 429 請求負載。切換自動儲存並立即生效，無需重新啟動。",
     "codexOAuthKeepalive": "惰性模式下保持 Codex 授權",
     "codexOAuthKeepaliveDesc": "開啟後，惰性模式仍會為即將到期的 Codex Token 續期，包括額度冷卻中的帳號；不會解除冷卻或發送生成請求。預設關閉。",
     "codexTelemetry": "用戶端遙測（實驗性）",

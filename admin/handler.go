@@ -9362,6 +9362,7 @@ type settingsResponse struct {
 	MaxRateLimitRetries               int      `json:"max_rate_limit_retries"`
 	RetryIntervalMS                   int      `json:"retry_interval_ms"`
 	TransportRetryPolicy              string   `json:"transport_retry_policy"`
+	CodexTransient429CooldownEnabled  bool     `json:"codex_transient_429_cooldown_enabled"`
 	ContinuousRetryEnabled            bool     `json:"continuous_retry_enabled"`
 	ContinuousRetryCatchAll           bool     `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories         []string `json:"continuous_retry_categories"`
@@ -9545,6 +9546,7 @@ type updateSettingsReq struct {
 	MaxRateLimitRetries                 *int                             `json:"max_rate_limit_retries"`
 	RetryIntervalMS                     *int                             `json:"retry_interval_ms"`
 	TransportRetryPolicy                *string                          `json:"transport_retry_policy"`
+	CodexTransient429CooldownEnabled    *bool                            `json:"codex_transient_429_cooldown_enabled"`
 	ContinuousRetryEnabled              *bool                            `json:"continuous_retry_enabled"`
 	ContinuousRetryCatchAll             *bool                            `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories           *[]string                        `json:"continuous_retry_categories"`
@@ -10284,6 +10286,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
+		CodexTransient429CooldownEnabled:    h.store.CodexTransient429CooldownEnabled(),
 		BackgroundImage:                     bgCfg.Image,
 		BackgroundOpacity:                   bgCfg.Opacity,
 		BackgroundBlur:                      bgCfg.Blur,
@@ -11996,6 +11999,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.CodexTransient429CooldownEnabled != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Codex 临时 429 冷却设置失败，设置未生效")
+			return
+		}
 		if req.CodexImagesMainModel != nil {
 			writeError(c, http.StatusInternalServerError, "保存生图设置失败，文本驱动模型未生效")
 			return
@@ -12174,6 +12181,17 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		responseCacheSettings = latest
 	}
 
+	// Persist the narrow switch only after the other requested saves succeeded.
+	// Never publish a stale full-settings snapshot or a value from a failed write.
+	if req.CodexTransient429CooldownEnabled != nil {
+		enabled := *req.CodexTransient429CooldownEnabled
+		if updateErr := h.db.UpdateCodexTransient429CooldownEnabled(c.Request.Context(), enabled); updateErr != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Codex 临时 429 冷却设置失败，设置未生效")
+			return
+		}
+		h.store.SetCodexTransient429CooldownEnabled(enabled)
+	}
+
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {
 		h.store.TriggerAutoCleanupAsync()
 	}
@@ -12192,6 +12210,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,
+		CodexTransient429CooldownEnabled:    h.store.CodexTransient429CooldownEnabled(),
 		BackgroundImage:                     bgCfg.Image,
 		BackgroundOpacity:                   bgCfg.Opacity,
 		BackgroundBlur:                      bgCfg.Blur,

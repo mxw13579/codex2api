@@ -4500,7 +4500,8 @@ func TestApply429CooldownSparkUsageLimitDoesNotApplyFreePlanMetadata(t *testing.
 }
 
 func TestApplyResponseFailedSemantic429IgnoresOuterHeadersForOrdinaryModel(t *testing.T) {
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5", CodexTransient429CooldownEnabled: true})
+	defer store.Stop()
 	account := &auth.Account{DBID: 204, AccessToken: "token", PlanType: "plus", Status: auth.StatusReady}
 	account.SetUsageSnapshot5h(40, time.Now().Add(2*time.Hour))
 	handler := &Handler{store: store}
@@ -4553,7 +4554,8 @@ func TestApplyResponseFailedSemantic429KeepsExplicitModelCapacityScoped(t *testi
 }
 
 func TestApplyResponseFailedSemantic429SparkUsesTransientAccountCooldown(t *testing.T) {
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5", CodexTransient429CooldownEnabled: true})
+	defer store.Stop()
 	account := &auth.Account{DBID: 205, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
 	account.SetUsageSnapshot5h(40, time.Now().Add(2*time.Hour))
 	handler := &Handler{store: store}
@@ -4875,7 +4877,8 @@ func TestSyncCodexUsageStateUpdatesPlanTypeFromHeader(t *testing.T) {
 }
 
 func TestApply429CooldownUnknown429UsesAccountCooldown(t *testing.T) {
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5", CodexTransient429CooldownEnabled: true})
+	defer store.Stop()
 	account := &auth.Account{DBID: 102, PlanType: "pro"}
 
 	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.5")

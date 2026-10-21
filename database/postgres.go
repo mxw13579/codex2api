@@ -1377,7 +1377,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			response_cache_reconstruct_max_bytes BIGINT NOT NULL DEFAULT 67108864,
 			response_cache_write_policy VARCHAR(20) NOT NULL DEFAULT 'always',
 			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
-			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608
+			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608,
+			codex_transient_429_cooldown_enabled BOOLEAN NOT NULL DEFAULT FALSE
 		);
 	CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
 		api_key_id BIGINT NOT NULL,
@@ -1561,6 +1562,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_transient_429_cooldown_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
@@ -2409,6 +2411,7 @@ type SystemSettings struct {
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	ContinuousRetryPolicy              string // JSON: database.ContinuousRetryPolicy
+	CodexTransient429CooldownEnabled   bool   // Default false; write only via UpdateCodexTransient429CooldownEnabled.
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
@@ -2646,7 +2649,9 @@ func NormalizeSchedulerEngine(value string, legacyFastEnabled bool) string {
 	}
 }
 
-// GetSystemSettings 加载全局设置
+// GetSystemSettings 加载全局设置。
+// 无行时保留 nil, nil 契约，由调用方使用首次启动默认值；
+// CodexTransient429CooldownEnabled 的零值默认关闭，不因读取而创建设置行。
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s := &SystemSettings{}
 	// 模板缓存列仍留在表里，读取后丢弃，避免改动既有 SELECT 列序。
@@ -2661,6 +2666,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(scheduler_engine, ''),
 		       COALESCE(max_retries, 2),
 		       COALESCE(max_rate_limit_retries, 1),
+		       COALESCE(codex_transient_429_cooldown_enabled, false),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
@@ -2778,7 +2784,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.SiteName, &s.SiteLogo,
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.SchedulerEngine, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.SchedulerEngine, &s.MaxRetries, &s.MaxRateLimitRetries,
+		&s.CodexTransient429CooldownEnabled, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
@@ -3022,6 +3029,9 @@ func NormalizeCodexFingerprintDefaultMode(mode string) string {
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
 // codex_synced_cli_version 与 model_pricing_* 由各自的窄更新独立维护；冲突更新时
 // 保留数据库当前值，避免管理员保存其他设置时回滚后台同步刚写入的数据。
+// continuous_retry_policy 和 codex_transient_429_cooldown_enabled 完全不在本方法中写入，
+// 分别使用 UpdateContinuousRetryPolicy 和 UpdateCodexTransient429CooldownEnabled，
+// 避免无关设置的陈旧快照覆盖新值；首次插入也使用数据库默认值。
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	reasoningEffortModels := strings.TrimSpace(s.ReasoningEffortModels)
 	if reasoningEffortModels == "" {

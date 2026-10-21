@@ -5294,6 +5294,8 @@
     "smartPacingMinConcurrencyHint": "配速时并发不会低于该值，保证账号不被完全饿死。默认 1。",
     "globalAutoPausePlaceholder": "留空或 0 表示不启用",
     "globalAutoPauseHint": "填 0 表示不启用全局默认阈值。优先级: 账号 > 分组 > 全局。",
+    "codexTransient429Cooldown": "瞬时 429 账号暂停",
+    "codexTransient429CooldownDesc": "本分支默认关闭。开启沿用原策略：瞬时 429 触发整个 Codex 账号的 15s→300s 退避暂停；关闭不再施加此类暂停，并立即解除已有瞬时暂停。真实 usage_limit/5h/7d 配额冷却及鉴权冷却保留；429 错误、重试预算和 Retry-After 仍按原逻辑处理。关闭可能增加 429 请求负载。切换自动保存并热生效，无需重启。",
     "ignoreUsageLimitStatus": "Responses 权威限流判定",
     "ignoreUsageLimitStatusHint": "用量窗口达到 100% 时，仅允许携带 Codex turn state 的已绑定活跃轮次继续；新轮次仍会被阻止，/v1/responses 返回 usage_limit_reached 时停止续传。账号级设置可覆盖此全局值。",
     "codexContinueThinking": "思考截断自动续想",

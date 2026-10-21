@@ -3937,6 +3937,8 @@ type Store struct {
 	autoCleanupBatch                   atomic.Bool
 	maxRetries                         atomic.Int64 // 请求失败最大重试次数（换号重试）
 	maxRateLimitRetries                atomic.Int64 // 429 最大换号重试次数
+	transient429PolicyMu               sync.Mutex
+	transient429Policy                 atomic.Pointer[transient429CooldownPolicy]
 	backgroundRefreshInterval          atomic.Int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge                   atomic.Int64 // 用量探针快照最大缓存时长（ns）
 	usageProbeConcurrency              atomic.Int64 // 用量探针并行度
@@ -4212,7 +4214,7 @@ func (s *Store) setCachedAccountCooldown(accountID int64, reason string, resetAt
 // Publication is outside Account.mu and FastScheduler.mu. Native cache drivers
 // merge atomically; older/custom TokenCache implementations retain SetRuntime.
 func (s *Store) cacheAccountCooldownRecord(accountID int64, record runtimeCooldownRecord) runtimeCooldownRecord {
-	if s == nil || s.tokenCache == nil || accountID == 0 {
+	if s == nil || s.tokenCache == nil || accountID == 0 || s.ignoreTransient429CooldownRecord(record) {
 		return record
 	}
 	ttl, ok := cooldownTTL(record.ResetAt)
@@ -4265,6 +4267,11 @@ func (s *Store) getCachedAccountCooldown(accountID int64) (runtimeCooldownRecord
 		return runtimeCooldownRecord{}, false
 	}
 	record.Reason = normalizeCooldownReason(record.Reason)
+	if s.ignoreTransient429CooldownRecord(record) {
+		// Leave the shared record intact: deleting by account ID could race a
+		// stronger quota/auth publication, or affect a replica still draining.
+		return runtimeCooldownRecord{}, false
+	}
 	return record, true
 }
 
@@ -4296,6 +4303,12 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 	reason := normalizeCooldownReason(record.Reason)
 	baseLimit := s.maxConcurrency.Load()
 	acc.mu.Lock()
+	// Recheck under the account lock: the admin switch may have changed
+	// after the Redis read or while a transient publication was in flight.
+	if s.ignoreTransient429CooldownRecord(record) {
+		acc.mu.Unlock()
+		return
+	}
 	current := runtimeCooldownRecord{Reason: acc.CooldownReason, ResetAt: acc.CooldownUtil}
 	if acc.isTransientRateLimitCooldownLocked() {
 		current.Kind = cache.CooldownKindTransient
@@ -4359,6 +4372,9 @@ func (s *Store) accountHasCachedCooldown(acc *Account) bool {
 		return false
 	}
 	s.applyCachedAccountCooldown(acc, record)
+	if s.ignoreTransient429CooldownRecord(record) {
+		return false
+	}
 	if acc.IsAntigravityAPI() {
 		acc.mu.RLock()
 		recoverable := acc.antigravityUnauthorizedRecoveryLocked(time.Now())
@@ -4734,6 +4750,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		oauthRefreshLocks:          make(map[string]*oauthRefreshLocalLock),
 	}
 	s.maxConcurrency.Store(int64(settings.MaxConcurrency))
+	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: settings.CodexTransient429CooldownEnabled})
 	s.usageFramePersist.start(s)
 	s.testConcurrency.Store(int64(settings.TestConcurrency))
 	s.codexRequestCompression.Store(settings.CodexRequestCompression)

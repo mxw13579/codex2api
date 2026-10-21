@@ -3,6 +3,29 @@ import test from "node:test";
 
 import { buildWritableSettingsPayload } from "./settingsPayload.ts";
 
+for (const enabled of [false, true]) {
+  test(`writable settings payload preserves transient Codex 429 account pause = ${enabled}`, () => {
+    const settings = Object.freeze({
+      site_name: "CodexProxy",
+      codex_transient_429_cooldown_enabled: enabled,
+      ignore_usage_limit_status: false,
+      max_rate_limit_retries: 1,
+      response_cache_config_generation: 7,
+    });
+
+    const payload = buildWritableSettingsPayload(settings);
+
+    assert.deepEqual(JSON.parse(JSON.stringify(payload)), {
+      site_name: "CodexProxy",
+      codex_transient_429_cooldown_enabled: enabled,
+      ignore_usage_limit_status: false,
+      max_rate_limit_retries: 1,
+    });
+    assert.equal(settings.codex_transient_429_cooldown_enabled, enabled);
+    assert.equal(settings.response_cache_config_generation, 7);
+  });
+}
+
 test("writable settings payload omits response cache generation regardless of value", () => {
   for (const generation of [7, 0, null, undefined]) {
     const settings = {

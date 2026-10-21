@@ -19,6 +19,88 @@ const (
 	transientRateLimitStableReset = 5 * time.Minute
 )
 
+// transient429CooldownPolicy is published atomically so readers cannot mix
+// the enabled flag with a cutoff from a different admin update.
+type transient429CooldownPolicy struct {
+	enabled      bool
+	ignoreBefore time.Time
+}
+
+// CodexTransient429CooldownEnabled reports whether transient Codex 429s freeze
+// the account. A bare Store retains the legacy policy; NewStore loads the
+// persisted setting, whose default in this fork is false.
+func (s *Store) CodexTransient429CooldownEnabled() bool {
+	if s == nil {
+		return true
+	}
+	policy := s.transient429Policy.Load()
+	return policy == nil || policy.enabled
+}
+
+// SetCodexTransient429CooldownEnabled applies a persisted admin setting live.
+// It releases only positively identified transient pauses, never quota/auth
+// cooldowns, and does not delete shared cache entries by account ID.
+func (s *Store) SetCodexTransient429CooldownEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.transient429PolicyMu.Lock()
+	defer s.transient429PolicyMu.Unlock()
+	if s.CodexTransient429CooldownEnabled() == enabled {
+		return
+	}
+	// Re-enabling must not revive a pre-toggle Redis record, including a
+	// delayed publication from an attempt already in flight when disabled.
+	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: enabled, ignoreBefore: time.Now()})
+	if enabled {
+		return
+	}
+	for _, acc := range s.accountSnapshotAccounts() {
+		if acc == nil {
+			continue
+		}
+		acc.mu.Lock()
+		cleared := acc.clearTransient429CooldownLocked()
+		if cleared {
+			acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
+		}
+		acc.mu.Unlock()
+		if cleared {
+			s.fastSchedulerUpdate(acc)
+		}
+	}
+	s.notifySchedulerAvailability()
+}
+
+// ignoreTransient429CooldownRecord only bypasses explicit transient records.
+// A missing kind or a quota/auth reason must retain its protective semantics.
+func (s *Store) ignoreTransient429CooldownRecord(record runtimeCooldownRecord) bool {
+	if s == nil || record.Kind != cache.CooldownKindTransient || normalizeCooldownReason(record.Reason) != ResponsesRateLimitedCooldownReason {
+		return false
+	}
+	policy := s.transient429Policy.Load()
+	return policy != nil && (!policy.enabled || (!policy.ignoreBefore.IsZero() && !record.UpdatedAt.After(policy.ignoreBefore)))
+}
+
+// clearTransient429CooldownLocked resets the transient ladder and timer, but
+// clears account status/deadline only when they still belong to that throttle.
+// LastRateLimitedAt remains available for scoring and in-flight-success fences.
+func (a *Account) clearTransient429CooldownLocked() bool {
+	cleared := a.isTransientRateLimitCooldownLocked()
+	if cleared {
+		a.Status = StatusReady
+		a.CooldownUtil = time.Time{}
+		a.CooldownReason = ""
+	}
+	a.transientRateLimitBackoff = 0
+	a.transientRateLimitUntil = time.Time{}
+	if a.transientRateLimitTimer != nil {
+		a.transientRateLimitTimer.Stop()
+		a.transientRateLimitTimer = nil
+	}
+	return cleared
+}
+
 // nextTransientRateLimitCooldown returns the freeze duration for the given
 // backoff level, never shorter than Retry-After and never longer than the cap.
 func nextTransientRateLimitCooldown(level int, retryAfter time.Duration) time.Duration {
@@ -49,22 +131,40 @@ func nextTransientRateLimitCooldown(level int, retryAfter time.Duration) time.Du
 // Unlike a quota cooldown the freeze is seconds long, so it neither triggers
 // a WHAM usage probe nor is written to the database: under a burst that would
 // turn every throttled account into one probe plus one write per window.
-// The scheduler and the cross-instance cooldown cache are still updated.
+// The scheduler and the cross-instance cooldown cache are still updated when
+// enabled. When disabled, only failure evidence/scoring is recorded; no new
+// account pause, recovery timer, quota probe or cooldown-cache write is created.
 func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration) time.Duration {
 	if s == nil || acc == nil {
 		return nextTransientRateLimitCooldown(0, retryAfter)
 	}
-	now := time.Now()
 	acc.mu.Lock()
+	now := time.Now()
 	until := acc.CooldownUtil
 	sameWindow := acc.Status == StatusCooldown && until.After(now)
+	// A quota/auth window cannot be replaced, shortened or cleared by a
+	// throttle, even when the transient-pause switch is off.
+	if sameWindow && !acc.isTransientRateLimitCooldownLocked() {
+		acc.mu.Unlock()
+		return until.Sub(now)
+	}
+	if !s.CodexTransient429CooldownEnabled() {
+		acc.clearTransient429CooldownLocked()
+		if accountDispatchBlocked(acc) || acc.Status == StatusError || acc.healthTierLocked() == HealthTierBanned {
+			acc.mu.Unlock()
+			return 0
+		}
+		acc.LastRateLimitedAt = now
+		acc.LastFailureAt = now
+		acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+		acc.SuccessStreak = 0
+		acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
+		acc.mu.Unlock()
+		s.fastSchedulerUpdate(acc)
+		return 0
+	}
 	if sameWindow {
 		remaining := until.Sub(now)
-		// A quota/auth window cannot be replaced or extended by a throttle.
-		if !acc.isTransientRateLimitCooldownLocked() {
-			acc.mu.Unlock()
-			return remaining
-		}
 		acc.LastRateLimitedAt = now
 		extension := now.Add(min(retryAfter, TransientRateLimitBackoffMax))
 		if retryAfter <= 0 || !extension.After(until) {

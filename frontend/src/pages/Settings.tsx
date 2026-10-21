@@ -2553,6 +2553,7 @@ export default function Settings() {
     const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
       ...cacheNormalized,
+      codex_transient_429_cooldown_enabled: cacheNormalized.codex_transient_429_cooldown_enabled ?? false,
       codex_images_main_model: cacheNormalized.codex_images_main_model ?? '',
       codex_telemetry_enabled: cacheNormalized.codex_telemetry_enabled ?? false,
       codex_telemetry_timing_debug: cacheNormalized.codex_telemetry_timing_debug ?? false,
@@ -2744,6 +2745,7 @@ export default function Settings() {
     smart_pacing_min_concurrency: 1,
     smart_pacing_windows: '5h,7d',
     ignore_usage_limit_status: false,
+    codex_transient_429_cooldown_enabled: false,
   })
   const continuousRetryStatusCodesText = (settingsForm.continuous_retry_status_codes ?? []).join(',')
   const continuousRetryErrorCodesText = (settingsForm.continuous_retry_error_codes ?? []).join(',')
@@ -4082,6 +4084,18 @@ export default function Settings() {
                       <Switch
                         checked={settingsForm.ignore_usage_limit_status}
                         onCheckedChange={(checked) => autoSaveBooleanField('ignore_usage_limit_status', checked)}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.codexTransient429Cooldown')}
+                      description={t('settings.codexTransient429CooldownDesc')}
+                      layout="switch"
+                      channels={['codex']}
+                    >
+                      <Switch
+                        aria-label={t('settings.codexTransient429Cooldown')}
+                        checked={settingsForm.codex_transient_429_cooldown_enabled}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_transient_429_cooldown_enabled', checked)}
                       />
                     </SettingField>
                     <SettingField label={t('settings.smartPacingEnabled')} description={t('settings.smartPacingEnabledHint')} layout="switch">

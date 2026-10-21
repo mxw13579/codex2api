@@ -14,6 +14,7 @@ func newProxyPremiumTestStore() *auth.Store {
 	return auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:                   4,
 		TestConcurrency:                  1,
+		CodexTransient429CooldownEnabled: true,
 		TestModel:                        "gpt-5.4",
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,

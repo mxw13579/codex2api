@@ -199,9 +199,10 @@ func TestTransientRateLimitDoesNotArmUsageProbe(t *testing.T) {
 
 func newTransientRateLimitTestStore() *Store {
 	return NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:  4,
-		TestConcurrency: 1,
-		TestModel:       "gpt-5.4",
+		MaxConcurrency:                   4,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		CodexTransient429CooldownEnabled: true,
 	})
 }
 

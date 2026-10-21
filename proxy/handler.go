@@ -8671,6 +8671,7 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		// here would slide the same cooldown forward on every in-flight 429.
 		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))
 		decision.Cooldown = applied
+		decision.ResetAt = time.Time{}
 		if applied > 0 {
 			decision.ResetAt = time.Now().Add(applied)
 		}
@@ -8745,7 +8746,11 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			}
 			return decision
 		}
-		log.Printf("账号 %d 被限速 (plan=%s, reason=%s)，冷却到 %s", account.ID(), account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
+		if decision.ResetAt.IsZero() {
+			log.Printf("账号 %d 收到瞬时 429 (plan=%s, reason=%s)，按设置不暂停账号", account.ID(), account.GetPlanType(), decision.Reason)
+		} else {
+			log.Printf("账号 %d 被限速 (plan=%s, reason=%s)，冷却到 %s", account.ID(), account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
+		}
 		return decision
 	case http.StatusUnauthorized:
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号

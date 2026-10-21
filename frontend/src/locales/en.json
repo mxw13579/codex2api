@@ -5295,6 +5295,8 @@
     "smartPacingMinConcurrencyHint": "Concurrency will not drop below this value while pacing, so an account is never fully starved. Default is 1.",
     "globalAutoPausePlaceholder": "Blank or 0 to disable",
     "globalAutoPauseHint": "Enter 0 to disable global default. Priority: Account > Group > Global.",
+    "codexTransient429Cooldown": "Transient 429 Account Pause",
+    "codexTransient429CooldownDesc": "Off by default in this fork. On retains the original policy: transient 429s pause the entire Codex account with 15s→300s backoff. Off skips that cooldown and immediately releases existing transient pauses. Real usage_limit/5h/7d quota and auth cooldowns remain; 429 errors, retry budgets, and Retry-After keep their existing behavior. Turning this off can increase 429 request load. Changes save immediately and apply without a restart.",
     "ignoreUsageLimitStatus": "Responses-Authoritative Limits",
     "ignoreUsageLimitStatusHint": "Allow only bound active turns carrying Codex turn state to continue when a usage window reports 100%. Fresh turns remain blocked, and /v1/responses usage_limit_reached stops continuation. Account overrides take priority.",
     "codexContinueThinking": "Auto-Continue Truncated Reasoning",

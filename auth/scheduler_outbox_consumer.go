@@ -705,17 +705,17 @@ func (s *Store) reloadAccountGroupRoutingByID(ctx context.Context, groupID int64
 	return nil
 }
 
-// reloadSchedulerEngineSetting is completed by the persisted setting layer.
-// Keeping it as a method now makes settings events forward-compatible with a
-// rolling deployment where older replicas do not know the new column yet.
+// reloadSchedulerEngineSetting also applies the persisted transient-429 pause
+// switch on every replica. Pinning the scheduler engine must not prevent other
+// live settings from propagating through the outbox.
 func (s *Store) reloadSchedulerEngineSetting(ctx context.Context) error {
-	if strings.TrimSpace(os.Getenv("CODEX_SCHEDULER_ENGINE")) != "" {
-		return nil
-	}
 	settings, err := s.db.GetSystemSettings(ctx)
 	if err != nil || settings == nil {
 		return err
 	}
-	s.SetSchedulerEngine(settings.SchedulerEngine)
+	s.SetCodexTransient429CooldownEnabled(settings.CodexTransient429CooldownEnabled)
+	if strings.TrimSpace(os.Getenv("CODEX_SCHEDULER_ENGINE")) == "" {
+		s.SetSchedulerEngine(settings.SchedulerEngine)
+	}
 	return nil
 }
