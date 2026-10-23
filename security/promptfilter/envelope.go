@@ -1149,8 +1149,10 @@ func (b *envelopeBuilder) appendTypedInputItem(item gjson.Result, currentUser bo
 		b.appendResult(OriginSessionContext, "assistant", firstExistingResult(item, "summary", "content", "text"))
 	case "summary_text", "compaction", "context_compaction":
 		b.appendResult(OriginSessionContext, "context", firstExistingResult(item, "summary", "content", "text"))
-	case "compaction_trigger", "item_reference":
+	case "compaction_trigger", "item_reference", "configuration_update":
 		// Control/reference items carry no end-user prompt text.
+		// configuration_update only names a reasoning effort; that value is
+		// not a user prompt and must stay out of the detector.
 		b.appendAttachmentReferences(item, "context")
 	case "encrypted_content":
 		// Opaque server-side encrypted continuation payload (gpt-5.6 store=false
@@ -1212,7 +1214,7 @@ func recognizedEnvelopeContentBlockType(blockType string) bool {
 		"tool_search_call", "custom_tool_call", "mcp_tool_call", "mcp_call", "mcp_list_tools",
 		"mcp_approval_request", "mcp_approval_response", "additional_tools", "code_interpreter_call",
 		"computer_call", "file_search_call", "image_generation_call", "web_search_call", "tool_use", "agent_message",
-		"compaction_trigger", "item_reference", "encrypted_content":
+		"compaction_trigger", "item_reference", "configuration_update", "encrypted_content":
 		return true
 	default:
 		return false
