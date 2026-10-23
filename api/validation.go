@@ -705,17 +705,20 @@ func ValidateInput() ValidationRule {
 			"web_search_call":         true,
 			"compaction":              true,
 			"compaction_trigger":      true,
-			"context_compaction":      true,
-			"encrypted_content":       true,
-			"input_text":              true,
-			"input_image":             true,
-			"output_text":             true,
-			"refusal":                 true,
-			"input_file":              true,
-			"computer_screenshot":     true,
-			"summary_text":            true,
-			"file":                    true,
-			"image":                   true,
+			// GPT-6 在历史中的位置控制项，用来切换后续 reasoning effort。
+			// effort 是开放字符串，校验只认类型，字段原样转发。
+			"configuration_update": true,
+			"context_compaction":   true,
+			"encrypted_content":    true,
+			"input_text":           true,
+			"input_image":          true,
+			"output_text":          true,
+			"refusal":              true,
+			"input_file":           true,
+			"computer_screenshot":  true,
+			"summary_text":         true,
+			"file":                 true,
+			"image":                true,
 		}
 
 		// 单次 ForEach 遍历，避免按下标 value.Get("i.type") 随机访问——gjson 数组按
