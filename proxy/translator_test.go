@@ -4213,6 +4213,23 @@ func TestReasoningReplayOmitsDisplayContent(t *testing.T) {
 	}
 }
 
+func TestPrepareResponsesBodyPreservesConfigurationUpdate(t *testing.T) {
+	raw := []byte(`{"model":"gpt-6-astra","input":[{"type":"configuration_update","reasoning":{"effort":"model-specific"}},{"type":"message","role":"user","content":"Reply with exactly OK."}],"reasoning":{"effort":"low"},"stream":true}`)
+	got, _ := PrepareResponsesBody(raw)
+	for path, want := range map[string]string{
+		"input.0.type":             "configuration_update",
+		"input.0.reasoning.effort": "model-specific",
+		"input.1.type":             "message",
+		"input.1.role":             "user",
+		"input.1.content":          "Reply with exactly OK.",
+		"reasoning.effort":         "low",
+	} {
+		if value := gjson.GetBytes(got, path).String(); value != want {
+			t.Errorf("%s = %q, want %q\nbody=%s", path, value, want, got)
+		}
+	}
+}
+
 func TestPrepareResponsesBodyPreservesNativeAgentContext(t *testing.T) {
 	raw := []byte(`{"model":"gpt-5.5","input":[{"type":"agent_message","id":"amsg_native","author":"parent","recipient":"child","content":[{"type":"input_text","text":"plain task"},{"type":"encrypted_content","encrypted_content":"gAAAAnative-agent-context"}]}]}`)
 	got, _ := PrepareResponsesBody(raw)
