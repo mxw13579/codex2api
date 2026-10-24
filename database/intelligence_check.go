@@ -229,6 +229,12 @@ func (db *DB) intelligenceChannelExpr() string {
 func (db *DB) intelligenceEligibleSQL() string {
 	return `a.status<>'deleted' AND COALESCE(a.error_message,'')<>'deleted' AND ` + db.intelligenceUpstreamExpr() + ` NOT IN ('grok','antigravity') AND LOWER(COALESCE(a.platform,'openai')) NOT IN ('xai','grok','antigravity','google')`
 }
+
+// intelligenceAutomaticSQL admits scheduled checks only for accounts that opted
+// in and are not manually disabled. Manual checks bypass both switches.
+func intelligenceAutomaticSQL(account, state string) string {
+	return state + `.enabled=TRUE AND COALESCE(` + account + `.enabled,TRUE)=TRUE`
+}
 func intelligencePage(offset, limit int) (int, int) {
 	if offset < 0 {
 		offset = 0

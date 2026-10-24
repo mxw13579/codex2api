@@ -32,7 +32,10 @@ func TestModelCapabilitiesPersistenceAndGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot.ObservedAt = 15
-	snapshot.Models["gpt-5.6-sol"]["context_window"] = json.RawMessage("900")
+	snapshot.Models = map[string]map[string]json.RawMessage{"gpt-5.6-sol": {
+		"context_window":    json.RawMessage("900"),
+		"prefer_websockets": json.RawMessage("true"),
+	}}
 	if err := db.SaveModelCapabilities(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +44,7 @@ func TestModelCapabilitiesPersistenceAndGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := stored[id]
-	if len(got.Models) != 2 || string(got.Models["gpt-5.6-sol"]["context_window"]) != "800" || string(got.Models["gpt-5.6-sol"]["use_responses_lite"]) != "true" {
+	if len(got.Models) != 2 || string(got.Models["gpt-5.6-sol"]["context_window"]) != "800" || string(got.Models["gpt-5.6-sol"]["use_responses_lite"]) != "true" || string(got.Models["gpt-5.6-sol"]["prefer_websockets"]) != "true" {
 		t.Fatalf("partial/stale sync lost capabilities: %+v", got)
 	}
 	if _, err := db.conn.ExecContext(ctx, `UPDATE accounts SET credential_generation=credential_generation+1 WHERE id=$1`, id); err != nil {

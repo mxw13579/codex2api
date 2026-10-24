@@ -140,21 +140,16 @@ func TestGPTImage25UsageAndResponsesModel(t *testing.T) {
 }
 
 func TestGPTImage25OfficialPricingIgnoresBatch(t *testing.T) {
-	body := []byte(`Image generation models
-Standard
-### Grouped Pricing Table data
-| Model | Modality | Input | Cached input | Output |
-| --- | --- | --- | --- | --- |
-| gpt-image-2.5-flare | Image | $8.00 | $2.00 | $30.00 |
-| gpt-image-2.5-flare | Text | $5.00 | $1.25 | - |
-
-Batch
-### Grouped Pricing Table data
-| Model | Modality | Input | Cached input | Output |
-| --- | --- | --- | --- | --- |
-| gpt-image-2.5-flare | Image | $4.00 | $1.00 | $15.00 |
+	body := []byte(`
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Modality</th><th>Input</th><th>Cached input</th><th>Output</th></tr></thead><tbody>
+<tr><td>gpt-image-2.5-flare</td><td>Image</td><td>$8.00</td><td>$2.00</td><td>$30.00</td></tr>
+<tr><td>gpt-image-2.5-flare</td><td>Text</td><td>$5.00</td><td>$1.25</td><td>-</td></tr>
+</tbody></table></section>
+<section data-pricing-tier="batch"><table><thead><tr><th>Model</th><th>Modality</th><th>Input</th><th>Cached input</th><th>Output</th></tr></thead><tbody>
+<tr><td>gpt-image-2.5-flare</td><td>Image</td><td>$4.00</td><td>$1.00</td><td>$15.00</td></tr>
+</tbody></table></section>
 `)
-	prices, err := ParseOpenAIOfficialPricingMarkdown(body)
+	prices, err := ParseOpenAIOfficialPricingHTML(body)
 	if err != nil {
 		t.Fatal(err)
 	}

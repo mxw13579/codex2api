@@ -371,6 +371,9 @@ func main() {
 
 	// 启动后台刷新
 	store.StartBackgroundRefresh()
+	// Antigravity groups summary 周期巡检（Spec §5.3）：随 Store 生命周期启动，
+	// Store.Stop 在关闭 stopCh 前收口。
+	store.StartAntigravityQuotaScheduler()
 	store.TriggerUsageProbeAsync()
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerAutoCleanupAsync()

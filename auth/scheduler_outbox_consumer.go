@@ -329,7 +329,10 @@ func (s *Store) applySchedulerOutboxEvent(ctx context.Context, event database.Sc
 		// admin request. Cross-instance engine/settings pickup is handled by the
 		// persisted scheduler-engine setting when that field is present; unknown
 		// settings events are safe no-ops for older schemas.
-		return s.reloadSchedulerEngineSetting(ctx)
+		engineErr := s.reloadSchedulerEngineSetting(ctx)
+		// 同一张 system_settings 行上的 antigravity_config 只能经这条路径跨实例生效
+		// （Spec §8.2）。两者互不依赖，任一失败都必须上报但不得吞掉另一个。
+		return errors.Join(engineErr, s.reloadAntigravityConfig(ctx))
 	default:
 		return nil
 	}
@@ -576,6 +579,9 @@ func (s *Store) applyPersistentAccountSnapshot(dst, src *Account, enabled bool) 
 	dst.ModelCooldownSecondsOverride = cloneIntPtr(src.ModelCooldownSecondsOverride)
 	dst.ModelCooldownBackoffOverride = cloneBoolPtr(src.ModelCooldownBackoffOverride)
 	dst.SubscriptionExpiresAt = src.SubscriptionExpiresAt
+	// Antigravity 配额事实与失效纪元按 Spec §4.3 原位单调合并：只有事实和门禁派生键
+	// 按 epoch/applied_seq 判定后更新，Account 指针、在途计数与请求绑定保持不变。
+	dst.mergeAntigravityQuotaProjectionLocked(src, identityChanged)
 	if identityChanged {
 		dst.HealthTier = src.HealthTier
 		dst.SuccessStreak = 0
@@ -702,6 +708,71 @@ func (s *Store) reloadAccountGroupRoutingByID(ctx context.Context, groupID int64
 		}
 	}
 	s.notifySchedulerAvailability()
+	return nil
+}
+
+// reloadAntigravityConfig 从 DB 重新载入 antigravity_config 并按 revision 单调应用
+// （Spec §8.2：跨实例的渠道设置只能通过这条路径生效）。
+//
+// revision 回退的检测与基线重建由 ApplyConfiguredAntigravitySettings 负责；这里额外
+// 承担 Task 4 的回写义务：混布窗口的旧写侧会把整包覆盖成不含 quota_* 字段的形态，
+// 而缺失即默认 true 会无痕掩盖止血开关，因此本机仍显式持有的字段必须以 CAS 合并回写。
+func (s *Store) reloadAntigravityConfig(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	raw, err := s.db.GetAntigravityConfigRaw(ctx)
+	if err != nil {
+		return err
+	}
+	next, err := ParseAntigravitySettings(raw)
+	if err != nil {
+		// 库里是不可解析的历史内容：保持本机已生效配置，等下一次合法写入。
+		log.Printf("antigravity_config 解析失败，保持本机已生效配置: %v", err)
+		return nil
+	}
+	// 本机仍显式持有但 DB 已丢失的 quota_* 字段先补回内存：缺失即默认 true 会当场
+	// 掩盖止血开关，不能等回写事件绕一圈才恢复。
+	lost := AntigravityQuotaFieldsLost(next, ConfiguredAntigravitySettings())
+	if !lost.Empty() {
+		next.QuotaRefreshEnabled = cloneOptionalBool(lost.QuotaRefreshEnabled)
+		next.QuotaRefreshIntervalMinutes = cloneOptionalInt(lost.QuotaRefreshIntervalMinutes)
+		next.QuotaGateEnabled = cloneOptionalBool(lost.QuotaGateEnabled)
+	}
+	if outcome := ApplyConfiguredAntigravitySettings(next); outcome == AntigravityApplyRevisionRollback && !lost.Empty() {
+		if err := s.writeBackAntigravityConfig(ctx, raw, next); err != nil {
+			log.Printf("antigravity_config quota_* 字段回写失败: %v", err)
+		}
+	}
+	// 重定向与门禁止血开关可能已变化，唤醒本地调度器立即按新配置重新求值。
+	s.notifySchedulerAvailability()
+	// quota_refresh_enabled / interval 可能已变化：唤醒配额巡检调度器立即按新配置重算槽位。
+	s.WakeAntigravityQuotaScheduler()
+	return nil
+}
+
+// writeBackAntigravityQuotaFields 把本机仍显式持有但 DB 已丢失的 quota_* 字段以整
+// JSON CAS 合并回 antigravity_config（与 admin 写侧同一把乐观锁）。revision 抬到
+// max(DB, 本机已应用) + 1，保证回写既不会被自己的 consumer 拒旧，也不会让旧副本的
+// 版本序列重新生效。CAS 未命中说明库已被更新的写入推进，交给下一轮事件收敛。
+func (s *Store) writeBackAntigravityConfig(ctx context.Context, raw string, merged AntigravitySettings) error {
+	revision := merged.ConfigRevision
+	if local := AppliedAntigravityConfigRevision(); local > revision {
+		revision = local
+	}
+	merged.ConfigRevision = revision + 1
+	encoded, err := EncodeAntigravitySettings(merged)
+	if err != nil {
+		return err
+	}
+	applied, err := s.db.SaveAntigravityConfigCAS(ctx, raw, encoded)
+	if err != nil {
+		return err
+	}
+	if applied {
+		log.Printf("antigravity_config_revision_rollback: DB 配置缺失本机仍生效的 quota_* 字段（疑似混布窗口旧版本整包覆盖），已以 CAS 基准合并回写 revision=%d", merged.ConfigRevision)
+		raiseConfiguredAntigravityRevision(merged.ConfigRevision)
+	}
 	return nil
 }
 

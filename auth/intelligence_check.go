@@ -45,8 +45,10 @@ func (s *Store) RefreshIntelligenceAccount(ctx context.Context, id int64) error 
 }
 
 // TryAcquireIntelligenceCheck reserves an ordinary occupied slot but ignores
-// administrative/quality pauses so recovery probes can run. It never changes
-// either pause or the account's authentication/quota status.
+// administrative/quality pauses so recovery probes and explicit manual checks
+// can run; the queue already keeps automatic checks off manually disabled
+// accounts. It never changes either pause or the account's
+// authentication/quota status.
 func (s *Store) TryAcquireIntelligenceCheck(a *Account) bool {
 	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 {
 		return false

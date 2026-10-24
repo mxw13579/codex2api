@@ -58,6 +58,19 @@ type antigravityCapabilityObservation struct {
 	ContentType          string    `json:"content_type,omitempty"`
 }
 
+// antigravityQuotaGateState 是硬门禁在管理端的只读视图（Spec §3.3、§9 管理层）：
+// blocked/reason/stale 与调度侧共用同一个门禁谓词，前端据此展示"事实过期"并按来源
+// 显示新鲜度；quota_epoch 是清除事实后的失效纪元（Spec §4.1）。
+type antigravityQuotaGateState struct {
+	GateEnabled    bool                       `json:"gate_enabled"`
+	SchemaVersion  int                        `json:"schema_version"`
+	Blocked        bool                       `json:"blocked"`
+	Reason         string                     `json:"reason,omitempty"`
+	Stale          bool                       `json:"stale"`
+	ResetAt        string                     `json:"reset_at,omitempty"`
+	SourceMetadata map[string]auth.SourceMeta `json:"source_metadata,omitempty"`
+}
+
 type antigravityAccountState struct {
 	AccountID            int64                              `json:"account_id"`
 	CredentialGeneration int64                              `json:"credential_generation"`
@@ -66,6 +79,8 @@ type antigravityAccountState struct {
 	Identity             antigravityIdentityState           `json:"identity"`
 	Permissions          *auth.AntigravityEntitlements      `json:"permissions,omitempty"`
 	Quota                *auth.AntigravityQuotaSnapshot     `json:"quota,omitempty"`
+	QuotaGate            *antigravityQuotaGateState         `json:"quota_gate,omitempty"`
+	QuotaEpoch           int64                              `json:"quota_epoch"`
 	Capabilities         []antigravityCapabilityObservation `json:"capabilities"`
 	LastSyncedAt         string                             `json:"last_synced_at,omitempty"`
 	LastSyncAttemptAt    string                             `json:"last_sync_attempt_at,omitempty"`
@@ -124,12 +139,45 @@ func antigravityAuthKindFromRow(row *database.AccountRow) string {
 	return auth.AntigravityAuthKindOAuth
 }
 
+// antigravityQuotaEpochFromRow 从账号持久化凭据中提取 antigravity_quota_epoch 整型纪元；
+// 缺失、无效或负数时均归一为 0。
+func antigravityQuotaEpochFromRow(row *database.AccountRow) int64 {
+	if row == nil {
+		return 0
+	}
+	epoch, ok := row.GetCredentialInt64("antigravity_quota_epoch")
+	if !ok || epoch < 0 {
+		return 0
+	}
+	return epoch
+}
+
+// antigravityQuotaGateStateFromSnapshot 把持久化快照折算成管理端门禁视图。判定完全
+// 委托给 auth 侧的唯一门禁谓词（auth.EvaluateAntigravityQuotaGate），管理端不实现
+// 第二套口径，因此展示的四态与调度实际阻断结果一致（Spec §3.3）。
+func antigravityQuotaGateStateFromSnapshot(snapshot *auth.AntigravityQuotaSnapshot, now time.Time) antigravityQuotaGateState {
+	view := auth.EvaluateAntigravityQuotaGate(snapshot, now)
+	state := antigravityQuotaGateState{
+		GateEnabled:    view.GateEnabled,
+		SchemaVersion:  view.SchemaVersion,
+		Blocked:        view.Blocked,
+		Reason:         view.Reason,
+		Stale:          view.Stale,
+		SourceMetadata: view.SourceMetadata,
+	}
+	if !view.ResetAt.IsZero() {
+		state.ResetAt = view.ResetAt.UTC().Format(time.RFC3339)
+	}
+	return state
+}
+
 func antigravityStateFromRow(row *database.AccountRow) *antigravityAccountState {
 	kind := antigravityAuthKindFromRow(row)
 	rawModels := row.GetCredentialStringSlice("models")
 	state := &antigravityAccountState{
 		AccountID: row.ID, CredentialGeneration: row.CredentialGeneration, CredentialKind: kind,
 		Capabilities: []antigravityCapabilityObservation{}, Warnings: []string{},
+		QuotaEpoch:          antigravityQuotaEpochFromRow(row),
 		LastSyncedAt:        row.GetCredential("antigravity_last_synced_at"),
 		LastSyncAttemptAt:   row.GetCredential("antigravity_last_sync_attempt_at"),
 		LastCapabilityProbe: row.GetCredential("antigravity_capability_last_probe_at"),
@@ -180,13 +228,17 @@ func antigravityStateFromRow(row *database.AccountRow) *antigravityAccountState 
 			state.Permissions = &permissions
 		}
 	}
+	// 门禁视图恒常输出：清除事实后 quota 可能整体为空，前端仍要能区分「无事实、未阻断」
+	// 与「未观测」（Spec §8.2 止血后的可见性）。
+	var gateSnapshot auth.AntigravityQuotaSnapshot
 	if raw := strings.TrimSpace(row.GetCredential("antigravity_quota")); raw != "" {
-		var quota auth.AntigravityQuotaSnapshot
-		if json.Unmarshal([]byte(raw), &quota) == nil {
-			projected := antigravityPublishedQuota(quota)
+		if json.Unmarshal([]byte(raw), &gateSnapshot) == nil {
+			projected := antigravityPublishedQuota(gateSnapshot)
 			state.Quota = &projected
 		}
 	}
+	gate := antigravityQuotaGateStateFromSnapshot(&gateSnapshot, time.Now().UTC())
+	state.QuotaGate = &gate
 	if raw := strings.TrimSpace(row.GetCredential("antigravity_capabilities")); raw != "" {
 		var observations []antigravityCapabilityObservation
 		if json.Unmarshal([]byte(raw), &observations) == nil {

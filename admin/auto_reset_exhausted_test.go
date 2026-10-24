@@ -343,7 +343,8 @@ func TestExhaustedResetUsage401RefreshAndUnavailableCredits(t *testing.T) {
 				return nil, &http.Response{StatusCode: 401, Body: http.NoBody}, errors.New("unauthorized")
 			}
 			u := &proxy.WhamUsage{}
-			// Available does not always mean applicable (credits-only billing can refuse reset).
+			// Business Pro Lite has reported applicable=0 at 7d=100% while
+			// consume still succeeded, so applicable is advisory, not a gate.
 			_ = json.Unmarshal([]byte(`{"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":0}}`), u)
 			u.RateLimit.PrimaryWindow = &proxy.WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(time.Hour).Unix()}
 			return u, nil, nil
@@ -354,8 +355,51 @@ func TestExhaustedResetUsage401RefreshAndUnavailableCredits(t *testing.T) {
 	if err != nil || calls != 2 || refreshes != 1 {
 		t.Fatalf("usage calls=%d refreshes=%d err=%v", calls, refreshes, err)
 	}
-	if resetUsageExhausted(u, now, now) {
-		t.Fatal("consumed when upstream reported no applicable credits")
+	if !resetUsageExhausted(u, now, now) {
+		t.Fatal("applicable=0 must not block an exhausted window with available credits")
+	}
+	none := &proxy.WhamUsage{}
+	_ = json.Unmarshal([]byte(`{"rate_limit_reset_credits":{"available_count":0,"applicable_available_count":0}}`), none)
+	none.RateLimit.PrimaryWindow = u.RateLimit.PrimaryWindow
+	if resetUsageExhausted(none, now, now) {
+		t.Fatal("consumed when upstream reported no available credits")
+	}
+}
+
+// Mirrors an observed Business Pro Lite account: live usage says 7d=100% with applicable=0,
+// the coupon list has available credits, and the scan must consume exactly once.
+func TestExhaustedResetIgnoresZeroApplicableCount(t *testing.T) {
+	previous := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previous) })
+	cfg := proxy.DefaultRuntimeSettings()
+	cfg.AutoResetCreditsOnExhaustionEnabled = true
+	proxy.ApplyRuntimeSettings(cfg)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	account := &auth.Account{DBID: 528, AccessToken: "fixture", AccountID: "workspace-528", PlanType: "self_serve_business_prolite"}
+	store.AddAccount(account)
+	now := time.Now()
+	var consumes atomic.Int32
+	h := &Handler{store: store,
+		queryResetCredits: func(context.Context, *auth.Account, string) (*proxy.WhamResetCreditsList, *http.Response, error) {
+			return &proxy.WhamResetCreditsList{AvailableCount: 2, Credits: []proxy.WhamResetCreditItem{{ID: "coupon-528", Status: "available", ResetType: "codex_rate_limits", ExpiresAt: now.Add(5 * 24 * time.Hour).Format(time.RFC3339)}}}, nil, nil
+		},
+		queryResetUsage: func(context.Context, *auth.Account, string) (*proxy.WhamUsage, *http.Response, error) {
+			u := &proxy.WhamUsage{}
+			_ = json.Unmarshal([]byte(`{"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}}`), u)
+			u.RateLimit.PrimaryWindow = &proxy.WhamUsageWindow{UsedPercent: 100, LimitWindowSeconds: 604800, ResetAt: now.Add(6 * 24 * time.Hour).Unix()}
+			return u, nil, nil
+		},
+		consumeResetCredit: func(context.Context, *auth.Account, string, string) (*proxy.WhamResetResult, *http.Response, error) {
+			consumes.Add(1)
+			return &proxy.WhamResetResult{WindowsReset: 1}, nil, nil
+		},
+		probeUsage: func(context.Context, *auth.Account) error { return nil },
+	}
+	t.Cleanup(h.WaitAutoResetCredits)
+	stats := h.runAutoResetCreditsScan(context.Background(), now)
+	if stats.Candidates != 1 || stats.Consumed != 1 || stats.Failed != 0 || consumes.Load() != 1 {
+		t.Fatalf("scan %+v consumes=%d", stats, consumes.Load())
 	}
 }
 

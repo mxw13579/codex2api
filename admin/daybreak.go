@@ -18,6 +18,9 @@ func (h *Handler) refreshImportedDaybreak(ctx context.Context, id int64) {
 	snapshot := account.BeginDaybreakObservation()
 	manifest, err := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "", nil)
 	if err == nil {
+		if capabilityErr := manifest.SaveCapabilities(ctx, h.db); capabilityErr != nil {
+			log.Printf("[账号 %d] Codex 能力快照保存失败，保留已有结果: %v", id, capabilityErr)
+		}
 		err = (proxy.DaybreakObservation{Account: account, Snapshot: snapshot, Body: manifest.Body}).Save(ctx, h.db)
 		if err == nil {
 			_, _ = proxy.LearnModelsFromManifest(ctx, h.db, manifest.Body, time.Now())

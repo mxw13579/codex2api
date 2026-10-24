@@ -63,7 +63,7 @@ export function buildModelPricingPreview(
   const baseExpression = image
     ? `text_input * ${standard.input} + image_input * ${image.input} + cached_text * ${standard.cached} + cached_image * ${image.cached} + image_output * ${image.output}`
     : long
-    ? `len < ${threshold} ? tier("standard", ${rateExpression(standard)}) : tier("long_context", ${rateExpression(long)})`
+    ? `(len < ${threshold} ? tier("standard", ${rateExpression(standard)}) : tier("long_context", ${rateExpression(long)}))`
     : `tier("standard", ${rateExpression(standard)})`
   const withServiceTiers = priority || long
     ? `${baseExpression} * (param("service_tier") == "flex" ? 0.5 : 1) * (param("service_tier") == "priority" ? 2 : 1)`

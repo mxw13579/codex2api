@@ -167,7 +167,7 @@ func (db *DB) EnqueueDueIntelligenceChecks(ctx context.Context, now time.Time, l
 			}
 		}
 
-		rows, err := tx.QueryContext(ctx, `SELECT a.id FROM accounts a JOIN intelligence_check_accounts s ON s.account_id=a.id WHERE `+db.intelligenceEligibleSQL()+filter+` AND s.enabled=TRUE AND s.next_due_ms<=$1 AND NOT EXISTS(SELECT 1 FROM intelligence_check_runs r WHERE r.account_id=a.id AND r.status IN ('queued','running')) ORDER BY s.next_due_ms,a.id LIMIT $2`, args...)
+		rows, err := tx.QueryContext(ctx, `SELECT a.id FROM accounts a JOIN intelligence_check_accounts s ON s.account_id=a.id WHERE `+db.intelligenceEligibleSQL()+filter+` AND `+intelligenceAutomaticSQL("a", "s")+` AND s.next_due_ms<=$1 AND NOT EXISTS(SELECT 1 FROM intelligence_check_runs r WHERE r.account_id=a.id AND r.status IN ('queued','running')) ORDER BY s.next_due_ms,a.id LIMIT $2`, args...)
 
 		if err != nil {
 			return err
@@ -220,7 +220,7 @@ func (db *DB) ClaimIntelligenceCheck(ctx context.Context, owner string, now time
 		if active >= s.Concurrency {
 			return nil
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT `+intelligenceRunColumns+` FROM intelligence_check_runs WHERE status='queued' AND ready_ms<=$1 AND (`+db.intelligenceJSONField("source")+`='manual' OR ($2 AND account_id IN (SELECT account_id FROM intelligence_check_accounts WHERE enabled=TRUE))) ORDER BY ready_ms,id LIMIT 100`, now.UnixMilli(), s.Enabled)
+		rows, err := tx.QueryContext(ctx, `SELECT `+intelligenceRunColumns+` FROM intelligence_check_runs WHERE status='queued' AND ready_ms<=$1 AND (`+db.intelligenceJSONField("source")+`='manual' OR ($2 AND account_id IN (SELECT s.account_id FROM intelligence_check_accounts s JOIN accounts a ON a.id=s.account_id WHERE `+intelligenceAutomaticSQL("a", "s")+`))) ORDER BY ready_ms,id LIMIT 100`, now.UnixMilli(), s.Enabled)
 		if err != nil {
 			return err
 		}
@@ -270,7 +270,7 @@ func (db *DB) ClaimIntelligenceCheck(ctx context.Context, owner string, now time
 				continue
 			}
 
-			if r.Source == "automatic" && (!s.Enabled || !a.Enabled) {
+			if r.Source == "automatic" && (!s.Enabled || !a.Enabled || !a.ManualEnabled) {
 				continue
 			}
 			if minimum := time.Duration(r.Settings.TimeoutSeconds+30) * time.Second; lease < minimum {
@@ -582,8 +582,8 @@ func (db *DB) IntelligenceCheckBars(ctx context.Context, ids []int64) (map[int64
 	if db.isSQLite() {
 		automaticEnabled = `json_extract(config_json,'$.enabled')`
 	}
-	active := `r.status='running' OR (r.status='queued' AND (` + db.intelligenceJSONField("source") + `='manual' OR (a.enabled=TRUE AND (SELECT ` + automaticEnabled + ` FROM intelligence_check_settings WHERE id=1))))`
-	rows, err := db.conn.QueryContext(ctx, `SELECT a.account_id,a.enabled,a.quality_paused,a.state_json,COALESCE(r.id,0),COALESCE(r.status,'') FROM intelligence_check_accounts a LEFT JOIN intelligence_check_runs r ON r.account_id=a.account_id AND r.status IN ('queued','running') AND (`+active+`) WHERE a.account_id IN (`+ph+`)`, args...)
+	active := `r.status='running' OR (r.status='queued' AND (` + db.intelligenceJSONField("source") + `='manual' OR (` + intelligenceAutomaticSQL("acc", "a") + ` AND (SELECT ` + automaticEnabled + ` FROM intelligence_check_settings WHERE id=1))))`
+	rows, err := db.conn.QueryContext(ctx, `SELECT a.account_id,a.enabled,a.quality_paused,a.state_json,COALESCE(r.id,0),COALESCE(r.status,'') FROM intelligence_check_accounts a JOIN accounts acc ON acc.id=a.account_id LEFT JOIN intelligence_check_runs r ON r.account_id=a.account_id AND r.status IN ('queued','running') AND (`+active+`) WHERE a.account_id IN (`+ph+`)`, args...)
 	if err != nil {
 		return nil, err
 	}

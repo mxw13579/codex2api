@@ -1055,6 +1055,94 @@ function AntigravityThinkingCard() {
   )
 }
 
+// Antigravity 配额自动刷新与硬门禁(Spec §8):保存走后端整 JSON CAS,
+// GET 返回生效值,PUT 缺失字段 = 保留现值,因此这里只提交本次修改的字段。
+function AntigravityQuotaSettingsCard() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [settings, setSettings] = useState<AntigravitySettingsResponse | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.getAntigravitySettings().then((response) => {
+      if (active) setSettings(response)
+    }).catch((error) => {
+      if (active) showToast(getErrorMessage(error), 'error')
+    })
+    return () => {
+      active = false
+    }
+  }, [showToast])
+
+  const save = useCallback(async (patch: Parameters<typeof api.updateAntigravitySettings>[0]) => {
+    setSaving(true)
+    try {
+      setSettings(await api.updateAntigravitySettings(patch))
+      showToast(t('antigravityQuota.saved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [showToast, t])
+
+  const intervalMinutes = settings?.quota_refresh_interval_minutes ?? 10
+
+  return (
+    <SettingsCard
+      title={t('antigravityQuota.cardTitle')}
+      description={t('antigravityQuota.cardDescription')}
+      icon={<Gauge className="size-4" />}
+    >
+      <div className="space-y-4">
+        <div className={SETTINGS_FIELD_GRID}>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{t('antigravityQuota.refreshEnabled')}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.refreshEnabledHint')}</p>
+            </div>
+            <Switch
+              checked={settings?.quota_refresh_enabled ?? false}
+              disabled={settings === null || saving}
+              onCheckedChange={(checked) => void save({ quota_refresh_enabled: checked })}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{t('antigravityQuota.gateEnabled')}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.gateEnabledHint')}</p>
+            </div>
+            <Switch
+              checked={settings?.quota_gate_enabled ?? false}
+              disabled={settings === null || saving}
+              onCheckedChange={(checked) => void save({ quota_gate_enabled: checked })}
+            />
+          </div>
+        </div>
+        <SettingField
+          label={t('antigravityQuota.refreshInterval')}
+          description={t('antigravityQuota.refreshIntervalHint')}
+        >
+          <DraftNumberInput
+            value={intervalMinutes}
+            min={3}
+            max={60}
+            integer
+            disabled={settings === null || saving}
+            className="max-w-32"
+            onValueCommit={(value) => {
+              if (value !== intervalMinutes) void save({ quota_refresh_interval_minutes: value })
+            }}
+            onValueChange={() => {}}
+          />
+        </SettingField>
+        <p className="text-xs text-muted-foreground">{t('antigravityQuota.hint')}</p>
+      </div>
+    </SettingsCard>
+  )
+}
+
 function ClaudeCodeSettingsCard() {
   const { t } = useTranslation()
   const { showToast } = useToast()
@@ -5147,6 +5235,7 @@ export default function Settings() {
               <ChannelConnectivityTestCard channel="antigravity" />
               <AntigravityModelRedirectCard />
               <AntigravityThinkingCard />
+              <AntigravityQuotaSettingsCard />
               <SettingsCard
                 title={t('settings.antigravityOAuth.title')}
                 description={t('settings.antigravityOAuth.description')}

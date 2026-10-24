@@ -4157,6 +4157,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
 	// previous_response_id 缓存按下游 API Key 隔离，防止跨用户注入他人对话历史。
 	respCacheOwner := responseCacheOwner(apiKeyID)
+	multiAgentV2State := &codexMultiAgentV2State{}
+	if codexMultiAgentV2CompatEnabled() {
+		c.Request = c.Request.WithContext(withCodexMultiAgentV2State(c.Request.Context(), multiAgentV2State))
+	}
 	bodyPreparation := prepareResponsesBodyForOwnerDetailed(rawBody, respCacheOwner)
 	codexBody, expandedInputRaw := bodyPreparation.Body, bodyPreparation.ExpandedInputRaw
 	continuationStatus, continuationReason, continuationUnavailable := responseCachePreparationFailure(bodyPreparation)
@@ -5508,6 +5512,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			preflightPassthrough := continuousRetryPreflightPassthrough(preflightSettings)
 			emptyIncomplete := &emptyIncompleteTracker{}
 			forwardWithEvent := func(sseEvent string, data []byte) bool {
+				if multiAgentV2State.isOptimizedFor(account.ID()) {
+					data = restoreCodexMultiAgentV2Response(data, multiAgentV2State)
+				}
 				streamDiag.markUpstreamFrame()
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
@@ -5768,6 +5775,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			seenImageOutputs := make(map[string]struct{})
 			emptyIncomplete := &emptyIncompleteTracker{}
 			readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, func(sseEvent string, data []byte) bool {
+				if multiAgentV2State.isOptimizedFor(account.ID()) {
+					data = restoreCodexMultiAgentV2Response(data, multiAgentV2State)
+				}
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
 				} else {

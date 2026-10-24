@@ -855,6 +855,11 @@ func (a *Account) fastSchedulerSnapshotForSpark(baseLimit int64, now time.Time) 
 	// DispatchPaused 是锁外原子标志,标准快照在这里显式补一道门,spark 必须
 	// 对齐,否则运维手动停调度或过载熔断置位的账号仍会被 spark 请求选中。
 	available := a.sparkDispatchEligibleLocked(now) && !accountDispatchBlocked(a)
+	// spark 与标准快照共用同一道配额硬门禁：Antigravity 之外的账号谓词恒为假，
+	// 不改变既有行为。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		available = false
+	}
 	return tier, score, limit, proven, available
 }
 
@@ -917,6 +922,12 @@ func (a *Account) fastSchedulerSnapshotWithUsageOverride(baseLimit int64, now ti
 	}
 
 	tier, limit, available = a.applyAntigravitySchedulerOverrideLocked(baseLimit, tier, limit, available)
+	// 配额硬门禁是最后一道围栏：它在 Antigravity 的 401 窄恢复豁免之后求值，
+	// 因此 unauthorized 冷却恢复出的可调度性不能把已耗尽的账号放回候选集
+	// （FastScheduler 候选过滤与 Store 各选号入口共用这一个线性化点）。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		available = false
+	}
 	return tier, score, limit, proven, available
 }
 

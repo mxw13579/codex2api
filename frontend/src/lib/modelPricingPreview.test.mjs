@@ -59,3 +59,19 @@ test('image pricing preview splits text and image inputs without long-context mu
   assert.match(preview.expression, /cached_image \* 2 \+ image_output \* 30/)
   assert.equal(preview.long, null)
 })
+
+test('service-tier multipliers apply to both context tiers, not only the long one', () => {
+  const preview = buildModelPricingPreview({
+    input: 10,
+    cached_input: 1,
+    output: 50,
+    input_long: 20,
+    cached_input_long: 2,
+    output_long: 75,
+    long_context_threshold_tokens: 272000,
+  })
+  assert.equal(
+    preview.expression,
+    '(len < 272000 ? tier("standard", p * 10 + c * 50 + cr * 1) : tier("long_context", p * 20 + c * 75 + cr * 2)) * (param("service_tier") == "flex" ? 0.5 : 1) * (param("service_tier") == "priority" ? 2 : 1)',
+  )
+})

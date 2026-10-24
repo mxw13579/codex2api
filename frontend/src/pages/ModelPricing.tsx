@@ -703,6 +703,7 @@ export default function ModelPricing() {
   const [syncUrl, setSyncUrl] = useState('')
   const [defaultUrl, setDefaultUrl] = useState('')
   const [modelsDevUrl, setModelsDevUrl] = useState('')
+  const [litellmUrl, setLitellmUrl] = useState('')
   const [officialOpenAIUrl, setOfficialOpenAIUrl] = useState('')
   const [officialXAIUrl, setOfficialXAIUrl] = useState('')
   const [officialClaudeUrl, setOfficialClaudeUrl] = useState('')
@@ -742,6 +743,7 @@ export default function ModelPricing() {
       setRows(res.models)
       setDefaultUrl(res.default_sync_url)
       setModelsDevUrl(res.models_dev_url)
+      setLitellmUrl(res.litellm_url)
       setOfficialOpenAIUrl(res.official_openai_url)
       setOfficialXAIUrl(res.official_xai_url)
       setOfficialClaudeUrl(res.official_claude_url)
@@ -871,7 +873,7 @@ export default function ModelPricing() {
         include_grok: officialConfig.include_grok,
         include_claude: officialConfig.include_claude,
       })
-      showToast(t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }))
+      showToast([t('settings.pricing.officialSyncDone', { applied: result.applied, skipped: result.skipped }), ...(result.notices ?? [])].join('；'))
       await load()
     } catch (error) {
       showToast(`${t('settings.pricing.syncFailed')}: ${getErrorMessage(error)}`, 'error')
@@ -1049,7 +1051,7 @@ export default function ModelPricing() {
         </>}
       />
       <ModelCatalogModal open={catalogOpen} onClose={() => setCatalogOpen(false)} rows={rows} newModels={newModels} query={catalogQuery} onQueryChange={setCatalogQuery} onJump={jumpToModel} onRefresh={() => void refreshCatalogModels()} refreshing={refreshingModels} refreshProgress={refreshProgress} onAcknowledge={acknowledgeNewModels} />
-      <PricingSyncPanel open={syncOpen} onClose={() => setSyncOpen(false)} syncUrl={syncUrl} onSyncUrlChange={setSyncUrl} urls={{ default: defaultUrl, modelsDev: modelsDevUrl, openAI: officialOpenAIUrl, xAI: officialXAIUrl, claude: officialClaudeUrl }} config={officialConfig} onConfigChange={setOfficialConfig} syncing={syncing} officialSyncing={officialSyncing} officialSaving={officialSaving} onSync={() => void sync()} onSyncOfficial={() => void syncOfficial()} onSaveOfficial={() => void saveOfficialConfig()} />
+      <PricingSyncPanel open={syncOpen} onClose={() => setSyncOpen(false)} syncUrl={syncUrl} onSyncUrlChange={setSyncUrl} urls={{ default: defaultUrl, litellm: litellmUrl, modelsDev: modelsDevUrl, openAI: officialOpenAIUrl, xAI: officialXAIUrl, claude: officialClaudeUrl }} config={officialConfig} onConfigChange={setOfficialConfig} syncing={syncing} officialSyncing={officialSyncing} officialSaving={officialSaving} onSync={() => void sync()} onSyncOfficial={() => void syncOfficial()} onSaveOfficial={() => void saveOfficialConfig()} />
       <StateShell variant="page" loading={loading && rows.length === 0} error={loadError && rows.length === 0 ? loadError : null} onRetry={() => void load()}>
         <div className="pricing-overview">
           <div className="pricing-metrics" role="group" aria-label={t('settings.pricing.sourceFilterLabel')}>

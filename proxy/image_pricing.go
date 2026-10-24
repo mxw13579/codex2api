@@ -1,58 +1,42 @@
 package proxy
 
 import (
-	"bufio"
 	"strings"
 
 	"github.com/codex2api/database"
 )
 
-// 官方图片价格按同一模型的 Image/Text 两行发布；只读取图片章节第一张
-// Standard 表，避免后面的 Batch 价格覆盖线上同步请求的费率。
-func parseGPTImage25Pricing(body []byte) map[string]database.ModelPricingOverride {
-	out := make(map[string]database.ModelPricingOverride)
-	text := string(body)
-	start := strings.Index(text, "Image generation models")
-	if start < 0 {
-		return out
+// applyOfficialImagePricingRow 只读取受支持图片模型，分别合并 Image/Text 行。
+func applyOfficialImagePricingRow(out map[string]database.ModelPricingOverride, row officialPricingRow) {
+	model := database.GPTImage25BillingModel(normalizeOfficialPricingModel(row.cell("model")))
+	if model == "" {
+		return
 	}
-	text = text[start:]
-	start = strings.Index(text, "### Grouped Pricing Table data")
-	if start < 0 {
-		return out
+	price := out[model]
+	switch strings.ToLower(row.cell("modality")) {
+	case "image":
+		price.ImageInput, price.CachedImageInput, price.Output = row.price("input"), row.price("cached input"), row.price("output")
+	case "text":
+		price.Input, price.CachedInput = row.price("input"), row.price("cached input")
+	default:
+		return
 	}
-	scanner := bufio.NewScanner(strings.NewReader(text[start:]))
-	seenRows := false
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "|") {
-			if seenRows {
-				break
-			}
+	out[model] = price
+}
+
+// projectImageResolutionPricing 为独立可编辑的分辨率变体继承基础模型 token 价。
+// 官方没有按输出分辨率区分 token 单价；精确模型价格和用户自定义价仍优先。
+func projectImageResolutionPricing(allowed map[string]struct{}, parsed map[string]database.ModelPricingOverride) {
+	base, exists := parsed["gpt-image-2"]
+	if !exists {
+		return
+	}
+	for _, model := range []string{"gpt-image-2-2k", "gpt-image-2-4k"} {
+		if _, enabled := allowed[model]; !enabled {
 			continue
 		}
-		seenRows = true
-		cells := splitMarkdownRow(line)
-		if len(cells) != 5 {
-			continue
-		}
-		model := database.GPTImage25BillingModel(normalizeOfficialPricingModel(cells[0]))
-		if model == "" {
-			continue
-		}
-		price := out[model]
-		switch strings.ToLower(cells[1]) {
-		case "image":
-			price.ImageInput, price.CachedImageInput, price.Output = parseOfficialPrice(cells[2]), parseOfficialPrice(cells[3]), parseOfficialPrice(cells[4])
-		case "text":
-			price.Input, price.CachedInput = parseOfficialPrice(cells[2]), parseOfficialPrice(cells[3])
-		}
-		out[model] = price
-	}
-	for model, price := range out {
-		if price.Input <= 0 || price.ImageInput <= 0 || price.Output <= 0 {
-			delete(out, model)
+		if _, exact := parsed[model]; !exact {
+			parsed[model] = base
 		}
 	}
-	return out
 }

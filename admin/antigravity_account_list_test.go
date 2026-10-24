@@ -18,12 +18,12 @@ import (
 func antigravityQuotaJSON(t *testing.T, remaining float64) string {
 	t.Helper()
 	snapshot := map[string]interface{}{
-		"models": []map[string]interface{}{{"model_id": "gemini-3-flash", "remaining_fraction": 1}},
+		"models": []map[string]interface{}{{"model_id": "gemini-3-flash", "remaining_fraction": 1, "fraction_present": true}},
 		"quota_groups": []map[string]interface{}{{
 			"display_name": "Gemini Models",
 			"buckets": []map[string]interface{}{
-				{"bucket_id": "gemini-5h", "window": "5h", "remaining_fraction": 1},
-				{"bucket_id": "gemini-weekly", "window": "weekly", "remaining_fraction": remaining},
+				{"bucket_id": "gemini-5h", "window": "5h", "remaining_fraction": 1, "fraction_present": true},
+				{"bucket_id": "gemini-weekly", "window": "weekly", "remaining_fraction": remaining, "fraction_present": true},
 			},
 		}},
 		"updated_at": time.Now().UTC().Format(time.RFC3339),

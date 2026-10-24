@@ -358,6 +358,9 @@ func GetModelPricing(model string) *ModelPricing {
 // baseModelPricing 返回代码内置的模型定价（不含覆盖）。normalized 为归一化后的模型名，
 // canonical 为 codex 归一后的规范名（用于规则表查找）。
 func baseModelPricing(normalized, canonical string) *ModelPricing {
+	if pricing := cyberDefaultPricing(canonical); pricing != nil {
+		return pricing
+	}
 	if key := GrokMediaPricingKey(normalized); key != "" {
 		return grokMediaBasePricing(key)
 	}
@@ -535,6 +538,9 @@ func normalizeBillingModelName(model string) string {
 
 func normalizeCodexBillingModel(model string) (string, bool) {
 	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(strings.ToLower(model))
+	if target := daybreakCanonicalModel(compact); target != "" {
+		return target, true
+	}
 	switch {
 	case strings.HasPrefix(compact, "gpt-6-sol") || strings.HasPrefix(compact, "gpt6-sol"):
 		return "gpt-6-sol", true
@@ -563,14 +569,10 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 	case strings.Contains(compact, "gpt-5.6-luna") || strings.Contains(compact, "gpt5-6-luna") || strings.Contains(compact, "gpt5.6-luna"):
 		return "gpt-5.6-luna", true
 	case strings.Contains(compact, "gpt-5.6") || strings.Contains(compact, "gpt5-6") || strings.Contains(compact, "gpt5.6"):
-		// 未知 gpt-5.6 变体（含 gpt-5.6-cyber）：按最贵的 sol 兜底，避免低估计费。
+		// 未知 gpt-5.6 变体按 sol 兜底；Cyber 已在前面按独立价目处理。
 		return "gpt-5.6-sol", true
 	case strings.HasPrefix(compact, "gpt-daybreak-"):
-		// Trusted Access for Cyber 的稳定别名（issue #624）：官方文档写明
-		// gpt-daybreak-blue-latest 即 gpt-5.6-sol，gpt-daybreak-red-latest 即
-		// gpt-5.6-cyber（无独立公开定价）。两者都归到 5.6 家族最贵的 sol，
-		// 否则会落到 $1/$2 的默认价严重低估。只认 gpt-daybreak- 前缀，
-		// 带版本号的 ID（如 gpt-5.4-daybreak）仍走各自版本规则。
+		// 未知代号别名只保留项目既有 Sol 兜底，不据此生成同步价。
 		return "gpt-5.6-sol", true
 	case strings.Contains(compact, "gpt-5.4-mini") || strings.Contains(compact, "gpt5-4-mini") || strings.Contains(compact, "gpt5.4-mini"):
 		return "gpt-5.4-mini", true

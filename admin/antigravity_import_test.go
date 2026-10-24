@@ -1684,8 +1684,10 @@ func TestRefreshAntigravityAccountPreservesRotatedTokenOnQuotaFailure(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantFamily := antigravityCredentialFamilyID(auth.AntigravityCredential{}, "google-subject")
-	if row.CredentialGeneration != 2 || row.CredentialFamilyID != wantFamily || row.GetCredential("credential_family_id") != wantFamily || row.GetCredential("access_token") != "access-new" || row.GetCredential("refresh_token") != "refresh-rotated" || row.GetCredential("antigravity_sync_error") == "" {
+	// Store 统一入口（Spec §9）把 credential_family_id 视为稳定租约键：手动刷新只
+	// 做换票与 CAS，不重写 family（provisional→subject 的身份迁移仍归导入/替换
+	// 凭据路径负责）。契约变化后断言 family 保持不变且运行时与持久化行一致。
+	if row.CredentialGeneration != 2 || row.CredentialFamilyID != "ag_family" || row.GetCredential("credential_family_id") != "ag_family" || row.GetCredential("access_token") != "access-new" || row.GetCredential("refresh_token") != "refresh-rotated" || row.GetCredential("antigravity_sync_error") == "" {
 		t.Fatalf("failed refresh row = generation %d credentials %#v", row.CredentialGeneration, row.Credentials)
 	}
 	if handler.accountCachesGen.Load() <= cacheGeneration {

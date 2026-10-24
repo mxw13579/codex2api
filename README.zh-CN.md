@@ -257,6 +257,7 @@ Antigravity 作为独立 Google 渠道管理，支持浏览器/导入 OAuth 凭�
 | [API 文档](docs/API.md) | 所有 API 端点、请求/响应示例、错误码说明 | `docs/API.md` |
 | [使用指南](docs/USAGE.md) | 客户端接入、SDK 示例、媒体任务与常见错误排查 | `docs/USAGE.md` |
 | [Antigravity 接入](docs/ANTIGRAVITY.md) | Google OAuth、实验性 API Key 渠道、模型、风险与协议验证状态 | `docs/ANTIGRAVITY.md` |
+| [Codex Multi-Agent v2 兼容](docs/CODEX_MULTI_AGENT_V2_COMPAT.md) | 第三方子 Agent 明文字段兼容、风险、灰度与回滚 | `docs/CODEX_MULTI_AGENT_V2_COMPAT.md` |
 | [部署文档](docs/DEPLOYMENT.md) | 各种部署模式、升级指南、备份恢复 | `docs/DEPLOYMENT.md` |
 | [配置文档](docs/CONFIGURATION.md) | 环境变量、系统设置、配置优先级 | `docs/CONFIGURATION.md` |
 | [架构文档](docs/ARCHITECTURE.md) | 系统架构、调度算法、存储设计 | `docs/ARCHITECTURE.md` |

@@ -2,23 +2,18 @@ package proxy
 
 import "testing"
 
-func TestParseOpenAIOfficialPricingMarkdownIncludesFastAndLongContext(t *testing.T) {
+func TestParseOpenAIOfficialPricingHTMLIncludesFastAndLongContext(t *testing.T) {
 	body := []byte(`
-### Standard pricing data
-
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-5.6-sol | $5.00 | $0.50 | $6.25 | $30.00 | $10.00 | $1.00 | $12.50 | $45.00 |
-| gpt-5.5 (<272K context length) | $5.00 | $0.50 | - | $30.00 | $10.00 | $1.00 | - | $45.00 |
-
-### Fast pricing data
-
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-5.6-sol | $10.00 | $1.00 | $12.50 | $60.00 | $20.00 | $2.00 | $25.00 | $90.00 |
-| gpt-5.5 (<272K context length) | $12.50 | $1.25 | - | $75.00 | - | - | - | - |
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Short context input</th><th>Short context cached input</th><th>Short context cache writes</th><th>Short context output</th><th>Long context input</th><th>Long context cached input</th><th>Long context cache writes</th><th>Long context output</th></tr></thead><tbody>
+<tr><td>gpt-5.6-sol</td><td>$5.00</td><td>$0.50</td><td>$6.25</td><td>$30.00</td><td>$10.00</td><td>$1.00</td><td>$12.50</td><td>$45.00</td></tr>
+<tr><td>gpt-5.5 (&lt;272K context length)</td><td>$5.00</td><td>$0.50</td><td>-</td><td>$30.00</td><td>$10.00</td><td>$1.00</td><td>-</td><td>$45.00</td></tr>
+</tbody></table></section>
+<section data-pricing-tier="fast"><table><thead><tr><th>Model</th><th>Short context input</th><th>Short context cached input</th><th>Short context cache writes</th><th>Short context output</th><th>Long context input</th><th>Long context cached input</th><th>Long context cache writes</th><th>Long context output</th></tr></thead><tbody>
+<tr><td>gpt-5.6-sol</td><td>$10.00</td><td>$1.00</td><td>$12.50</td><td>$60.00</td><td>$20.00</td><td>$2.00</td><td>$25.00</td><td>$90.00</td></tr>
+<tr><td>gpt-5.5 (&lt;272K context length)</td><td>$12.50</td><td>$1.25</td><td>-</td><td>$75.00</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>
+</tbody></table></section>
 `)
-	got, err := ParseOpenAIOfficialPricingMarkdown(body)
+	got, err := ParseOpenAIOfficialPricingHTML(body)
 	if err != nil {
 		t.Fatalf("parse official OpenAI pricing: %v", err)
 	}
@@ -43,18 +38,16 @@ func TestParseOpenAIOfficialPricingMarkdownIncludesFastAndLongContext(t *testing
 	}
 }
 
-func TestParseXAIOfficialPricingMarkdown(t *testing.T) {
+func TestParseXAIOfficialPricingHTML(t *testing.T) {
 	body := []byte(`
-### Text API Pricing
-
-| Model | Context | Input / 1M tokens | Cached input / 1M tokens | Output / 1M tokens |
-| --- | --- | --- | --- | --- |
-| grok-4.6 (< 200k prompt tokens) | 500k | $2.00 | $0.50 | $6.00 |
-| grok-4.6 (≥ 200k prompt tokens) | 500k | $4.00 | $1.00 | $12.00 |
-| grok-4.5 (< 200k prompt tokens) | 500k | $2.00 | $0.30 | $6.00 |
-| grok-4.5 (≥ 200k prompt tokens) | 500k | $4.00 | $0.60 | $12.00 |
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Context</th><th>Input / 1M tokens</th><th>Cached input / 1M tokens</th><th>Output / 1M tokens</th></tr></thead><tbody>
+<tr><td>grok-4.6 (&lt; 200k prompt tokens)</td><td>500k</td><td>$2.00</td><td>$0.50</td><td>$6.00</td></tr>
+<tr><td>grok-4.6 (≥ 200k prompt tokens)</td><td>500k</td><td>$4.00</td><td>$1.00</td><td>$12.00</td></tr>
+<tr><td>grok-4.5 (&lt; 200k prompt tokens)</td><td>500k</td><td>$2.00</td><td>$0.30</td><td>$6.00</td></tr>
+<tr><td>grok-4.5 (≥ 200k prompt tokens)</td><td>500k</td><td>$4.00</td><td>$0.60</td><td>$12.00</td></tr>
+</tbody></table></section>
 `)
-	all, err := ParseXAIOfficialPricingMarkdown(body)
+	all, err := ParseXAIOfficialPricingHTML(body)
 	if err != nil {
 		t.Fatalf("parse xAI official pricing: %v", err)
 	}
@@ -81,5 +74,46 @@ func TestParseAnthropicOfficialPricingHTMLIncludesCacheWriteAndRead(t *testing.T
 	fable5 := got["claude-fable-5"]
 	if fable5.Input != 10 || fable5.CachedInput != 1 || fable5.CacheWrite5m != 12.5 || fable5.CacheWrite1h != 20 || fable5.Output != 50 {
 		t.Fatalf("Fable 5 pricing = %+v", fable5)
+	}
+}
+
+// 2026-10: OpenAI moved output before cached input and added 30m / 12h write
+// columns. Fixed positions read output as cached input and the 30m write as
+// output (gpt-6-astra synced as output 12.5, cached 50); columns must be read
+// by header name, both for single-row and grouped (colspan) headers.
+func TestParseOpenAIOfficialPricingHTMLReadsReorderedColumnsByHeader(t *testing.T) {
+	flat := []byte(`
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Short context input</th><th>Short context output</th><th>Short context cached input</th><th>Short context 30m write</th><th>Short context 12h write</th><th>Long context input</th><th>Long context output</th><th>Long context cached input</th><th>Long context 30m write</th><th>Long context 12h write</th></tr></thead><tbody>
+<tr><td>gpt-6-astra</td><td>$10.00</td><td>$50.00</td><td>$1.00</td><td>$12.50</td><td>$25.00</td><td>$20.00</td><td>$75.00</td><td>$2.00</td><td>$25.00</td><td>$50.00</td></tr>
+<tr><td>gpt-6-sol</td><td>$2.00</td><td>$10.00</td><td>$0.20</td><td>$2.50</td><td>$5.00</td><td>$4.00</td><td>$15.00</td><td>$0.40</td><td>$5.00</td><td>$10.00</td></tr>
+</tbody></table></section>
+`)
+	grouped := []byte(`
+<section data-pricing-tier="standard"><table><thead>
+<tr><th rowspan="2">Model</th><th colspan="5">Short context</th><th colspan="5">Long context</th></tr>
+<tr><th>Input</th><th>Output</th><th>Cached input</th><th>30m write</th><th>12h write</th><th>Input</th><th>Output</th><th>Cached input</th><th>30m write</th><th>12h write</th></tr>
+</thead><tbody>
+<tr><td>gpt-6-astra</td><td>$10.00</td><td>$50.00</td><td>$1.00</td><td>$12.50</td><td>$25.00</td><td>$20.00</td><td>$75.00</td><td>$2.00</td><td>$25.00</td><td>$50.00</td></tr>
+<tr><td>gpt-6-sol</td><td>$2.00</td><td>$10.00</td><td>$0.20</td><td>$2.50</td><td>$5.00</td><td>$4.00</td><td>$15.00</td><td>$0.40</td><td>$5.00</td><td>$10.00</td></tr>
+</tbody></table></section>
+`)
+	for name, body := range map[string][]byte{"flat": flat, "grouped": grouped} {
+		got, err := ParseOpenAIOfficialPricingHTML(body)
+		if err != nil {
+			t.Fatalf("%s: parse official OpenAI pricing: %v", name, err)
+		}
+		astra := got["gpt-6-astra"]
+		if astra.Input != 10 || astra.Output != 50 || astra.CachedInput != 1 {
+			t.Fatalf("%s: standard prices = %+v", name, astra)
+		}
+		if astra.InputLong != 20 || astra.OutputLong != 75 || astra.CachedInputLong != 2 {
+			t.Fatalf("%s: long prices = %+v", name, astra)
+		}
+		if astra.LongContextThresholdTokens != 272000 {
+			t.Fatalf("%s: threshold = %d", name, astra.LongContextThresholdTokens)
+		}
+		if sol := got["gpt-6-sol"]; sol.Input != 2 || sol.Output != 10 || sol.CachedInput != 0.2 || sol.OutputLong != 15 {
+			t.Fatalf("%s: gpt-6-sol = %+v", name, sol)
+		}
 	}
 }

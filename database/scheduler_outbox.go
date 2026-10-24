@@ -188,7 +188,7 @@ func (db *DB) installSQLiteSchedulerOutboxTriggers(ctx context.Context) error {
 		CREATE TRIGGER scheduler_outbox_accounts_insert AFTER INSERT ON accounts BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('account',NEW.id,'created');
 		END;
-		CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE OF credentials,proxy_url,status,error_message,cooldown_reason,cooldown_until,enabled,locked,score_bias_override,base_concurrency_override,skip_warm_tier,tags,credit_enabled,credit_skip_usage_window,deleted_at ON accounts
+		CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE OF credentials,credential_generation,proxy_url,status,error_message,cooldown_reason,cooldown_until,enabled,locked,score_bias_override,base_concurrency_override,skip_warm_tier,tags,credit_enabled,credit_skip_usage_window,deleted_at ON accounts
 		WHEN OLD.proxy_url IS NOT NEW.proxy_url OR OLD.status IS NOT NEW.status OR OLD.error_message IS NOT NEW.error_message
 		  OR OLD.cooldown_reason IS NOT NEW.cooldown_reason OR OLD.cooldown_until IS NOT NEW.cooldown_until
 		  OR OLD.enabled IS NOT NEW.enabled OR OLD.locked IS NOT NEW.locked
@@ -216,6 +216,9 @@ func (db *DB) installSQLiteSchedulerOutboxTriggers(ctx context.Context) error {
 		  OR COALESCE(json_extract(OLD.credentials,'$.task_id'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.task_id'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.grok_principal_id'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.grok_principal_id'),'')
 		  OR COALESCE(json_extract(OLD.credentials,'$.grok_oidc_issuer'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.grok_oidc_issuer'),'')
+		  OR COALESCE(json_extract(OLD.credentials,'$.antigravity_quota'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.antigravity_quota'),'')
+		  OR COALESCE(json_extract(OLD.credentials,'$.antigravity_quota_epoch'),'') IS NOT COALESCE(json_extract(NEW.credentials,'$.antigravity_quota_epoch'),'')
+		  OR OLD.credential_generation IS NOT NEW.credential_generation
 		BEGIN
 			INSERT INTO scheduler_outbox(entity_type,entity_id,event_type) VALUES('account',NEW.id,'updated');
 		END;
@@ -333,7 +336,7 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 		DROP TRIGGER IF EXISTS scheduler_outbox_accounts_update ON accounts;
 		DROP TRIGGER IF EXISTS scheduler_outbox_accounts_delete ON accounts;
 		CREATE TRIGGER scheduler_outbox_accounts_insert AFTER INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
-		CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE OF credentials,proxy_url,status,error_message,cooldown_reason,cooldown_until,enabled,locked,score_bias_override,base_concurrency_override,skip_warm_tier,tags,credit_enabled,credit_skip_usage_window,deleted_at ON accounts FOR EACH ROW WHEN (
+		CREATE TRIGGER scheduler_outbox_accounts_update AFTER UPDATE OF credentials,credential_generation,proxy_url,status,error_message,cooldown_reason,cooldown_until,enabled,locked,score_bias_override,base_concurrency_override,skip_warm_tier,tags,credit_enabled,credit_skip_usage_window,deleted_at ON accounts FOR EACH ROW WHEN (
 			OLD.proxy_url IS DISTINCT FROM NEW.proxy_url OR OLD.status IS DISTINCT FROM NEW.status OR OLD.error_message IS DISTINCT FROM NEW.error_message OR
 			OLD.cooldown_reason IS DISTINCT FROM NEW.cooldown_reason OR OLD.cooldown_until IS DISTINCT FROM NEW.cooldown_until OR
 			OLD.enabled IS DISTINCT FROM NEW.enabled OR OLD.locked IS DISTINCT FROM NEW.locked OR
@@ -360,7 +363,10 @@ func (db *DB) installPostgresSchedulerOutboxTriggers(ctx context.Context) error 
 			COALESCE(OLD.credentials->>'agent_private_key','') IS DISTINCT FROM COALESCE(NEW.credentials->>'agent_private_key','') OR
 			COALESCE(OLD.credentials->>'task_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'task_id','') OR
 			COALESCE(OLD.credentials->>'grok_principal_id','') IS DISTINCT FROM COALESCE(NEW.credentials->>'grok_principal_id','') OR
-			COALESCE(OLD.credentials->>'grok_oidc_issuer','') IS DISTINCT FROM COALESCE(NEW.credentials->>'grok_oidc_issuer','')
+			COALESCE(OLD.credentials->>'grok_oidc_issuer','') IS DISTINCT FROM COALESCE(NEW.credentials->>'grok_oidc_issuer','') OR
+			COALESCE(OLD.credentials->>'antigravity_quota','') IS DISTINCT FROM COALESCE(NEW.credentials->>'antigravity_quota','') OR
+			COALESCE(OLD.credentials->>'antigravity_quota_epoch','') IS DISTINCT FROM COALESCE(NEW.credentials->>'antigravity_quota_epoch','') OR
+			OLD.credential_generation IS DISTINCT FROM NEW.credential_generation
 		) EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
 		CREATE TRIGGER scheduler_outbox_accounts_delete AFTER DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION codex2api_scheduler_outbox_row('account','id');
 

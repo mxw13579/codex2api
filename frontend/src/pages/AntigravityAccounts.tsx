@@ -6,6 +6,7 @@ import {
   ArrowUp,
   ArrowUpDown,
   Download,
+  Eraser,
   FlaskConical,
   FolderOpen,
   Layers,
@@ -113,7 +114,7 @@ type StatusFilter = "all" | "active" | "rate_limited" | "abnormal" | "disabled" 
 type AuthFilter = "all" | "oauth" | "api_key";
 type SortKey = "updated_at" | "usage" | "today" | "requests" | "created_at" | "group";
 type SortDir = "asc" | "desc";
-type BatchOperation = "sync" | "test" | "delete" | "update" | "reset" | "clean";
+type BatchOperation = "sync" | "test" | "delete" | "update" | "reset" | "clean" | "quota-clear";
 
 const DEFAULT_SORT: SortKey = "updated_at";
 const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = {
@@ -862,6 +863,35 @@ function AntigravityAccounts({
     }
   };
 
+  // 运维止血:清除选中账号已存储的配额事实并递增配额纪元(误封/契约异常时使用),
+  // 后端同事务清空内存门禁状态,凭据与模型目录不受影响。
+  const handleBatchClearQuota = async () => {
+    if (selectedIds.length === 0 || batchBusy) return;
+    const confirmed = await confirm({
+      title: t("antigravityQuota.clearTitle"),
+      description: t("antigravityQuota.clearConfirm"),
+      confirmText: t("antigravityQuota.clearAction"),
+      tone: "warning",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    setBatchOperation("quota-clear");
+    try {
+      const result = await api.clearAntigravityQuota(selectedIds);
+      showToast(
+        (result.failed ?? 0) > 0
+          ? t("antigravityQuota.clearPartial", { cleared: result.cleared ?? 0, failed: result.failed ?? 0 })
+          : t("antigravityQuota.clearDone", { cleared: result.cleared ?? 0 }),
+        (result.failed ?? 0) > 0 ? "warning" : "success",
+      );
+      await finishBatch(true);
+    } catch (batchError) {
+      showToast(t("antigravityQuota.clearFailed", { error: getErrorMessage(batchError) }), "error");
+    } finally {
+      setBatchOperation(null);
+    }
+  };
+
   const handleBatchDelete = async () => {
     if (selectedIds.length === 0 || batchBusy) return;
     const confirmed = await confirm({
@@ -1565,6 +1595,13 @@ function AntigravityAccounts({
                   icon: <RotateCcw className="size-3.5" />,
                   disabled: batchBusy,
                   onSelect: () => void handleBatchResetStatus(),
+                },
+                {
+                  key: "quota-clear",
+                  label: t("antigravityQuota.clearAction"),
+                  icon: <Eraser className="size-3.5" />,
+                  disabled: batchBusy,
+                  onSelect: () => void handleBatchClearQuota(),
                 },
                 {
                   key: "models",

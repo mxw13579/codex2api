@@ -850,6 +850,11 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 		// Keep the compatibility JSON field synchronized with the canonical
 		// column in the same write that publishes the rotated credential.
 		merged["credential_family_id"] = familyID
+		// Antigravity 受控 carryforward（Spec §4.1 代际变迁规则 #1）：例行同身份换票
+		// 不得把已落库的配额事实洗新，也不得递增 antigravity_quota_epoch。该逻辑按
+		// credentials 的 upstream_type 条件化，Grok/Codex 的既有语义完全不受影响；
+		// ReplaceAccountCredentialsCAS（身份替换）不调用本函数，其失效栅栏依旧生效。
+		ApplyAntigravityCarryforwardOnUpdateCAS(merged, string(bytesFromDBValue(raw)))
 		encoded, marshalErr := json.Marshal(encryptSensitiveCredentials(merged))
 		if marshalErr != nil {
 			return marshalErr

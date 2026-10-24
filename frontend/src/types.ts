@@ -117,7 +117,29 @@ export interface AntigravitySettingsResponse {
   model_redirects: Record<string, string>
   redirect_overrides_effort: boolean
   expose_thoughts: boolean
+  /** 配额自动刷新开关（GET 返回后端生效值；PUT 缺失 = 保留现值，null = 重置默认）。 */
+  quota_refresh_enabled?: boolean
+  /** 配额刷新间隔（分钟），允许范围 3–60。 */
+  quota_refresh_interval_minutes?: number
+  /** 配额硬门禁开关：开启后配额耗尽账号直接 429，不进入排队。 */
+  quota_gate_enabled?: boolean
+  /** 渠道配置 CAS 版本号（只读，后端下发）。 */
+  config_revision?: number
   choices: AntigravityRedirectChoice[]
+}
+
+/** POST /accounts/antigravity/quota/clear 的逐项结果（运维止血）。 */
+export interface AntigravityQuotaClearItem {
+  id: number
+  ok: boolean
+  quota_epoch: number
+  error?: string
+}
+
+export interface AntigravityQuotaClearResponse {
+  cleared: number
+  failed: number
+  items: AntigravityQuotaClearItem[]
 }
 
 export interface VisibleChannelsSettings {
@@ -1131,7 +1153,10 @@ export interface AntigravityModelQuota {
   model?: string
   model_id?: string
   name?: string
-  remaining_fraction?: number
+  /** V2 契约：null 表示无事实；配合 fraction_present 区分"未观测"与"观测到耗尽"。 */
+  remaining_fraction?: number | null
+  /** 上游是否观测到该配额的 remaining_fraction（true 时 0 是可信的耗尽事实）。 */
+  fraction_present?: boolean
   remaining_percent?: number
   reset_time?: string
   display_name?: string
@@ -1147,7 +1172,10 @@ export interface AntigravityModelQuota {
 export interface AntigravityQuotaBucket {
   bucket_id: string
   window: string
-  remaining_fraction: number
+  /** V2 契约：null 表示无事实；配合 fraction_present 区分"未观测"与"观测到耗尽"。 */
+  remaining_fraction: number | null
+  /** 上游是否观测到该配额的 remaining_fraction（true 时 0 是可信的耗尽事实）。 */
+  fraction_present?: boolean
   reset_time?: string
   display_name?: string
   description?: string
@@ -3750,6 +3778,8 @@ export interface OfficialPricingSyncResult {
 	sources: string[]
 	warnings?: string[]
 	synced_at: string
+	fallbacks?: Record<string, string>
+	notices?: string[]
 }
 
 /**

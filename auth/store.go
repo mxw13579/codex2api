@@ -196,6 +196,13 @@ type Account struct {
 	antigravityQuotaObservedAt  time.Time
 	antigravityQuotaValid       bool
 	antigravityModelMaxOutput   map[string]int
+	// AntigravityQuota 是 credentials JSON 中 antigravity_quota 的内存 V2 投影，
+	// 受 a.mu 保护；由账号装载、client.Sync 落库后与 outbox consumer 投影共同更新。
+	AntigravityQuota AntigravityQuotaSnapshot
+	// antigravityQuotaEpoch 是上述内存配额事实所属的失效纪元基线（credentials JSON 的
+	// antigravity_quota_epoch 键）。跨实例投影按它做单调判定：纪元递增即序号空间重新
+	// 初始化，更旧纪元的一切观测一律丢弃（Spec §4.3）。受 a.mu 保护。
+	antigravityQuotaEpoch int64
 	// antigravityPenalty 是 Antigravity 首绑/Fresh 选号避险使用的近期限流惩罚：
 	// 进程内、指数衰减、不落库（见 antigravity_ratelimit.go）。它只影响「下一个
 	// 新会话优先选谁」，不参与冷却判定，也不改变任何既有绑定语义。
@@ -1475,7 +1482,45 @@ func (a *Account) IsAvailable() bool {
 	return a.isAvailableLocked(time.Now())
 }
 
+// antigravityQuotaBlockReasonQuotaExhausted 是配额硬门禁对外暴露的类型化阻断原因
+// （Spec §6.2 #2）。上层（proxy 边缘层）据此把「候选全被门禁阻断」映射为 429 +
+// reason，而不是与容量满、鉴权失败混为一谈的 503。
+const antigravityQuotaBlockReasonQuotaExhausted = "quota_exhausted"
+
+// ErrQuotaExhausted 是「候选账号全因 Antigravity 配额硬门禁被阻断」的哨兵错误：
+// 调用方用 errors.Is 识别后返回 429，而不是排队等待或 503。
+var ErrQuotaExhausted = errors.New("antigravity account quota exhausted")
+
+// antigravityQuotaBlockReasonLocked 返回账号级的类型化阻断原因，未阻断时为空串。
+//
+// Locked 语义：调用方必须已持有 a.mu（读锁或写锁）。谓词本身纯内存只读，不做 I/O、
+// 不起 goroutine（Spec §3.3）。阻断判定与选号决策落在同一次账号临界区内，两者之间
+// 没有可插入其他决策的时间窗（原子线性化）。
+func (a *Account) antigravityQuotaBlockReasonLocked(now time.Time) string {
+	exhausted, _, _ := a.IsAntigravityQuotaExhaustedLocked(now)
+	if exhausted {
+		return antigravityQuotaBlockReasonQuotaExhausted
+	}
+	return ""
+}
+
+// antigravityAccountQuotaBlocked 是自锁封装的阻断查询，供锁外的选号入口复检使用。
+// nil 账号与未命中的账号都返回 false。
+func antigravityAccountQuotaBlocked(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	return acc.antigravityQuotaBlockReasonLocked(time.Now()) != ""
+}
+
 func (a *Account) isAvailableLocked(now time.Time) bool {
+	// 配额硬门禁先于 Antigravity 的鉴权豁免分支求值：401 窄恢复（unauthorized
+	// cooldown）只豁免鉴权类围栏，绝不豁免配额事实（Spec §3.3 优先级）。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -3954,12 +3999,22 @@ type Store struct {
 	boundaryProbeWakeCh chan struct{}
 	armedBoundaryAt     atomic.Int64
 	lazyRefreshInFlight sync.Map
-	stopCh              chan struct{}
-	usageFramePersist   *usageFramePersistQueue
-	stopOnce            sync.Once
-	backgroundCtx       context.Context
-	backgroundCancel    context.CancelFunc
-	wg                  sync.WaitGroup
+	// antigravityCoordinator 是 Antigravity 控制面协调器（Spec §4.2）：每账号
+	// flight 单飞互斥 + 后台共享许可。NewStore 装配；经 antigravityFlightCoordinator
+	// 惰性兜底，保证任何构造路径下手动同步都落入单账号 flight，不允许空转绕过。
+	antigravityCoordinatorMu sync.Once
+	antigravityCoordinator   *AntigravityCoordinator
+	// antigravityQuotaScheduler 是 Antigravity groups summary 的周期调度器
+	// （Spec §5.3）。由 StartAntigravityQuotaScheduler 幂等装配；Store.Stop 在
+	// close(stopCh) 之前先停它，保证停机不再派发新的 summary 请求。
+	antigravityQuotaSchedulerMu sync.Mutex
+	antigravityQuotaScheduler   *antigravityQuotaScheduler
+	stopCh                      chan struct{}
+	usageFramePersist           *usageFramePersistQueue
+	stopOnce                    sync.Once
+	backgroundCtx               context.Context
+	backgroundCancel            context.CancelFunc
+	wg                          sync.WaitGroup
 
 	// 代理池
 	proxyPoolReloadMu    sync.Mutex
@@ -4748,6 +4803,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		sessionSlotReservations:    make(map[int64]map[string][]uint64),
 		promptFilterNewAPIBindings: make(map[int64]database.PromptFilterNewAPIBinding),
 		oauthRefreshLocks:          make(map[string]*oauthRefreshLocalLock),
+		antigravityCoordinator:     NewAntigravityCoordinator(4),
 	}
 	s.maxConcurrency.Store(int64(settings.MaxConcurrency))
 	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: settings.CodexTransient429CooldownEnabled})
@@ -6034,19 +6090,18 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	return nil
 }
 
-// antigravityPersistedHardFence projects only authoritative, durable provider
-// facts into runtime availability. Missing or malformed snapshots remain
-// fail-open; an explicit forbidden quota, observed Allowed=false permission,
-// or permanent OAuth failure is a hard fence until a later successful sync
-// replaces the persisted fact.
-func antigravityPersistedHardFence(row *database.AccountRow) (reason string, permanentRefresh bool) {
+// antigravityAccessFenceReasonFromRow 报告持久化事实是否仍呈访问拒绝类硬围栏
+// （quota forbidden 或 entitlements 明确 Allowed=false），否则返回空串。
+// 与 antigravityPersistedHardFence 前两个分支同构，供手动同步的行级状态投影
+// 与管理端结果映射复用。
+func antigravityAccessFenceReasonFromRow(row *database.AccountRow) string {
 	if row == nil || !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamAntigravity) {
-		return "", false
+		return ""
 	}
 	if raw := strings.TrimSpace(row.GetCredential("antigravity_quota")); raw != "" {
 		var quota AntigravityQuotaSnapshot
 		if json.Unmarshal([]byte(raw), &quota) == nil && quota.Forbidden {
-			return "Google quota API denied access", false
+			return "Google quota API denied access"
 		}
 	}
 	permissionsRaw := strings.TrimSpace(row.GetCredential("antigravity_permissions"))
@@ -6061,8 +6116,23 @@ func antigravityPersistedHardFence(row *database.AccountRow) (reason string, per
 			if reason == "" {
 				reason = "Google account is not allowed to use Antigravity"
 			}
-			return reason, false
+			return reason
 		}
+	}
+	return ""
+}
+
+// antigravityPersistedHardFence projects only authoritative, durable provider
+// facts into runtime availability. Missing or malformed snapshots remain
+// fail-open; an explicit forbidden quota, observed Allowed=false permission,
+// or permanent OAuth failure is a hard fence until a later successful sync
+// replaces the persisted fact.
+func antigravityPersistedHardFence(row *database.AccountRow) (reason string, permanentRefresh bool) {
+	if row == nil || !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), UpstreamAntigravity) {
+		return "", false
+	}
+	if accessReason := antigravityAccessFenceReasonFromRow(row); accessReason != "" {
+		return accessReason, false
 	}
 	if syncErr := strings.TrimSpace(row.GetCredential("antigravity_sync_error")); syncErr != "" {
 		if permanentErr := strings.TrimSpace(row.GetCredential(antigravityPermanentRefreshErrorCredentialKey)); permanentErr != "" && permanentErr == syncErr {
@@ -6076,6 +6146,19 @@ func antigravityPersistedHardFence(row *database.AccountRow) (reason string, per
 		}
 	}
 	return "", false
+}
+
+// antigravityQuotaEpochFromRow 读取 credentials JSON 的 antigravity_quota_epoch 失效
+// 纪元基线，缺失或非法一律 0（Spec §4.1 失效纪元）。
+func antigravityQuotaEpochFromRow(row *database.AccountRow) int64 {
+	if row == nil {
+		return 0
+	}
+	epoch, ok := row.GetCredentialInt64("antigravity_quota_epoch")
+	if !ok || epoch < 0 {
+		return 0
+	}
+	return epoch
 }
 
 // buildAccountFromRow 将数据库账号行转换为运行时账号；凭据缺失或不可用时返回 nil。
@@ -6264,6 +6347,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	if isAntigravityAccount {
 		account.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
+		account.antigravityQuotaEpoch = antigravityQuotaEpochFromRow(row)
 		if reason, permanentRefresh := antigravityPersistedHardFence(row); reason != "" {
 			account.AntigravityHardBlocked = true
 			account.AntigravityHardBlockReason = reason
@@ -6861,6 +6945,10 @@ func (s *Store) Stop() {
 			}
 			acc.mu.Unlock()
 		}
+		// 先停 Antigravity 配额调度器：字段未装配（未启动）时安全跳过。
+		if scheduler := s.antigravityQuotaSchedulerRef(); scheduler != nil {
+			scheduler.Stop()
+		}
 		if s.stopCh != nil {
 			close(s.stopCh)
 		}
@@ -7289,6 +7377,11 @@ func (s *Store) accountLazySelectable(acc *Account) bool {
 }
 
 func (a *Account) lazySelectableLocked(now time.Time) bool {
+	// 与 isAvailableLocked 同一处硬门禁：lazy 模式是选号入口的另一条腿，漏掉它会让
+	// 被阻断账号在 lazy 部署下照常入选（含 401 窄恢复豁免路径）。
+	if a.antigravityQuotaBlockReasonLocked(now) != "" {
+		return false
+	}
 	if a.Status == StatusError {
 		return false
 	}
@@ -8054,6 +8147,12 @@ func (s *Store) takeByIDModeWithCapacity(id int64, apiKeyID int64, exclude map[i
 	if target == nil {
 		return nil, false
 	}
+	// 配额硬门禁在这里复检（且先于 continuation/spark 豁免）：被阻断是「不可选」，
+	// 不是「并发满」，因此第二个返回值必须保持 false——续链据此保留绑定并返回 nil，
+	// 新请求据此 fallthrough 借用其他账号，两者都不得进入 WaitForDispatchAvailable。
+	if antigravityAccountQuotaBlocked(target) {
+		return nil, false
+	}
 	continuationEligible := continuation && target.UsageLimitContinuationEligible()
 	sparkEligible := policy == DispatchPolicySpark && target.SparkDispatchEligible()
 	if s.GetLazyMode() {
@@ -8732,6 +8831,15 @@ func (s *Store) tryReclaimSessionSlot(acc *Account, sessionKey string, updateSch
 		return false
 	}
 	if accountDispatchBlocked(acc) {
+		if releaseOccupiedAccountSlot(acc) {
+			s.notifySchedulerAccountAvailability(acc, false)
+		}
+		return false
+	}
+	// 成功返回前复检配额硬门禁：预留槽的判定发生在选号入口，门禁可能在此期间被新的
+	// 观测置位。宁可回滚这次回收，也不得把请求交付给已耗尽的账号。唤醒等待者由置位
+	// 门禁的那次投影刷新负责，这里不再全局广播，避免每次回收都触发一轮空转重扫。
+	if antigravityAccountQuotaBlocked(acc) {
 		if releaseOccupiedAccountSlot(acc) {
 			s.notifySchedulerAccountAvailability(acc, false)
 		}
@@ -12623,6 +12731,7 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.AntigravityHardBlocked = hardReason != ""
 	acc.AntigravityHardBlockReason = hardReason
 	acc.applyAntigravityQuotaSchedulingLocked(row.GetCredential("antigravity_quota"))
+	acc.antigravityQuotaEpoch = antigravityQuotaEpochFromRow(row)
 	if permanentRefresh {
 		acc.PermanentRefreshFailures = permanentRefreshFailureTerminalLimit
 	} else if hardReason == "" {
@@ -12666,6 +12775,10 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 		atomic.StoreInt32(&acc.DispatchPaused, 1)
 	}
 	s.fastSchedulerUpdate(acc)
+	// 配额快照与硬围栏随本行一起刷新：门禁可能刚刚转为阻断或解除阻断（reset 到期、
+	// clear 动作、止血开关翻转），必须唤醒排队中的等待者立即重新求值，否则它们会
+	// 空等到超时（Spec §6.2 #2）。
+	s.notifySchedulerAvailability()
 }
 
 // reloadAntigravityRuntimeOrRemove reconciles a runtime account with the
@@ -12705,11 +12818,111 @@ func (s *Store) persistAntigravityPermanentRefreshFailure(ctx context.Context, a
 	return refreshErr
 }
 
+// antigravityFlightCoordinator 返回 Store 挂载的 Antigravity 控制面协调器
+// （Spec §4.2）。NewStore 已装配默认实例；对绕过 NewStore 的构造路径经
+// sync.Once 惰性兜底为 NewAntigravityCoordinator(4)，保证手动同步始终落入
+// 单账号 flight 单飞，不允许空转绕过协调器。
+func (s *Store) antigravityFlightCoordinator() *AntigravityCoordinator {
+	if s == nil {
+		return nil
+	}
+	s.antigravityCoordinatorMu.Do(func() {
+		if s.antigravityCoordinator == nil {
+			s.antigravityCoordinator = NewAntigravityCoordinator(4)
+		}
+	})
+	return s.antigravityCoordinator
+}
+
+// SyncAntigravityAccountForAdmin 是管理端手动同步的 Store 侧统一入口（Spec §9）：
+//   - 先取单账号 flight 互斥（opType manual_refresh，交互通道，不占后台许可）；
+//     同账号已有在途 flight 时在传入 ctx 范围内有界等待，ctx 取消即返回 ctx.Err()；
+//   - 再复用既有安全换票链路：稳定 credential family lease + DB-first
+//     generation CAS + 运行时投影（publishAntigravityRuntimeRow 内部随
+//     notifySchedulerAvailability 唤醒调度等待者）。
+//
+// 管理端因此不再直接 client.Sync，也不再绕过单飞与 family lease；账号不在运行时
+// 池时按持久化行先载入（与管理端 reload 的 LoadAccountByID 语义一致）。
+func (s *Store) SyncAntigravityAccountForAdmin(ctx context.Context, accountID int64) error {
+	if s == nil {
+		return fmt.Errorf("store is not initialized")
+	}
+	if s.db == nil {
+		return fmt.Errorf("Antigravity manual sync requires a database-backed store")
+	}
+	if accountID <= 0 {
+		return fmt.Errorf("invalid Antigravity account ID")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	coordinator := s.antigravityFlightCoordinator()
+	lease, err := coordinator.AcquireFlight(ctx, accountID, "manual_refresh")
+	if err != nil {
+		return fmt.Errorf("acquire Antigravity manual sync flight: %w", err)
+	}
+	defer lease.Release()
+
+	acc := s.FindByID(accountID)
+	if acc == nil {
+		if err := s.LoadAccountByID(ctx, accountID); err != nil {
+			return fmt.Errorf("load Antigravity account %d into runtime: %w", accountID, err)
+		}
+		acc = s.FindByID(accountID)
+	}
+	if acc == nil {
+		return fmt.Errorf("Antigravity account %d is unavailable in runtime", accountID)
+	}
+	return s.refreshAntigravityAccountDurable(ctx, acc, false)
+}
+
+// ErrAntigravityNoUsableProxy 表示代理池已启用但没有可用出口，控制面调用必须
+// fail-closed。哨兵错误供管理端 errors.Is 映射为对外统一文案。
+var ErrAntigravityNoUsableProxy = errors.New("Antigravity proxy pool is enabled but no usable proxy is available")
+
+// AntigravityAccessDeniedTag 是访问拒绝类硬围栏写入 accounts.error_message 的
+// 归属前缀；SetOwned/ClearOwned 只作用于带该前缀的行状态。
+const AntigravityAccessDeniedTag = "Antigravity access denied by Google"
+
+// ErrAntigravityAccessDenied 表示同步已把访问拒绝事实落库并投影为硬围栏。
+// 它是"已持久化的 Provider 拒绝"而非操作故障：管理端据此回显为成功+警告，
+// 与旧直连路径的 applyAntigravityAccessFence 契约保持一致。
+var ErrAntigravityAccessDenied = errors.New(AntigravityAccessDeniedTag)
+
+// ErrAntigravityCredentialGenerationChanged 表示本次同步结果因凭据代际被并发
+// 推进而作废（结果已丢弃，运行时已对齐 durable winner）。管理端映射为中文
+// 冲突文案，保持手动刷新的对外错误契约不变。
+var ErrAntigravityCredentialGenerationChanged = errors.New("Antigravity credential generation changed during refresh")
+
+// projectAntigravityManualAccessFence 把手动同步后的访问拒绝硬围栏投影到账号行
+// status/error_message（与管理端直连路径 SetOwnedAccountError 契约一致）；持久化
+// 事实恢复正常时按归属前缀回收行状态。401 恢复通道不改行状态，行为保持原样。
+func (s *Store) projectAntigravityManualAccessFence(ctx context.Context, row *database.AccountRow) {
+	if s == nil || s.db == nil || row == nil {
+		return
+	}
+	if reason := antigravityAccessFenceReasonFromRow(row); reason != "" {
+		_, _ = s.db.SetOwnedAccountError(ctx, row.ID, AntigravityAccessDeniedTag, AntigravityAccessDeniedTag+": "+reason)
+		return
+	}
+	_, _ = s.db.ClearOwnedAccountError(ctx, row.ID, AntigravityAccessDeniedTag)
+}
+
 // RefreshAntigravityAccount refreshes a Google OAuth credential after a
 // v1internal 401. Refreshes are serialized by the stable credential family,
 // re-read from the database after acquiring the lease, and published to
 // runtime only after a generation-fenced durable write succeeds.
 func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) error {
+	return s.refreshAntigravityAccountDurable(ctx, acc, true)
+}
+
+// refreshAntigravityAccountDurable 是 401 恢复与手动同步共用的安全换票/同步链路：
+// 稳定 family lease + 租约内重读 + DB-first generation CAS + 运行时投影。
+// forceRotate=true（401 恢复通道）：调用方已被上游 401，即便存量 AT 名义未过期
+// 也强制换票；forceRotate=false（手动同步通道）：保留存量 AT，交给 client.Sync
+// 仅在临近过期/被拒时换票——手动刷新的价值在刷新 quota/项目事实，不应无条件
+// 消耗 RT 轮换。
+func (s *Store) refreshAntigravityAccountDurable(ctx context.Context, acc *Account, forceRotate bool) error {
 	if s == nil || acc == nil || !acc.IsAntigravityAPI() {
 		return fmt.Errorf("account is not an Antigravity account")
 	}
@@ -12782,7 +12995,7 @@ func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) err
 			routeAccount := &Account{DBID: lockedRow.ID, ProxyURL: strings.TrimSpace(lockedRow.ProxyURL), GroupIDs: groupIDs}
 			proxyURL, usableEgress := s.ResolveUsableProxyForAccount(routeAccount)
 			if !usableEgress {
-				return fmt.Errorf("Antigravity proxy pool is enabled but no usable proxy is available")
+				return ErrAntigravityNoUsableProxy
 			}
 			client, clientErr := NewAntigravityClient(proxyURL)
 			if clientErr != nil {
@@ -12793,7 +13006,10 @@ func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) err
 			}
 			// The caller reached this path after an upstream 401. Force the token
 			// exchange even when the stored expiry still claims the bearer is fresh.
-			credential.AccessToken = ""
+			// 手动同步不强制：保留存量 AT，由 client.Sync 在临近过期时才换票。
+			if forceRotate {
+				credential.AccessToken = ""
+			}
 			criticalCtx := lease.CriticalContext()
 			result, syncErr := client.Sync(criticalCtx, credential)
 			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) {
@@ -12825,7 +13041,7 @@ func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) err
 				if antigravityRowHasFreshAccess(current, lockedRow.GetCredential("access_token")) {
 					return nil
 				}
-				return fmt.Errorf("Antigravity credential generation changed during refresh; discarded stale provider result")
+				return fmt.Errorf("%w; discarded stale provider result", ErrAntigravityCredentialGenerationChanged)
 			}
 			cleared, clearErr := s.db.ClearCooldownIfReason(criticalCtx, lockedRow.ID, "unauthorized")
 			if cleared {
@@ -12841,10 +13057,16 @@ func (s *Store) RefreshAntigravityAccount(ctx context.Context, acc *Account) err
 			if clearErr != nil {
 				return clearErr
 			}
+			if !forceRotate {
+				s.projectAntigravityManualAccessFence(criticalCtx, current)
+			}
 			if syncErr != nil {
 				return syncErr
 			}
 			if reason, _ := antigravityPersistedHardFence(current); reason != "" {
+				if accessReason := antigravityAccessFenceReasonFromRow(current); accessReason != "" {
+					return fmt.Errorf("%w: %s", ErrAntigravityAccessDenied, accessReason)
+				}
 				return errors.New(reason)
 			}
 			return nil

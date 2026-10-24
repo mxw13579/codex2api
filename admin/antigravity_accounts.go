@@ -33,6 +33,12 @@ const (
 	antigravityNoUsableEgressError      = "Antigravity 没有可用代理出口"
 	// antigravityManualRefreshTimeout 是管理端单号同步(换票+项目+权限+配额)的上限。
 	antigravityManualRefreshTimeout = 90 * time.Second
+	// antigravityQuotaClearMaxAccounts 是止血清除单次账号上限（Spec §8.2）。
+	antigravityQuotaClearMaxAccounts = 100
+	// antigravityQuotaClearTimeout 覆盖最多 100 个账号的短事务清除 + 运行时重载。
+	antigravityQuotaClearTimeout = 60 * time.Second
+	// antigravityQuotaClearedEvent 是清除配额事实写入 account_events 的审计事件类型。
+	antigravityQuotaClearedEvent = "antigravity_quota_cleared"
 )
 
 type antigravityImportRequest struct {
@@ -1963,7 +1969,81 @@ func (h *Handler) syncAntigravityAccountByID(ctx context.Context, id int64) erro
 	return errors.New("Antigravity 同步失败")
 }
 
+// antigravityStoreSyncCoordinator 是 Store 侧统一管理入口的能力面（Spec §9：
+// `Store.SyncAntigravityAccountForAdmin`）。手动同步经它入单账号 flight 与 family
+// lease，并在传入 ctx 范围内对在途 flight 有界等待；Store 未挂载该入口时（旧装配）
+// 管理端平滑回退到本包既有的控制面直连路径，不得因缺少协调器而不可用。
+type antigravityStoreSyncCoordinator interface {
+	SyncAntigravityAccountForAdmin(ctx context.Context, accountID int64) error
+}
+
+// antigravityStoreCoordinator 尝试从 store 提取 antigravityStoreSyncCoordinator 接口实现；
+// 未装配或类型不匹配时返回 nil, false。
+func antigravityStoreCoordinator(store *auth.Store) (antigravityStoreSyncCoordinator, bool) {
+	if store == nil {
+		return nil, false
+	}
+	coordinator, ok := interface{}(store).(antigravityStoreSyncCoordinator)
+	return coordinator, ok
+}
+
+// refreshAntigravityAccountViaStore 把手动同步整体交给 Store 协调器：租约、在途去重
+// 与部分成功复用都在协调器内部完成，管理端只负责回显持久化后的事实与运行时重载。
+// ctx 直接继承调用方（单号 90s / 批量按规模 / 状态同步 100s 已在各入口封顶），
+// 不再叠加内层超时；协调器对 flight 的有界等待随外层 ctx 一并生效与取消。
+func (h *Handler) refreshAntigravityAccountViaStore(ctx context.Context, id int64) (antigravityRefreshItem, bool) {
+	coordinator, ok := antigravityStoreCoordinator(h.store)
+	if !ok {
+		return antigravityRefreshItem{}, false
+	}
+	item := antigravityRefreshItem{ID: id}
+	syncErr := coordinator.SyncAntigravityAccountForAdmin(ctx, id)
+	// Store 统一入口内整条链路都可能推进 durable 状态（含失败但已落库的换票进展），
+	// 结束后一律失效账号快照缓存，对齐直连路径变更即失效的契约。
+	h.invalidateAccountSnapshotCaches()
+	if row, err := h.db.GetAccountByID(ctx, id); err == nil && row != nil {
+		item.Email = strings.TrimSpace(row.GetCredential("email"))
+		if warning := strings.TrimSpace(row.GetCredential("antigravity_sync_warning")); warning != "" {
+			item.Warning = warning
+		}
+	}
+	if syncErr != nil {
+		switch {
+		case errors.Is(syncErr, auth.ErrAntigravityNoUsableProxy):
+			// 协调器链路的"无可用出口"以哨兵表达，管理端映射为对外统一文案，
+			// 保持手动刷新的 fail-closed 错误契约不随入口切换而变化。
+			syncErr = errors.New(antigravityNoUsableEgressError)
+		case errors.Is(syncErr, auth.ErrAntigravityAccessDenied):
+			// 访问拒绝事实已由 Store 落库并投影为行级硬围栏：与直连路径一致，
+			// 回显为"成功 + 访问拒绝警告"，不作为操作失败。
+			item.Warning = appendAntigravityWarning(item.Warning, syncErr.Error())
+			syncErr = nil
+		case errors.Is(syncErr, auth.ErrAntigravityCredentialGenerationChanged):
+			// 并发推进凭据代际：本次结果已丢弃、运行时已对齐 durable winner，
+			// 沿用直连路径的冲突文案。
+			syncErr = errors.New("账号凭据已被其他操作更新，请重试")
+		}
+	}
+	if syncErr != nil {
+		item.Error = syncErr.Error()
+		return item, true
+	}
+	if err := h.reloadAntigravityRuntimeAccount(ctx, id); err != nil {
+		log.Printf("经 Store 协调器刷新 Antigravity 账号 %d 后重载运行时状态失败: %v", id, err)
+		item.Warning = appendAntigravityWarning(item.Warning, "运行时重载失败: "+err.Error())
+	}
+	h.db.InsertAccountEventAsync(id, "updated", "antigravity_refresh")
+	item.Message = "Antigravity 账号信息与额度已刷新"
+	item.OK = true
+	return item, true
+}
+
+// refreshAntigravityAccount 执行单个 Antigravity 账号的刷新：优先走 Store 协调器统一入口，
+// 协调器未装配时平滑回退到控制面直连同步路径。
 func (h *Handler) refreshAntigravityAccount(ctx context.Context, id int64) antigravityRefreshItem {
+	if item, handled := h.refreshAntigravityAccountViaStore(ctx, id); handled {
+		return item
+	}
 	item := antigravityRefreshItem{ID: id}
 	row, err := h.db.GetAccountByID(ctx, id)
 	if err != nil {
@@ -2275,4 +2355,94 @@ func antigravityCredentialFromRow(row *database.AccountRow) auth.AntigravityCred
 		credential.VerifiedEmailPresent = true
 	}
 	return credential
+}
+
+// ClearAntigravityQuotaRequest 是运维止血清除配额事实的请求体（Spec §8.2）。
+type ClearAntigravityQuotaRequest struct {
+	AccountIDs []int64 `json:"account_ids"`
+}
+
+type antigravityQuotaClearItem struct {
+	ID         int64  `json:"id"`
+	OK         bool   `json:"ok"`
+	QuotaEpoch int64  `json:"quota_epoch"`
+	Error      string `json:"error,omitempty"`
+}
+
+// ClearAntigravityQuotaHandler 是误封/契约异常时的运维止血入口（Spec §8.2、验收 #30
+// 后半、#36）：同一短事务内删除该账号全部配额 source 事实与定时器并递增 quota_epoch，
+// 凭据、models 目录分区与 credential generation 全部保留。递增的纪元让清除前已发出的
+// 任何在途观测在提交时因 epoch 不匹配被拒，因此不会被"合法的大 mySeq"原样写回封禁。
+//
+// 成功后立刻经 Store 投影重载运行时账号（清空内存 known_zero），并由 AddAccount 唤醒
+// 调度器，使被门禁挂住的等待者即时重试（触发一次优先补查）。
+func (h *Handler) ClearAntigravityQuotaHandler(c *gin.Context) {
+	var req ClearAntigravityQuotaRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if len(req.AccountIDs) == 0 {
+		writeError(c, http.StatusBadRequest, "请选择要清除配额事实的账号")
+		return
+	}
+	if len(req.AccountIDs) > antigravityQuotaClearMaxAccounts {
+		writeError(c, http.StatusBadRequest, "单次最多清除 100 个账号的配额事实")
+		return
+	}
+	ids := uniqueAccountIDs(req.AccountIDs)
+	if len(ids) == 0 {
+		writeError(c, http.StatusBadRequest, "账号 ID 非法")
+		return
+	}
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusInternalServerError, "数据库未初始化")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), antigravityQuotaClearTimeout)
+	defer cancel()
+
+	// 整批先校验渠道：混入非 Antigravity 账号必须整请求拒绝，不得把非 AG 账号的失效
+	// 纪元无端推进，也不得出现"部分清除"的半途止血。
+	rows := make([]*database.AccountRow, 0, len(ids))
+	for _, id := range ids {
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(c, http.StatusBadRequest, "账号不存在")
+				return
+			}
+			writeAntigravityAdminError(c, err)
+			return
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamAntigravity) {
+			writeError(c, http.StatusBadRequest, "仅 Antigravity 账号支持清除配额事实")
+			return
+		}
+		rows = append(rows, row)
+	}
+
+	items := make([]antigravityQuotaClearItem, 0, len(rows))
+	cleared, failed := 0, 0
+	for _, row := range rows {
+		item := antigravityQuotaClearItem{ID: row.ID}
+		newEpoch, err := h.db.ClearAntigravityQuotaSourcesCAS(ctx, row.ID)
+		if err != nil {
+			item.Error = err.Error()
+			failed++
+			items = append(items, item)
+			continue
+		}
+		item.OK = true
+		item.QuotaEpoch = newEpoch
+		cleared++
+		if reloadErr := h.reloadAntigravityRuntimeAccount(ctx, row.ID); reloadErr != nil {
+			log.Printf("清除 Antigravity 配额事实后重载账号 %d 运行时状态失败: %v", row.ID, reloadErr)
+		}
+		if eventErr := h.db.InsertAccountEvent(ctx, row.ID, antigravityQuotaClearedEvent, "admin"); eventErr != nil {
+			log.Printf("记录 Antigravity 配额清除审计事件失败 account=%d: %v", row.ID, eventErr)
+		}
+		items = append(items, item)
+	}
+	c.JSON(http.StatusOK, gin.H{"cleared": cleared, "failed": failed, "items": items})
 }

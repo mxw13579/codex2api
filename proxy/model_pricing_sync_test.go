@@ -31,18 +31,16 @@ func TestAstraPricingSourcesPreserveLongContext(t *testing.T) {
 			parse: parseModelPricingPayload,
 		},
 		{
-			name: "official API Markdown",
+			name: "official API HTML",
 			body: `
-### Standard pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-6-astra | $10.00 | $1.00 | $12.50 | $50.00 | $20.00 | $2.00 | $25.00 | $75.00 |
-### Fast pricing data
-| Model | Short context input | Short context cached input | Short context cache writes | Short context output | Long context input | Long context cached input | Long context cache writes | Long context output |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| gpt-6-astra | $20.00 | $2.00 | $25.00 | $100.00 | $40.00 | $4.00 | $50.00 | $150.00 |
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Short context input</th><th>Short context cached input</th><th>Short context cache writes</th><th>Short context output</th><th>Long context input</th><th>Long context cached input</th><th>Long context cache writes</th><th>Long context output</th></tr></thead><tbody>
+<tr><td>gpt-6-astra</td><td>$10.00</td><td>$1.00</td><td>$12.50</td><td>$50.00</td><td>$20.00</td><td>$2.00</td><td>$25.00</td><td>$75.00</td></tr>
+</tbody></table></section>
+<section data-pricing-tier="fast"><table><thead><tr><th>Model</th><th>Short context input</th><th>Short context cached input</th><th>Short context cache writes</th><th>Short context output</th><th>Long context input</th><th>Long context cached input</th><th>Long context cache writes</th><th>Long context output</th></tr></thead><tbody>
+<tr><td>gpt-6-astra</td><td>$20.00</td><td>$2.00</td><td>$25.00</td><td>$100.00</td><td>$40.00</td><td>$4.00</td><td>$50.00</td><td>$150.00</td></tr>
+</tbody></table></section>
 `,
-			parse: ParseOpenAIOfficialPricingMarkdown,
+			parse: ParseOpenAIOfficialPricingHTML,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

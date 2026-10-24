@@ -204,22 +204,17 @@ func TestGrokImageBilledPerImage(t *testing.T) {
 
 func TestParseXAIImaginePricing(t *testing.T) {
 	body := []byte(`
-### Text API Pricing
-
-| Model | Context | Input / 1M tokens | Cached input / 1M tokens | Output / 1M tokens |
-| --- | --- | --- | --- | --- |
-| grok-4.7 (< 200k prompt tokens) | 500k | $2.00 | $0.50 | $6.00 |
-
-### Imagine Pricing
-
-| Model | Cost |
-| --- | --- |
-| grok-imagine-image-quality | $0.05 / image |
-| grok-imagine-image | $0.02 / image |
-| grok-imagine-video-1.5 | $0.080 / sec |
-| grok-imagine-video | $0.50 / image |
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Context</th><th>Input / 1M tokens</th><th>Cached input / 1M tokens</th><th>Output / 1M tokens</th></tr></thead><tbody>
+<tr><td>grok-4.7 (&lt; 200k prompt tokens)</td><td>500k</td><td>$2.00</td><td>$0.50</td><td>$6.00</td></tr>
+</tbody></table></section>
+<section data-pricing-tier="standard"><table><thead><tr><th>Model</th><th>Cost</th></tr></thead><tbody>
+<tr><td>grok-imagine-image-quality</td><td>$0.05 / image</td></tr>
+<tr><td>grok-imagine-image</td><td>$0.02 / image</td></tr>
+<tr><td>grok-imagine-video-1.5</td><td>$0.080 / sec</td></tr>
+<tr><td>grok-imagine-video</td><td>$0.50 / image</td></tr>
+</tbody></table></section>
 `)
-	got, err := ParseXAIOfficialPricingMarkdown(body)
+	got, err := ParseXAIOfficialPricingHTML(body)
 	if err != nil {
 		t.Fatal(err)
 	}

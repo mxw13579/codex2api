@@ -55,10 +55,24 @@ func (db *DB) SaveModelCapabilities(ctx context.Context, snapshot ModelCapabilit
 		}
 		old := map[string]map[string]json.RawMessage{}
 		if err == nil && oldGeneration == generation {
-			if oldObserved > snapshot.ObservedAt {
-				return nil
-			}
 			_ = json.Unmarshal([]byte(oldJSON), &old)
+			if oldObserved > snapshot.ObservedAt {
+				// A newer partial observation wins the timestamp, but an older
+				// full observation may still contain fields the newer response
+				// omitted. Preserve those fields without overwriting newer values.
+				for model, fields := range snapshot.Models {
+					if old[model] == nil {
+						old[model] = make(map[string]json.RawMessage)
+					}
+					for name, value := range fields {
+						if _, exists := old[model][name]; !exists {
+							old[model][name] = value
+						}
+					}
+				}
+				snapshot.Models = nil
+				snapshot.ObservedAt = oldObserved
+			}
 		}
 		// Client-version-filtered manifests are partial observations, not deletions.
 		merged := old

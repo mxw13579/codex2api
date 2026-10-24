@@ -2,11 +2,9 @@ package proxy
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -91,11 +89,12 @@ func fetchModelPricingJSON(ctx context.Context, syncURL, proxyURL string) (map[s
 		return nil, fmt.Errorf("build pricing request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "codex2api")
+	req.Header.Set("User-Agent", subscriptionsBrowserUserAgent)
 
 	// 目标是 GitHub 域（默认定价 JSON 在 raw.githubusercontent.com）时套用专用代理；
 	// URL 可被部署方改成任意地址，故这里绝不附加 github_token。
-	client := &http.Client{Transport: newCodexStandardTransport(GithubProxyOrDefault(syncURL, proxyURL)), Timeout: 20 * time.Second}
+	client, closeClient := newVersionSyncClient(syncURL, GithubProxyOrDefault(syncURL, proxyURL), officialPricingTimeout)
+	defer closeClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("pricing request: %w", err)
@@ -105,138 +104,12 @@ func fetchModelPricingJSON(ctx context.Context, syncURL, proxyURL string) (map[s
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("pricing upstream status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, referencePricingBodyLimit+1))
 	if err != nil {
 		return nil, fmt.Errorf("read pricing response: %w", err)
 	}
+	if len(body) > referencePricingBodyLimit {
+		return nil, fmt.Errorf("定价 JSON 超过大小限制")
+	}
 	return parseModelPricingPayload(body)
-}
-
-// modelsDevCostTier 是 models.dev 单个分档价（顶层与 tiers 元素共用形态）。
-type modelsDevCostTier struct {
-	Input     float64 `json:"input"`
-	Output    float64 `json:"output"`
-	CacheRead float64 `json:"cache_read"`
-	Tier      struct {
-		Type string `json:"type"`
-		Size int64  `json:"size"`
-	} `json:"tier"`
-}
-
-type modelsDevCost struct {
-	modelsDevCostTier
-	Tiers []modelsDevCostTier `json:"tiers"`
-}
-
-type modelsDevModel struct {
-	Cost *modelsDevCost `json:"cost"`
-}
-
-type modelsDevProvider struct {
-	Models map[string]modelsDevModel `json:"models"`
-}
-
-// parseModelPricingPayload 解析定价源 JSON，自动识别两种格式：
-//   - 扁平覆盖表：{ "<model>": {input,cached_input,output,...}, ... }
-//   - models.dev api.json：{ "<provider>": { "models": { "<model>": {cost:...} } }, ... }
-//
-// 扁平格式的值不含 "models" 对象，据此区分。
-func parseModelPricingPayload(body []byte) (map[string]database.ModelPricingOverride, error) {
-	var providers map[string]modelsDevProvider
-	if err := json.Unmarshal(body, &providers); err != nil {
-		return nil, fmt.Errorf("parse pricing json: %w", err)
-	}
-	for _, p := range providers {
-		if len(p.Models) > 0 {
-			return convertModelsDevPricing(providers), nil
-		}
-	}
-	var raw map[string]database.ModelPricingOverride
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil, fmt.Errorf("parse pricing json: %w", err)
-	}
-	return raw, nil
-}
-
-// modelsDevFirstPartyProviders 是取价的第一方 provider，按优先级排列：
-// 网关同时代理 Codex（openai）与 Grok（xai），两家的官方价都要同步进来。
-// 其余 provider 是转售商，同名模型加价不一，取了会串价，故不参与。
-var modelsDevFirstPartyProviders = []string{"openai", "xai"}
-
-// convertModelsDevPricing 把 models.dev 数据转成覆盖表。只取第一方 provider
-// （其余 provider 的同名模型定价可能不同，避免串价）；键归一为规范定价键。
-// 两轮写入：先写模型 ID 即规范键的条目，别名 ID（如 chat-latest 变体）只在
-// 规范键尚无条目时补位，避免别名价覆盖正主价。
-func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]database.ModelPricingOverride {
-	models := mergeModelsDevProviders(providers, modelsDevFirstPartyProviders)
-	if len(models) == 0 {
-		// 自建镜像可能只留了别的 provider 名，退化为合并全部（按名序保证确定性）。
-		providerNames := make([]string, 0, len(providers))
-		for name := range providers {
-			providerNames = append(providerNames, name)
-		}
-		sort.Strings(providerNames)
-		models = mergeModelsDevProviders(providers, providerNames)
-	}
-
-	ids := make([]string, 0, len(models))
-	for id := range models {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
-	out := make(map[string]database.ModelPricingOverride, len(models))
-	for _, exactPass := range []bool{true, false} {
-		for _, id := range ids {
-			key := database.PricingManagementModelKey(id)
-			if key == "" || models[id].Cost == nil {
-				continue
-			}
-			if exact := key == strings.ToLower(strings.TrimSpace(id)); exact != exactPass {
-				continue
-			}
-			if _, ok := out[key]; ok {
-				continue
-			}
-			ov := modelsDevCostToOverride(*models[id].Cost)
-			if ov.IsEmpty() {
-				continue
-			}
-			out[key] = ov
-		}
-	}
-	return out
-}
-
-// mergeModelsDevProviders 按给定顺序合并多个 provider 的模型表，先出现的 provider
-// 在同名模型上优先（列表按优先级排列，缺失的 provider 直接跳过）。
-func mergeModelsDevProviders(providers map[string]modelsDevProvider, names []string) map[string]modelsDevModel {
-	merged := make(map[string]modelsDevModel)
-	for _, name := range names {
-		for id, m := range providers[name].Models {
-			if _, ok := merged[id]; ok {
-				continue
-			}
-			merged[id] = m
-		}
-	}
-	return merged
-}
-
-func modelsDevCostToOverride(cost modelsDevCost) database.ModelPricingOverride {
-	ov := database.ModelPricingOverride{
-		Input:       cost.Input,
-		CachedInput: cost.CacheRead,
-		Output:      cost.Output,
-	}
-	for _, tier := range cost.Tiers {
-		if tier.Tier.Type != "context" {
-			continue
-		}
-		ov.InputLong = tier.Input
-		ov.CachedInputLong = tier.CacheRead
-		ov.OutputLong = tier.Output
-		break
-	}
-	return ov
 }

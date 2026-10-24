@@ -2187,5 +2187,23 @@
       "6": "週六",
       "7": "週日"
     }
+  },
+  "antigravityQuota": {
+    "cardTitle": "配額自動重新整理與門禁",
+    "cardDescription": "週期性拉取 Antigravity 帳號的上游配額事實，用於排程選擇與硬門禁判定。",
+    "refreshEnabled": "自動重新整理配額",
+    "refreshEnabledHint": "依固定間隔向上游查詢各帳號配額事實。",
+    "gateEnabled": "配額硬門禁",
+    "gateEnabledHint": "開啟後配額耗盡的帳號將直接被攔截並回傳 429，不再進入排隊。",
+    "refreshInterval": "重新整理間隔（分鐘）",
+    "refreshIntervalHint": "允許範圍 3–60 分鐘；儲存後本機立即重排，跨複本經 outbox ≤5 秒生效。",
+    "hint": "關閉僅停止自動配額查詢，模型目錄維護仍獨立",
+    "saved": "配額設定已儲存",
+    "clearAction": "清除配額事實",
+    "clearTitle": "清除配額事實",
+    "clearConfirm": "確認要清除選取帳號的配額事實嗎？該操作將刪除已儲存的配額事實並遞增配額紀元，用於誤封止血；不影響憑證與模型目錄。",
+    "clearDone": "已清除 {{cleared}} 個帳號的配額事實",
+    "clearPartial": "已清除 {{cleared}} 個帳號的配額事實，{{failed}} 個失敗",
+    "clearFailed": "清除配額事實失敗：{{error}}"
   }
 }

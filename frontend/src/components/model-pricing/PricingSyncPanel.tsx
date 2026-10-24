@@ -32,6 +32,7 @@ interface PricingSyncPanelProps {
   onSyncUrlChange: (url: string) => void
   urls: {
     default: string
+    litellm: string
     modelsDev: string
     openAI: string
     xAI: string
@@ -68,9 +69,11 @@ export default function PricingSyncPanel({
   const trimmedUrl = syncUrl.trim()
   const activePreset = trimmedUrl === '' || trimmedUrl === urls.default
     ? 'default'
-    : urls.modelsDev && trimmedUrl === urls.modelsDev
-      ? 'modelsdev'
-      : 'custom'
+    : urls.litellm && trimmedUrl === urls.litellm
+      ? 'litellm'
+      : urls.modelsDev && trimmedUrl === urls.modelsDev
+        ? 'modelsdev'
+        : 'custom'
   const providers = [
     { key: 'include_openai', channel: 'codex', label: 'OpenAI / Codex', source: 'OpenAI', url: urls.openAI },
     { key: 'include_grok', channel: 'grok', label: 'xAI / Grok', source: 'xAI', url: urls.xAI },
@@ -211,9 +214,11 @@ export default function PricingSyncPanel({
               <span className="pricing-sync-preset-badge">
                 {activePreset === 'default'
                   ? t('settings.pricing.presetDefault')
-                  : activePreset === 'modelsdev'
-                    ? 'models.dev'
-                    : t('settings.pricing.presetCustom')}
+                  : activePreset === 'litellm'
+                    ? 'LiteLLM'
+                    : activePreset === 'modelsdev'
+                      ? 'models.dev'
+                      : t('settings.pricing.presetCustom')}
               </span>
             </div>
           </div>
@@ -243,6 +248,17 @@ export default function PricingSyncPanel({
                 >
                   <Sparkles className="size-3.5" />
                   {t('settings.pricing.presetDefault')}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  aria-pressed={activePreset === 'litellm'}
+                  onClick={() => onSyncUrlChange(urls.litellm)}
+                  disabled={!urls.litellm}
+                >
+                  <FileJson className="size-3.5" />
+                  LiteLLM
                 </Button>
                 <Button
                   type="button"

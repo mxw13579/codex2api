@@ -48,6 +48,9 @@ func TestLiveOfficialPricingSyncIsolated(t *testing.T) {
 
 	result, err := SyncOfficialModelPricing(ctx, db, "", OfficialPricingSyncOptions{
 		Models: []string{
+			"gpt-6-astra",
+			"gpt-6.1-sol",
+			"gpt-6-luna",
 			"gpt-5.6-sol",
 			"gpt-5.6-terra",
 			"gpt-5.6-luna",
@@ -61,10 +64,10 @@ func TestLiveOfficialPricingSyncIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("live official pricing sync: %v", err)
 	}
-	if result.Fetched != 6 || result.Applied != 5 || result.Skipped != 1 {
+	if result.Fetched != 9 || result.Applied != 8 || result.Skipped != 1 {
 		t.Fatalf("unexpected live sync result: %+v", result)
 	}
-	if len(result.Warnings) != 0 || len(result.Missing) != 0 {
+	if len(result.Missing) != 0 || len(result.Warnings) != 0 || len(result.Fallbacks) != 0 {
 		t.Fatalf("official sources should cover the selected models: %+v", result)
 	}
 
@@ -93,7 +96,7 @@ func TestLiveOfficialPricingSyncIsolated(t *testing.T) {
 			t.Fatalf("%s official rates = %v, want %v", model, actual, want)
 		}
 	}
-	assertRates("gpt-5.6-sol", overrides["gpt-5.6-sol"], [12]float64{5, 0.5, 30, 10, 1, 60, 10, 1, 45, 20, 2, 90})
+	assertRates("gpt-5.6-sol", overrides["gpt-5.6-sol"], [12]float64{4, 0.4, 20, 8, 0.8, 40, 8, 0.8, 30, 16, 1.6, 60})
 	assertRates("gpt-5.6-terra", overrides["gpt-5.6-terra"], [12]float64{2, 0.2, 12, 4, 0.4, 24, 4, 0.4, 18, 8, 0.8, 36})
 	assertRates("gpt-5.6-luna", overrides["gpt-5.6-luna"], [12]float64{0.2, 0.02, 1.2, 0.4, 0.04, 2.4, 0.4, 0.04, 1.8, 0.8, 0.08, 3.6})
 	assertRates("grok-4.6", overrides["grok-4.6"], [12]float64{2, 0.5, 6, 0, 0, 0, 4, 1, 12, 0, 0, 0})
@@ -104,10 +107,10 @@ func TestLiveOfficialPricingSyncIsolated(t *testing.T) {
 			t.Fatalf("%s cost = %.8f, want %.8f", name, got, want)
 		}
 	}
-	assertCost("Codex standard", database.CalculateCost(100_000, 1_000_000, 0, "gpt-5.6-sol", "standard"), 30.5)
-	assertCost("Codex Fast", database.CalculateCost(100_000, 1_000_000, 0, "gpt-5.6-sol", "fast"), 61)
-	assertCost("Codex long Fast", database.CalculateCost(1_000_000, 1_000_000, 0, "gpt-5.6-sol", "fast"), 110)
-	assertCost("Codex cached Fast", database.CalculateCost(100_000, 0, 100_000, "gpt-5.6-sol", "fast"), 0.1)
+	assertCost("Codex standard", database.CalculateCost(100_000, 1_000_000, 0, "gpt-5.6-sol", "standard"), 20.4)
+	assertCost("Codex Fast", database.CalculateCost(100_000, 1_000_000, 0, "gpt-5.6-sol", "fast"), 40.8)
+	assertCost("Codex long Fast", database.CalculateCost(1_000_000, 1_000_000, 0, "gpt-5.6-sol", "fast"), 76)
+	assertCost("Codex cached Fast", database.CalculateCost(100_000, 0, 100_000, "gpt-5.6-sol", "fast"), 0.08)
 	assertCost("Grok standard", database.CalculateCost(100_000, 1_000_000, 0, "grok-4.6", "standard"), 6.2)
 	grokLong := database.CalculateCostBreakdown(200_001, 1_000_000, 0, "grok-4.6", "standard")
 	if !grokLong.LongContext || grokLong.LongContextThreshold != 200000 {

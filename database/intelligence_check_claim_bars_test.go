@@ -184,7 +184,7 @@ func TestIntelligenceCheckBarsTrackActiveRun(t *testing.T) {
 }
 
 func TestIntelligenceCheckBarsAllowManualAfterDisablingAutomatic(t *testing.T) {
-	for _, disable := range []string{"global", "account"} {
+	for _, disable := range []string{"global", "account", "dispatch"} {
 		t.Run(disable, func(t *testing.T) {
 			db := intelligenceDB(t)
 			ctx := context.Background()
@@ -216,11 +216,14 @@ func TestIntelligenceCheckBarsAllowManualAfterDisablingAutomatic(t *testing.T) {
 			}
 			setEnabled := func(enabled bool) {
 				t.Helper()
-				if disable == "global" {
+				switch disable {
+				case "global":
 					settings.Enabled = enabled
 					settings, err = db.SaveIntelligenceCheckSettings(ctx, settings)
-				} else {
+				case "account":
 					err = db.SetIntelligenceCheckEnabled(ctx, []int64{id}, enabled)
+				default:
+					err = db.SetAccountEnabled(ctx, id, enabled)
 				}
 				if err != nil {
 					t.Fatal(err)

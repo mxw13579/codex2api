@@ -69,20 +69,26 @@ func TestUsagePercentForSchedulingCodexPathUnchanged(t *testing.T) {
 }
 
 func TestAntigravitySchedulingUsedPercent(t *testing.T) {
+	frac := func(v float64) *float64 { return &v }
 	// 有 quota_groups 时取最紧的桶。
 	grouped := AntigravityQuotaSnapshot{
-		Models: []AntigravityModelQuota{{ModelID: "a", RemainingFraction: 1}},
-		Groups: []AntigravityQuotaGroup{{Buckets: []AntigravityQuotaBucket{{RemainingFraction: 0.9}, {RemainingFraction: 0.3}}}},
+		Models: []AntigravityModelQuota{{ModelID: "a", RemainingFraction: frac(1), FractionPresent: true}},
+		Groups: []AntigravityQuotaGroup{{Buckets: []AntigravityQuotaBucket{{RemainingFraction: frac(0.9), FractionPresent: true}, {RemainingFraction: frac(0.3), FractionPresent: true}}}},
 	}
 	if pct, ok := antigravitySchedulingUsedPercent(grouped); !ok || pct != 70 {
 		t.Fatalf("grouped: got (%v, %v), want (70, true)", pct, ok)
 	}
 	// 无分组时取模型平均剩余。
-	modelsOnly := AntigravityQuotaSnapshot{Models: []AntigravityModelQuota{{RemainingFraction: 0.5}, {RemainingFraction: 1}}}
+	modelsOnly := AntigravityQuotaSnapshot{Models: []AntigravityModelQuota{{RemainingFraction: frac(0.5), FractionPresent: true}, {RemainingFraction: frac(1), FractionPresent: true}}}
 	if pct, ok := antigravitySchedulingUsedPercent(modelsOnly); !ok || pct != 25 {
 		t.Fatalf("models only: got (%v, %v), want (25, true)", pct, ok)
 	}
-	if _, ok := antigravitySchedulingUsedPercent(AntigravityQuotaSnapshot{Forbidden: true, Models: []AntigravityModelQuota{{RemainingFraction: 0}}}); ok {
+	// 无 presence 的 legacy 数值不可信，不产生排序键。
+	legacyOnly := AntigravityQuotaSnapshot{Models: []AntigravityModelQuota{{RemainingFraction: frac(0.5)}}}
+	if _, ok := antigravitySchedulingUsedPercent(legacyOnly); ok {
+		t.Fatal("legacy snapshot without presence must not produce a sort key")
+	}
+	if _, ok := antigravitySchedulingUsedPercent(AntigravityQuotaSnapshot{Forbidden: true, Models: []AntigravityModelQuota{{RemainingFraction: frac(0), FractionPresent: true}}}); ok {
 		t.Fatal("forbidden snapshot must not produce a sort key")
 	}
 	if _, ok := antigravitySchedulingUsedPercent(AntigravityQuotaSnapshot{}); ok {
@@ -92,9 +98,10 @@ func TestAntigravitySchedulingUsedPercent(t *testing.T) {
 
 func TestAntigravityQuotaSchedulingProjectionAndTTL(t *testing.T) {
 	now := time.Now()
+	frac := func(v float64) *float64 { return &v }
 	acc := &Account{DBID: 7, UpstreamType: UpstreamAntigravity, AccessToken: "at"}
 	raw, _ := json.Marshal(AntigravityQuotaSnapshot{
-		Models:    []AntigravityModelQuota{{RemainingFraction: 0.2}},
+		Models:    []AntigravityModelQuota{{RemainingFraction: frac(0.2), FractionPresent: true}},
 		UpdatedAt: now,
 	})
 	acc.applyAntigravityQuotaSchedulingLocked(string(raw))
@@ -103,7 +110,7 @@ func TestAntigravityQuotaSchedulingProjectionAndTTL(t *testing.T) {
 	}
 
 	stale, _ := json.Marshal(AntigravityQuotaSnapshot{
-		Models:    []AntigravityModelQuota{{RemainingFraction: 0.2}},
+		Models:    []AntigravityModelQuota{{RemainingFraction: frac(0.2), FractionPresent: true}},
 		UpdatedAt: now.Add(-antigravitySchedulingQuotaTTL - time.Hour),
 	})
 	acc.applyAntigravityQuotaSchedulingLocked(string(stale))

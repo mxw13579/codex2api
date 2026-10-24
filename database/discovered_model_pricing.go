@@ -15,6 +15,9 @@ var (
 func discoveredGPTPricingKey(model string) string {
 	model = normalizeBillingModelName(model)
 	model = strings.TrimSuffix(model, "-openai-compact")
+	if cyberDefaultPricing(daybreakCanonicalModel(model)) != nil {
+		return ""
+	}
 	if !versionedGPTPricingID.MatchString(model) {
 		return ""
 	}

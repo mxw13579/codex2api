@@ -1176,6 +1176,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/antigravity/export", h.ExportAntigravityAccounts)
 	api.POST("/accounts/antigravity/import", h.BatchImportAntigravityAccounts)
 	api.POST("/accounts/antigravity/refresh", h.BatchRefreshAntigravityAccounts)
+	// 运维止血：清除配额事实并递增 quota_epoch（Spec §8.2），与批量刷新同为账号级入口。
+	api.POST("/accounts/antigravity/quota/clear", h.ClearAntigravityQuotaHandler)
 	api.POST("/accounts/antigravity/oauth/start", h.StartAntigravityOAuth)
 	api.GET("/accounts/antigravity/oauth/status", h.GetAntigravityOAuthStatus)
 	api.POST("/accounts/antigravity/oauth/complete", h.CompleteAntigravityOAuth)
@@ -4794,6 +4796,10 @@ func (h *Handler) SyncAccountUpstreamModels(c *gin.Context) {
 		return
 	}
 	proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
+	if err := manifest.SaveCapabilities(ctx, h.db); err != nil {
+		writeError(c, http.StatusBadGateway, "保存 Codex 能力快照失败: "+err.Error())
+		return
+	}
 	if err := (proxy.DaybreakObservation{Account: account, Snapshot: daybreakSnapshot, Body: manifest.Body}).Save(ctx, h.db); err != nil {
 		writeError(c, http.StatusBadGateway, "保存 Daybreak 能力失败: "+err.Error())
 		return

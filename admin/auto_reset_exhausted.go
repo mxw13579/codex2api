@@ -63,7 +63,10 @@ func resetUsageExhausted(usage *proxy.WhamUsage, observedAt, now time.Time) bool
 	if usage == nil || observedAt.IsZero() || now.Sub(observedAt) > autoResetCreditsAccountTimeout {
 		return false
 	}
-	if credits := usage.RateLimitResetCredits; credits != nil && (credits.AvailableCount <= 0 || credits.ApplicableAvailableCount <= 0) {
+	// applicable_available_count is advisory only: Business Pro Lite accounts have
+	// reported 0 at 7d=100% with available coupons, yet consume succeeded and reset
+	// the window. An upstream refusal is handled as an ordinary consume failure.
+	if credits := usage.RateLimitResetCredits; credits != nil && credits.AvailableCount <= 0 {
 		return false
 	}
 	// Only the shared long (7d-slot) window counts; a full 5h window recovers on its

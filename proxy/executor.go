@@ -575,6 +575,20 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
 	// 账号绑定时区：改写 environment_context 的时区/日期，与指纹收敛一样在分叉前统一处理。
 	requestBody = ApplyCodexTimezoneToBody(requestBody, account, time.Now())
+	// Codex multi-agent v2 兼容层：仅在调用方显式安装状态、部署方开启开关、
+	// 且下游确实是 Codex 客户端时改写 collaboration 工具 schema。冲突、无效
+	// JSON 或结构超限的请求保持原生路径，绝不猜测任务正文。
+	if state := codexMultiAgentV2StateFromContext(ctx); state != nil &&
+		codexMultiAgentV2CompatEnabled() && isCodexMultiAgentV2Client(headers.Get("User-Agent")) {
+		model := gjson.GetBytes(requestBody, "model").String()
+		if updated, optimized, err := prepareCodexMultiAgentV2Request(requestBody); err != nil {
+			log.Printf("[multi-agent-v2] 兼容层跳过请求改写 (account=%d model=%s): %v", account.ID(), model, err)
+		} else if optimized {
+			requestBody = updated
+			state.markOptimized(account.ID(), model)
+			log.Printf("[multi-agent-v2] 父请求已切换为明文协作工具 (account=%d model=%s)", account.ID(), model)
+		}
+	}
 	// lite 信号收敛：签名在 payload 规则改写后采集（规则可注入/删除 WS 标记，改写
 	// 前采集会让注入失效、删除被回填），模型也已被入口映射/规则定稿——已知不支持
 	// lite 的模型带信号上游必 400，发出前剥离。

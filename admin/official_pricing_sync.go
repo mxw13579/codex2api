@@ -13,6 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const officialPricingSyncTimeout = 3 * time.Minute
+
 // officialPricingSyncSlot ensures a manual sync and the background poller never
 // fetch/write pricing at the same time. Waiting is context-aware, so shutdown and
 // cancelled HTTP requests do not get stuck behind a slow official site.
@@ -63,7 +65,7 @@ func officialPricingConfigResponse(cfg *database.OfficialPricingSyncConfig) offi
 }
 
 func (h *Handler) officialPricingModelIDs(ctx context.Context) []string {
-	models := proxy.SupportedModelIDs(ctx, h.db)
+	models := h.codexPricingModelIDs(ctx)
 	models = append(models, h.grokBillingModelIDs()...)
 	models = append(models, h.claudeChannelModels()...)
 	return models
@@ -95,7 +97,7 @@ func (h *Handler) runOfficialPricingSyncWithWarnings(ctx context.Context, option
 	if result != nil {
 		result.Warnings = append(result.Warnings, warnings...)
 		if len(result.Missing) > 0 {
-			result.Warnings = append(result.Warnings, "未找到以下模型的官方价格，保留现有价格或兜底价: "+strings.Join(result.Missing, ", "))
+			result.Notices = append(result.Notices, "已使用内置默认定价（自定义定价优先）: "+strings.Join(result.Missing, ", "))
 		}
 		warnings = result.Warnings
 	}
@@ -170,7 +172,7 @@ func (h *Handler) SyncOfficialPricingNow(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "至少选择一个官方价格来源")
 		return
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), officialPricingSyncTimeout)
 	defer cancel()
 	result, err := h.runOfficialPricingSync(ctx, includeOpenAI, includeGrok, includeClaude)
 	if err != nil {
@@ -206,7 +208,7 @@ func (h *Handler) StartOfficialPricingSync(ctx context.Context) {
 				return
 			}
 
-			syncCtx, syncCancel := context.WithTimeout(ctx, automaticModelDiscoveryTimeout+90*time.Second)
+			syncCtx, syncCancel := context.WithTimeout(ctx, automaticModelDiscoveryTimeout+officialPricingSyncTimeout)
 			result, syncErr := h.runAutomaticModelPricingSync(syncCtx, cfg)
 			syncCancel()
 			if syncErr != nil {

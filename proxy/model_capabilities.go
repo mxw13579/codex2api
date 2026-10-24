@@ -154,6 +154,13 @@ var capabilityLearnCache = struct {
 }{entries: make(map[string]capabilityLearnEntry)}
 
 func (h *Handler) learnModelCapabilitiesAsync(account *auth.Account, body []byte) {
+	if account == nil {
+		return
+	}
+	h.learnModelCapabilitiesAsyncAtGeneration(account, account.GetCredentialGeneration(), body)
+}
+
+func (h *Handler) learnModelCapabilitiesAsyncAtGeneration(account *auth.Account, generation int64, body []byte) {
 	if h == nil || h.db == nil || account == nil || account.IsRelayStyle() {
 		return
 	}
@@ -162,7 +169,7 @@ func (h *Handler) learnModelCapabilitiesAsync(account *auth.Account, body []byte
 		return
 	}
 	observed := time.Now()
-	snapshot := database.ModelCapabilitySnapshot{AccountID: account.ID(), CredentialGeneration: account.GetCredentialGeneration(), ObservedAt: observed.UnixNano(), Models: models}
+	snapshot := database.ModelCapabilitySnapshot{AccountID: account.ID(), CredentialGeneration: generation, ObservedAt: observed.UnixNano(), Models: models}
 	key := fmt.Sprintf("%p:%d:%d", h.db, snapshot.AccountID, snapshot.CredentialGeneration)
 	hash := sha256.Sum256(body)
 	capabilityLearnCache.Lock()
@@ -186,19 +193,50 @@ func (h *Handler) learnModelCapabilitiesAsync(account *auth.Account, body []byte
 	if !h.db.RunBackgroundTask(func(parent context.Context) {
 		ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 		defer cancel()
-		if err := h.db.SaveModelCapabilities(ctx, snapshot); err != nil {
+		if err := saveModelCapabilitySnapshot(ctx, h.db, account, snapshot); err != nil {
 			forget()
 			log.Printf("save model capabilities: %v", err)
-			return
-		}
-		if stored, err := h.db.ListModelCapabilities(ctx, []int64{snapshot.AccountID}); err == nil {
-			if current, ok := stored[snapshot.AccountID]; ok {
-				account.ApplyModelCapabilities(current)
-			}
 		}
 	}) {
 		forget()
 	}
+}
+
+// SaveCapabilities persists this manifest for the account and credential
+// generation observed when the upstream request started. Explicit account
+// synchronization uses this synchronous path so success includes persistence.
+func (manifest *CodexModelsManifest) SaveCapabilities(ctx context.Context, db *database.DB) error {
+	if manifest == nil || manifest.capabilityAccount == nil || db == nil {
+		return fmt.Errorf("missing model capability observation")
+	}
+	snapshot := manifest.capabilitySnapshot
+	snapshot.Models = parseCodexModelCapabilities(manifest.Body)
+	if len(snapshot.Models) == 0 {
+		return fmt.Errorf("manifest contains no Codex model capabilities")
+	}
+	return saveModelCapabilitySnapshot(ctx, db, manifest.capabilityAccount, snapshot)
+}
+
+func saveModelCapabilitySnapshot(ctx context.Context, db *database.DB, account *auth.Account, snapshot database.ModelCapabilitySnapshot) error {
+	if snapshot.CredentialGeneration != account.GetCredentialGeneration() {
+		return fmt.Errorf("account credential generation changed")
+	}
+	if err := db.SaveModelCapabilities(ctx, snapshot); err != nil {
+		return err
+	}
+	stored, err := db.ListModelCapabilities(ctx, []int64{snapshot.AccountID})
+	if err != nil {
+		return err
+	}
+	if current, ok := stored[snapshot.AccountID]; ok {
+		if current.CredentialGeneration != snapshot.CredentialGeneration {
+			return fmt.Errorf("model capability snapshot generation changed")
+		}
+		account.ApplyModelCapabilities(current)
+	} else {
+		return fmt.Errorf("model capability snapshot was not saved for current credentials")
+	}
+	return nil
 }
 
 // Missing declarations count as unknown. Booleans require every serving

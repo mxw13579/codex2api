@@ -35,6 +35,42 @@ func TestCodexCapabilityValidationAndIntersection(t *testing.T) {
 	}
 }
 
+func TestCodexManifestSaveCapabilitiesUsesObservedGeneration(t *testing.T) {
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "caps", "sync-refresh", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &auth.Account{DBID: id, CredentialGeneration: row.CredentialGeneration, AccessToken: "test-only", PlanType: "plus"}
+	manifest := &CodexModelsManifest{
+		Body:              []byte(`{"models":[{"slug":"gpt-6.1-sol","context_window":500000,"max_context_window":872000}]}`),
+		capabilityAccount: account,
+		capabilitySnapshot: database.ModelCapabilitySnapshot{
+			AccountID: id, CredentialGeneration: row.CredentialGeneration, ObservedAt: time.Now().UnixNano(),
+		},
+	}
+	if err := manifest.SaveCapabilities(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	snapshots, err := db.ListModelCapabilities(ctx, []int64{id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(snapshots[id].Models["gpt-6.1-sol"]["context_window"]); got != "500000" {
+		t.Fatalf("context window = %q, want 500000", got)
+	}
+
+	account.CredentialGeneration++
+	if err := manifest.SaveCapabilities(ctx, db); err == nil {
+		t.Fatal("stale manifest was accepted after credential refresh")
+	}
+}
+
 func TestStoredModelCapabilitiesRestoreAndScope(t *testing.T) {
 	db := newTestModelRegistryDB(t)
 	ctx := context.Background()

@@ -1877,6 +1877,12 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
 }
 ```
 
+### 模型价格同步
+
+`GET /api/admin/model-pricing` 返回参考源地址 `litellm_url`、`models_dev_url`、`default_sync_url` 及官方 HTML 页面地址。`POST /api/admin/model-pricing/sync` 的 `url` 支持 LiteLLM、models.dev 和项目扁平 JSON 格式，手工价格不会被覆盖。
+
+`POST /api/admin/model-pricing/official-sync` 校验所选官方来源的 HTML 价格，失败或缺价时按模型依次回退 LiteLLM、models.dev、项目默认 JSON，最后恢复内置默认价。返回值 `sources` 列出取得有效价格的来源，`fallbacks` 为模型到参考源 URL 的映射，`missing` 为所有来源仍未提供有效价格的模型，`warnings` 仅包含抓取、解析及格式校验异常，`notices` 包含成功回退和使用默认价的普通提示。未勾选渠道不参与同步，管理员手工价格优先。
+
 ### 模型生图计费设置
 
 `PUT /api/admin/model-pricing`（`X-Admin-Key` 鉴权）可配置图片模型的用户计费方式：

@@ -233,6 +233,12 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 			c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts,
 		)
 		if account == nil {
+			// 选号失败只有在「候选集合全部因 Antigravity 配额硬门禁被阻断」时才改答 429
+			// （D8=A，Spec §6.2 #3）：其余无号成因（选号超时、队列准入被拒、上游 404、
+			// 不可重试传输错误）一律保持既有 200 + 本地估算回退。
+			if writeCountTokensQuotaGateError(c, selectionErr) {
+				return
+			}
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolOpenAI) {
 				return
 			}
@@ -349,6 +355,22 @@ func (h *Handler) handleGeminiCountTokens(c *gin.Context, model string, rawBody 
 		})
 		return
 	}
+}
+
+// writeCountTokensQuotaGateError 把 native countTokens 的选号失败中「候选集合全部因
+// Antigravity 配额硬门禁被阻断」这一种成因转成 429 + Retry-After + reason，返回 true
+// 表示响应已写出（Spec §6.2 #3、验收 #25）。
+//
+// 其余成因（选号超时、队列准入被拒、上游 404、不可重试传输错误）返回 false：调用方保持
+// 既有 200 + estimateInputTokens 估算回退，countTokens 是客户端计费探针，D8=A 只收紧
+// 「整池配额阻断」这一个分支，绝不把估算兜底整体换成错误。
+func writeCountTokensQuotaGateError(c *gin.Context, selectionErr error) bool {
+	retryAfterSeconds, reason, ok := schedulerQuotaExhaustion(selectionErr)
+	if !ok {
+		return false
+	}
+	writeSchedulerQuotaExhaustedError(c, retryAfterSeconds, reason)
+	return true
 }
 
 func geminiInboundEndpoint(stream bool) string {

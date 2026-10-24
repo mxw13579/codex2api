@@ -83,7 +83,7 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 				http.StatusBadGateway)
 			return
 		}
-		h.learnManifestModelsAsync(manifest.Body, account)
+		h.learnFetchedManifestAsync(manifest)
 		h.writeMergedCodexManifest(c, body, "", extraModels)
 		return
 	}
@@ -96,7 +96,7 @@ func (h *Handler) CodexModelsManifestHandler(c *gin.Context) {
 	}
 	// 顺手把清单里注册表不认识的新模型学习进注册表（只增不改不删），
 	// 让选单里出现的新模型立即通过请求侧模型校验，无需等手动同步。
-	h.learnManifestModelsAsync(manifest.Body, account)
+	h.learnFetchedManifestAsync(manifest)
 	h.writeMergedCodexManifest(c, manifest.Body, manifest.ETag, extraModels)
 }
 
@@ -376,6 +376,27 @@ func (h *Handler) learnManifestModelsAsync(manifestBody []byte, accounts ...*aut
 	for _, account := range accounts {
 		h.learnModelCapabilitiesAsync(account, manifestBody)
 	}
+	h.learnManifestModelRegistryAsync(manifestBody)
+}
+
+// learnFetchedManifestAsync carries the credential generation captured before
+// the upstream request into capability persistence. The response body must
+// never be re-associated with a generation read after a token rotation.
+func (h *Handler) learnFetchedManifestAsync(manifest *CodexModelsManifest) {
+	if manifest == nil {
+		return
+	}
+	if manifest.capabilityAccount != nil {
+		h.learnModelCapabilitiesAsyncAtGeneration(
+			manifest.capabilityAccount,
+			manifest.capabilitySnapshot.CredentialGeneration,
+			manifest.Body,
+		)
+	}
+	h.learnManifestModelRegistryAsync(manifest.Body)
+}
+
+func (h *Handler) learnManifestModelRegistryAsync(manifestBody []byte) {
 	if len(manifestBody) == 0 {
 		return
 	}
@@ -444,6 +465,9 @@ type CodexModelsManifest struct {
 	Body        []byte
 	ETag        string
 	NotModified bool
+
+	capabilityAccount  *auth.Account
+	capabilitySnapshot database.ModelCapabilitySnapshot
 }
 
 // FetchCodexModelsManifest 用账号凭据向 ChatGPT 后端实时拉取 Codex 模型清单。
@@ -466,7 +490,10 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	if account == nil {
 		return nil, fmt.Errorf("account is nil")
 	}
-	accessToken := account.GetAccessToken()
+	account.Mu().RLock()
+	accessToken := strings.TrimSpace(account.AccessToken)
+	generation := account.CredentialGeneration
+	account.Mu().RUnlock()
 	if accessToken == "" {
 		return nil, fmt.Errorf("account has no access token")
 	}
@@ -535,5 +562,12 @@ func fetchCodexModelsManifestWithURL(ctx context.Context, account *auth.Account,
 	if err != nil {
 		return nil, fmt.Errorf("read codex models response: %w", err)
 	}
-	return &CodexModelsManifest{Body: body, ETag: resp.Header.Get("ETag")}, nil
+	observedAt := time.Now().UnixNano()
+	return &CodexModelsManifest{
+		Body: body, ETag: resp.Header.Get("ETag"),
+		capabilityAccount: account,
+		capabilitySnapshot: database.ModelCapabilitySnapshot{
+			AccountID: account.ID(), CredentialGeneration: generation, ObservedAt: observedAt,
+		},
+	}, nil
 }

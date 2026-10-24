@@ -24,6 +24,12 @@
 
 Codex 注册表中管理员禁用的模型不会重新启用，账号清单学习只增加模型，不因单个账号缺少权限而删除模型；官方目录来源的非内置旧条目沿用现有同步清理规则。Grok、Claude 成功刷新后按上游结果更新账号目录。所有渠道的手工价格优先于同步价。单渠道发现失败不阻断其他渠道刷新及后续价格同步，失败会在同步警告和服务日志中报告；未公布价格的新型号暂用现有兜底价，后续轮询获得价格后自动生效。
 
+价格同步读取官方 HTML 网页，按列名识别价格，不解析 Markdown。OpenAI 折叠模型从页面内嵌数据补全，长上下文价读取该页面引用的官方价格组件，仅解码数据而不执行脚本；结构变化时拒绝不完整价格并进入参考来源回退。写入前校验表格结构、数值类型、非负有限价格、缓存读取价不高于对应输入价，以及已知模型的长上下文档位。官方抓取失败、格式变化、价格校验失败或模型缺价时，按模型依次尝试 **LiteLLM → models.dev → 项目默认 pricing.json**；仍无有效价格时清除该模型旧的同步覆盖，恢复内置默认定价。已获取的高优先级价格不会被后续来源覆盖，未勾选的渠道不受影响，管理员自定义价格始终优先。
+
+「参考 JSON 来源」提供 LiteLLM、models.dev、项目默认及自定义 URL 的手动导入。LiteLLM 的每 token 单价会转换为页面统一的 USD / 1M tokens；第三方目录只使用 OpenAI、Anthropic、xAI 第一方条目，避免混入转售商价格。自动回退顺序固定，不改写手动导入 URL。成功回退和使用内置默认价通过同步结果的普通提示展示；最近警告仅记录抓取、解析及校验异常。gpt-image-2 的 2K/4K 变体缺少独立价目时继承基础模型 token 价，仍可分别设置自定义价格。
+
+Daybreak 派生别名（如 `gpt-6-sol-daybreak-blue`、`gpt-6.1-sol-daybreak-blue`）按基础型号同步完整标准、Fast 和长上下文价格，不要求参考 JSON 单独收录别名。别名有精确价目时优先采用；别名自定义价优先，基础模型自定义价也不会被别名同步价压过。未查到基础型号价格时继续按既定来源顺序回退。官方 `gpt-daybreak-blue-latest`、`gpt-daybreak-red-latest` 的默认快照目前分别是 `gpt-5.6-sol`、`gpt-5.6-cyber`；Cyber 使用独立公开定价，不再按 Sol 兜底。来源：[Daybreak 指南](https://developers.openai.com/api/docs/guides/daybreak)、[官方价格页](https://developers.openai.com/api/docs/pricing)。
+
 Antigravity 模型仍使用「刷新全部模型」。「立即同步官方价」保持仅同步价格，模型发现由定时轮询执行。新协议、特殊权限或特殊计费规则仍可能需要更新程序。
 
 ## 配置层级
@@ -93,6 +99,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_COMPACTION_AFFINITY_TTL` | 否 | `168h` | 加密压缩状态的来源亲和 TTL。缓存仅保存密文的 SHA-256 摘要、来源账号和兼容域；已知状态不会跨 Codex 官方、不同 Responses 中转或 Grok 上游流转 |
 | `CODEX_FINGERPRINT_DEBUG` | 否 | `false` | 输出脱敏指纹策略诊断日志，不记录 token |
 | `CODEX_REQUEST_COMPRESSION` | 否 | 跟随系统设置 | 覆盖系统设置「Codex HTTP 请求体压缩」。`zstd`/`on`/`true`/`1` 强制开启，`off`/`false`/`0` 强制关闭，未设置或取值无法识别时以系统设置为准。作为部署级逃生阀存在：DB 不可达或后台打不开时仍可整机切换 |
+| `CODEX_MULTI_AGENT_V2_COMPAT` | 否 | `false` | 实验性：为官方 Codex 客户端的 Multi-Agent v2 协作工具启用明文参数兼容。仅原生 Codex 账号生效，重启生效；开启后匹配的 v2 子任务正文会以明文发送。详见 `docs/CODEX_MULTI_AGENT_V2_COMPAT.md` |
 | `CODEX_TELEMETRY_ENABLED` | 否 | 跟随系统设置 | 设为 `false` 时无视管理后台「客户端遥测」开关，部署层强制关闭模拟遥测外发 |
 | `CODEX_STATSIG_API_KEY` | 否 | 内置公开 key | 覆盖 Codex Desktop/CLI 共用的公开 Statsig SDK key，仅遥测开启时使用 |
 | `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |

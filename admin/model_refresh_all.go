@@ -415,6 +415,9 @@ func (h *Handler) refreshCodexChannelModels(ctx context.Context, emit modelRefre
 			if err != nil {
 				return 0, nil, err
 			}
+			if err := manifest.SaveCapabilities(ctx, h.db); err != nil {
+				return 0, nil, err
+			}
 			proxy.RecordResponsesLiteSupportFromManifest(manifest.Body)
 			added, err := proxy.LearnModelsFromManifest(ctx, h.db, manifest.Body, now)
 			if err != nil {

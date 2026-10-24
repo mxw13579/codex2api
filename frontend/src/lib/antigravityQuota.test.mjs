@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
 import test from 'node:test'
 import {
   aiCredits,
@@ -216,4 +217,36 @@ test('batched import results add up and item positions become global', () => {
   assert.equal(merged.failed, 1)
   assert.deepEqual(merged.items.map((item) => item.index), [2, 501])
   assert.equal(merged.proxies_imported, 1)
+})
+
+// Task 15: Antigravity 配额设置卡片与清除事实交互的 i18n 契约。
+// 本仓库 locales 为嵌套结构（如 "qualityTest": {...}，见 src/locales/zh.json），
+// 新键统一挂在 "antigravityQuota" 命名空间下，不是顶层平铺键。
+const quotaRequiredLeafKeys = [
+  'refreshEnabled',
+  'refreshInterval',
+  'gateEnabled',
+  'clearAction',
+  'clearConfirm',
+]
+
+function readQuotaNamespace(locale, file) {
+  const raw = JSON.parse(fs.readFileSync(`src/locales/${file}`, 'utf8'))
+  const ns = raw.antigravityQuota
+  assert.ok(ns && typeof ns === 'object', `missing antigravityQuota namespace in ${file}`)
+  return ns
+}
+
+test('Antigravity quota i18n keys present across all locales', () => {
+  const namespaces = {
+    zh: readQuotaNamespace('zh', 'zh.json'),
+    en: readQuotaNamespace('en', 'en.json'),
+    tw: readQuotaNamespace('zh-TW', 'zh-TW.json'),
+  }
+
+  for (const [locale, ns] of Object.entries(namespaces)) {
+    for (const k of quotaRequiredLeafKeys) {
+      assert.ok(ns[k] && ns[k].length > 0, `missing antigravityQuota.${k} in ${locale}`)
+    }
+  }
 })
