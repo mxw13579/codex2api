@@ -4761,19 +4761,18 @@ func (db *DB) flushLogs() {
 	db.flushLogBatch(false)
 }
 
-func (db *DB) flushLogBatch(drain bool) bool {
-	if db == nil {
-		return false
-	}
+// dequeueUsageLogBatch 在 logMu 下取出独立持有的批次，并返回出队时的剩余条数。
+// 只复制当前批次；清零已消费槽位以释放引用，剩余队列仅推进切片。
+func (db *DB) dequeueUsageLogBatch() ([]usageLogEntry, int) {
 	batchSize := db.GetUsageLogBatchSize()
 	if batchSize <= 0 {
 		batchSize = defaultUsageLogBatchSize
 	}
 
 	db.logMu.Lock()
+	defer db.logMu.Unlock()
 	if len(db.logBuf) == 0 {
-		db.logMu.Unlock()
-		return false
+		return nil, 0
 	}
 	take := len(db.logBuf)
 	if take > batchSize {
@@ -4781,15 +4780,24 @@ func (db *DB) flushLogBatch(drain bool) bool {
 	}
 	batch := make([]usageLogEntry, take)
 	copy(batch, db.logBuf[:take])
-	remaining := len(db.logBuf) - take
+	clear(db.logBuf[:take])
+	db.logBuf = db.logBuf[take:]
+	remaining := len(db.logBuf)
 	if remaining == 0 {
+		// 排空后释放大缓冲，只为后续入队保留一个批次的容量。
 		db.logBuf = make([]usageLogEntry, 0, batchSize)
-	} else {
-		next := make([]usageLogEntry, remaining, remaining+batchSize)
-		copy(next, db.logBuf[take:])
-		db.logBuf = next
 	}
-	db.logMu.Unlock()
+	return batch, remaining
+}
+
+func (db *DB) flushLogBatch(drain bool) bool {
+	if db == nil {
+		return false
+	}
+	batch, remaining := db.dequeueUsageLogBatch()
+	if len(batch) == 0 {
+		return false
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
