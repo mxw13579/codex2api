@@ -253,6 +253,10 @@ OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设�
 
 原生 WebSocket 入口为 `GET /v1/responses`。客户端每轮发送 `response.create`；当前网关明确拒绝 `response.append` 和官方 GPT-6 `response.steer`，返回 `status:400` 的 `unsupported_feature` WebSocket 错误帧，不会伪装成已完成的 steer。需要中途改向时，应等待当前轮结束后用 `previous_response_id` 发起新的 `response.create`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。相同 `stream_id`（含缺省流）内 FIFO，不同独立流可并行；每连接最多 16 个活动轮次、32 个命名流。每个 API Key 最多保留 64 条并发下游 WebSocket 连接，全局 4096 条；显式启用匿名访问时，匿名连接另按 IP 限制 16 条，超出返回 `503` 和 `Retry-After: 5`。命名流事件和请求级错误带回 `stream_id`，命名流请求错误或抢占不会关闭其他健康流，缺省流保留原有协议错误关闭行为。上游连接池按流隔离；同一客户端连接可从另一流已提交的 `store:false` 响应分叉，仍须命中完整缓存并满足授权范围，且指向同一父响应时仍可能等待上游原连接租约。不同 API Key 或不同路由作用域不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
 
+**上游错误与流式状态：** Codex 和 OpenAI Responses 的 WS 出站会在内部转成 SSE，内部 HTTP `200` 只表示流已建立，不代表本轮模型请求成功。`response.done` / `response.completed` 若携带明确的失败状态、非空错误或 `4xx/5xx` 状态，会按 `response.failed` 处理；正常 `incomplete` 截断仍保留。数值型 `status:503` 与 `status_code:503` 均可识别，不通过正文中的“overload”等词猜测失败。
+
+重试耗尽后，尚未提交响应头的 HTTP 请求返回明确错误：例如流内 `503` 返回 HTTP `503`，无终态提前断流返回 `502 upstream_stream_break`，非流式 Chat 不会把空内容或半截文本包装成成功结果。若 SSE 已发出内容或心跳，HTTP `200` 已无法更改，错误须通过流内失败事件表达，不追加成功终态或 Chat 的 `[DONE]`。原生下游 WebSocket 升级后同样不能再更改 HTTP 状态，客户端应检查 `error` / `response.failed`，不能仅凭连接建立或关闭判断请求成功。
+
 **响应示例:**
 
 ```json
