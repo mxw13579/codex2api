@@ -5524,7 +5524,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		outputCollector := newResponseOutputCollector()
 		var completedResponseData []byte
 		var completedResponseOutputItems []json.RawMessage
-		var compactionProvenancePayloads [][]byte
+		var compactionDigests compactionProvenanceDigests
 		promptPolicyIncidentID := ""
 		upstreamCyberPolicyLogged := false
 		var streamAttempt *continuousRetryStreamAttempt
@@ -5581,7 +5581,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				streamDiag.markUpstreamFrame()
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
+					compactionDigests.addPayload(data)
 				} else {
 					h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				}
@@ -5847,7 +5847,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					data = restoreCodexMultiAgentV2Response(data, multiAgentV2State)
 				}
 				if continuousRetryBuffersAttempts(continuousRetryPolicy) {
-					compactionProvenancePayloads = append(compactionProvenancePayloads, bytes.Clone(data))
+					compactionDigests.addPayload(data)
 				} else {
 					h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
 				}
@@ -6012,8 +6012,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 			} else {
-				for _, payload := range compactionProvenancePayloads {
-					h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
+				// Non-streaming has no replay; publish only after its JSON write below.
+				if isStream && c.Request.Context().Err() == nil {
+					h.recordCompactionProvenanceDigests(context.Background(), account, compactionDigests)
 				}
 				if isStream && len(completedResponseData) > 0 {
 					cacheCommittedCodexHTTPResponse(resp, respCacheOwner, expandedInputRaw, completedResponseData, completedResponseOutputItems, account)
@@ -6100,8 +6101,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				c.Header("Content-Type", "application/json")
 				c.Status(http.StatusOK)
 				if err := writeAll(c.Writer, responseJSON); err == nil {
-					for _, payload := range compactionProvenancePayloads {
-						h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
+					if outcome.logStatusCode == http.StatusOK && c.Request.Context().Err() == nil {
+						h.recordCompactionProvenanceDigests(context.Background(), account, compactionDigests)
 					}
 					if len(completedResponseData) > 0 {
 						cacheCommittedCodexHTTPResponse(resp, respCacheOwner, expandedInputRaw, completedResponseData, completedResponseOutputItems, account)
