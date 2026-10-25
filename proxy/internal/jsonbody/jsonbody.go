@@ -21,6 +21,75 @@ func DeletePath(body []byte, path string) []byte {
 	return body
 }
 
+// DeletePaths is equivalent to calling DeletePath for each path in order. For
+// three or more distinct plain top-level names, one TopLevel lookup replaces
+// the per-path presence checks. Missing paths keep the original slice without
+// a whole-document copy. Smaller batches, repeated or complex paths, and
+// invalid or non-object JSON retain the per-path behavior.
+func DeletePaths(body []byte, paths ...string) []byte {
+	// The two-field envelope cleanup must not pay for validation and batching.
+	if len(paths) < 3 {
+		return deletePathsSequential(body, paths)
+	}
+	for i, path := range paths {
+		if !plainTopLevelPath(path) {
+			return deletePathsSequential(body, paths)
+		}
+		for _, previous := range paths[:i] {
+			if path == previous {
+				// Repeated paths can delete successive duplicate JSON keys,
+				// then must skip the copy once none remain.
+				return deletePathsSequential(body, paths)
+			}
+		}
+	}
+	// TopLevel uses gjson's permissive parser. Do not trust negative presence
+	// results on malformed input, where it may differ from per-path lookups.
+	if !gjson.ValidBytes(body) {
+		return deletePathsSequential(body, paths)
+	}
+	values, ok := TopLevel(body, paths...)
+	if !ok {
+		return deletePathsSequential(body, paths)
+	}
+	// Results borrow body. Snapshot every presence bit before any deletion;
+	// never inspect their strings or raw bytes after body may have changed.
+	present := make([]bool, len(paths))
+	for i := range values {
+		present[i] = values[i].Exists()
+	}
+	for i, path := range paths {
+		if present[i] {
+			// Deleting a distinct top-level name cannot remove another one;
+			// presence is still known, so do not repeat DeletePath's lookup.
+			body, _ = sjson.DeleteBytes(body, path)
+		}
+	}
+	return body
+}
+
+func deletePathsSequential(body []byte, paths []string) []byte {
+	for _, path := range paths {
+		body = DeletePath(body, path)
+	}
+	return body
+}
+
+func plainTopLevelPath(path string) bool {
+	if path == "" {
+		return false
+	}
+	for i := 0; i < len(path); i++ {
+		c := path[i]
+		// Deliberately narrow: all escaping, nesting, queries, modifiers and
+		// other path syntax must retain the original DeletePath semantics.
+		if !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // SetString skips the rewrite when path already holds the exact bytes sjson
 // would write for value.
 func SetString(body []byte, path, value string) []byte {
