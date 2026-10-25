@@ -31,8 +31,14 @@ Thumbs.db
 USAGE_WINDOW_LOGIC.md
 .claude/settings.local.json
 .pi
+# Preserve the original ignore for scripts at any depth.
 scripts
-# 上面的 scripts 会匹配任意层级的同名目录;前端构建/CI 用的脚本需要入库。
+# Only the reusable root probe and its isolated tests are tracked here.
+!/scripts/
+/scripts/*
+!/scripts/codex_ws_probe.py
+!/scripts/test_codex_ws_probe.py
+# Frontend build/CI scripts remain trackable.
 !frontend/scripts/
 !.github/scripts/
 
@@ -57,6 +63,7 @@ diagrams/
 /data/
 /codex2api_local
 /server.log
+/.tmp/
 
 # local e2e test scaffolding (mock upstream + scripts, not for CI)
 /local-test/
