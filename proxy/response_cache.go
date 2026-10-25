@@ -1100,6 +1100,13 @@ func cacheCompletedResponse(owner string, expandedInputRaw []byte, completedData
 // 使用流式 response.output_item.done 中已收集的 outputItems 作为兜底。
 func cacheCompletedResponseWithOutputItems(owner string, expandedInputRaw []byte, completedData []byte, outputItems []json.RawMessage) {
 	respID := gjson.GetBytes(completedData, "response.id").String()
+	cacheCompletedResponseWithLazyInput(owner, func() []byte { return expandedInputRaw }, respID, completedData, outputItems)
+}
+
+// Share output validation and admission between byte and string callers. The
+// response ID is already read by the caller; input is requested synchronously,
+// exactly once, only when a replayable snapshot needs to be constructed.
+func cacheCompletedResponseWithLazyInput(owner string, input func() []byte, respID string, completedData []byte, outputItems []json.RawMessage) {
 	if respID == "" {
 		return
 	}
@@ -1139,7 +1146,7 @@ func cacheCompletedResponseWithOutputItems(owner string, expandedInputRaw []byte
 
 	// 添加展开后的请求 input items。先成对移除参数被截断的普通
 	// function_call/function_call_output，避免缓存把毒历史延长到下一轮。
-	inputItems := gjson.ParseBytes(sanitizeResponseCacheInput(expandedInputRaw))
+	inputItems := gjson.ParseBytes(sanitizeResponseCacheInput(input()))
 	if inputItems.IsArray() {
 		inputItems.ForEach(func(_, v gjson.Result) bool {
 			if item, ok := replayableCachedInputItem(v); ok {

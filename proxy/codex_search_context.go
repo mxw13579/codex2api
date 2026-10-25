@@ -69,6 +69,10 @@ func attachCodexSearchContinuation(response *http.Response, bridge *anthropicCod
 // Call only after successful downstream commit.
 func cacheCodexSearchContinuation(response *http.Response, snapshot nativeWSCompletedContext) bool {
 	id := gjson.GetBytes(snapshot.completed, "response.id").String()
+	return cacheCodexSearchContinuationWithID(response, snapshot, id)
+}
+
+func cacheCodexSearchContinuationWithID(response *http.Response, snapshot nativeWSCompletedContext, id string) bool {
 	if !isCodexSearchResponseID(id) {
 		return false
 	}
@@ -110,10 +114,15 @@ func cacheCodexSearchContinuation(response *http.Response, snapshot nativeWSComp
 }
 
 func cacheCommittedCodexHTTPResponse(response *http.Response, owner, input string, completed []byte, outputs []json.RawMessage, account *auth.Account) {
-	snapshot := nativeWSCompletedContext{owner: owner, input: input, completed: completed, outputs: outputs, provenance: nativeWSAccountProvenance(account)}
-	if !cacheCodexSearchContinuation(response, snapshot) {
-		cacheCompletedResponseWithOutputItems(owner, []byte(input), completed, outputs)
+	id := gjson.GetBytes(completed, "response.id").String()
+	if isCodexSearchResponseID(id) {
+		// Only private search snapshots need account provenance. A logical ID
+		// must never fall back to the public output, even if replay is missing.
+		snapshot := nativeWSCompletedContext{owner: owner, input: input, completed: completed, outputs: outputs, provenance: nativeWSAccountProvenance(account)}
+		cacheCodexSearchContinuationWithID(response, snapshot, id)
+		return
 	}
+	cacheCompletedResponseWithLazyInput(owner, func() []byte { return []byte(input) }, id, completed, outputs)
 }
 
 // Reject unavailable logical ancestry before scheduling, including when the
