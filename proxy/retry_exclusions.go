@@ -19,9 +19,10 @@ type retryAccountExclusions struct {
 	recoverable map[int64]bool
 }
 
-// websocketHTTPFallbackState carries the already-acquired account lease across
-// a one-time WebSocket -> HTTP transport downgrade. A close 1009 is a transport
-// limitation, not a reason to release the account and run the scheduler again.
+// websocketHTTPFallbackState owns an already-acquired account lease between
+// Retain and Take during a one-time WebSocket -> HTTP transport downgrade.
+// Handlers must defer ReleaseRetained for exits before the next Take. Once Take
+// transfers ownership back to the attempt, its normal release path applies.
 type websocketHTTPFallbackState struct {
 	forcedHTTP bool
 	account    *auth.Account
@@ -49,6 +50,7 @@ func (s *websocketHTTPFallbackState) Retain(account *auth.Account, proxyURL stri
 	}
 }
 
+// Take transfers the retained lease to the caller without acquiring a new slot.
 func (s *websocketHTTPFallbackState) Take() (*auth.Account, string, bool) {
 	if s == nil || s.account == nil {
 		return nil, "", false
@@ -58,6 +60,15 @@ func (s *websocketHTTPFallbackState) Take() (*auth.Account, string, bool) {
 	s.account = nil
 	s.proxyURL = ""
 	return account, proxyURL, true
+}
+
+// ReleaseRetained releases only a lease that has not been taken by an attempt.
+// Clearing ownership before calling release makes repeated cleanup a no-op and
+// prevents deferred cleanup from releasing another request's slot on the account.
+func (s *websocketHTTPFallbackState) ReleaseRetained(release func(*auth.Account)) {
+	if account, _, ok := s.Take(); ok {
+		release(account)
+	}
 }
 
 func (s *websocketHTTPFallbackState) ForceHTTP() bool {

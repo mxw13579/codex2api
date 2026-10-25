@@ -2779,9 +2779,20 @@ func responseFailedStatusCodeWithEvidence(payload []byte) (int, bool) {
 		"response.status_details.error.status_code",
 		"status_code",
 		"error.status_code",
+		// Some WS providers use numeric status rather than status_code.
+		// Lifecycle values such as "failed" must not be parsed as HTTP status.
+		"response.status",
+		"response.error.status",
+		"response.status_details.error.status",
+		"status",
+		"error.status",
 	} {
-		code := int(gjson.GetBytes(payload, path).Int())
-		if code >= 400 && code <= 599 {
+		value := gjson.GetBytes(payload, path)
+		if responsesTerminalHTTPFailure(value) {
+			code := int(value.Num)
+			if value.Type == gjson.String {
+				code, _ = strconv.Atoi(strings.TrimSpace(value.Str))
+			}
 			return code, true
 		}
 	}
@@ -4161,7 +4172,28 @@ func (h *Handler) Responses(c *gin.Context) {
 	if codexMultiAgentV2CompatEnabled() {
 		c.Request = c.Request.WithContext(withCodexMultiAgentV2State(c.Request.Context(), multiAgentV2State))
 	}
-	bodyPreparation := prepareResponsesBodyForOwnerDetailed(rawBody, respCacheOwner)
+	searchReplay, searchContextErr := prepareCodexSearchHTTPContinuation(c.Request.Context(), rawBody, respCacheOwner)
+	if searchContextErr != nil {
+		status := http.StatusConflict
+		if searchContextErr.Code == api.ErrCodeServiceUnavailable {
+			status = http.StatusServiceUnavailable
+		}
+		sendResponseContextUnavailable(c, status, responsesWSContextReason(searchContextErr))
+		return
+	}
+	if codexResponsesBodyHasHostedWebSearch(rawBody) {
+		markResponsesWSContinuationCapable(respCacheOwner, rawBody)
+	}
+	var bodyPreparation responsesBodyPreparation
+	if searchReplay != nil {
+		// Defer opaque replay until account provenance has been checked. Never
+		// route a logical ID through the ordinary relay/cache-miss bypass.
+		bodyPreparation.Body, bodyPreparation.ExpandedInputRaw = prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{forceStoreFalse: true})
+	} else {
+		bodyPreparation = prepareResponsesBodyForOwnerDetailed(rawBody, respCacheOwner)
+	}
+	finishSearchContextCommit := func() {}
+	defer func() { finishSearchContextCommit() }()
 	codexBody, expandedInputRaw := bodyPreparation.Body, bodyPreparation.ExpandedInputRaw
 	continuationStatus, continuationReason, continuationUnavailable := responseCachePreparationFailure(bodyPreparation)
 	// strip 策略：剥离网关注入及客户端携带的图片工具能力声明，作为普通文本请求继续（issue #411）。
@@ -4173,6 +4205,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	getOpenAIResponsesBody := func() []byte {
 		if openAIResponsesBody == nil {
 			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
+			if searchReplay != nil {
+				openAIResponsesBody, _ = sjson.SetRawBytes(openAIResponsesBody, "input", []byte(expandedInputRaw))
+				openAIResponsesBody, _ = sjson.DeleteBytes(openAIResponsesBody, "previous_response_id")
+			}
 		}
 		return openAIResponsesBody
 	}
@@ -4204,6 +4240,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if continuationUnavailable {
 		accountFilter = responsesContinuationRelayFilter(accountFilter)
 	}
+	accountFilter = nativeWSReplayAccountFilter(accountFilter, searchReplay)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
@@ -4237,6 +4274,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastRetryAfter string
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
+	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	invalidEncryptedContentRetried := false
 	antigravityRefreshRetried := map[int64]bool{}
 	relayContinuationAttempted := false
@@ -4262,6 +4300,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	var selectionErr error
 	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
+		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+			return
+		}
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
@@ -4363,6 +4404,17 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.Release(account)
 			sendResponsesCompatibilityError(c, compatibilityErr)
 			return
+		}
+		if searchReplay != nil {
+			searchReplay.setAccount(account)
+			expandedInputRaw = searchReplay.Input()
+			if expandedInputRaw == "" {
+				h.store.Release(account)
+				sendResponseContextUnavailable(c, http.StatusConflict, responsesWSContextReason(searchReplay.err))
+				return
+			}
+			codexBody, _ = sjson.SetRawBytes(codexBody, "input", []byte(expandedInputRaw))
+			resetOpenAIResponsesBody()
 		}
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
@@ -4470,7 +4522,14 @@ func (h *Handler) Responses(c *gin.Context) {
 					upstreamEndpoint = antigravityUpstreamEndpoint(isStream)
 					return resp, err
 				}
-				return ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, rawBody, upstreamBody, proxyURL, downstreamHeaders)
+				inboundBody := rawBody
+				if searchReplay != nil {
+					// Adapters may read the inbound Responses body instead of the
+					// prepared one. Neither representation may carry a logical ID.
+					inboundBody, _ = sjson.SetRawBytes(inboundBody, "input", []byte(expandedInputRaw))
+					inboundBody, _ = sjson.DeleteBytes(inboundBody, "previous_response_id")
+				}
+				return ExecuteRelayStyleProtocolRequest(upstreamCtx, account, GrokProtocolResponses, inboundBody, upstreamBody, proxyURL, downstreamHeaders)
 			})
 			durationMs := int(time.Since(start).Milliseconds())
 
@@ -5222,7 +5281,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
 		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
-			return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			return executeCodexResponsesRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		})
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -5505,6 +5564,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			var downstreamMu sync.Mutex
 			var pendingFirstTokenEvents bytes.Buffer
 			contEnabled, contMaxRounds := codexContinueThinkingSettings()
+			if _, search := resp.Body.(*codexSearchContextBody); search {
+				// The generic fold only sees the public search projection; it cannot
+				// build another round or commit a complete private replay from it.
+				contEnabled = false
+			}
 			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
 			// 热更新对新请求生效，流转发中途不切换缓冲策略。
 			preflightSettings := CurrentRuntimeSettings()
@@ -5576,6 +5640,10 @@ func (h *Handler) Responses(c *gin.Context) {
 						// Cache only after the private replay reaches the downstream.
 						// Otherwise a local filter/write failure would publish an ID that
 						// the client never received. Truncated terminals remain uncached.
+						if isCodexSearchResponseID(parsed.Get("response.id").String()) {
+							finishSearchContextCommit()
+							finishSearchContextCommit = beginNativeWSCommit(respCacheOwner, parsed.Get("response.id").String())
+						}
 						completedResponseData = append(completedResponseData[:0], data...)
 						completedResponseOutputItems = append(completedResponseOutputItems[:0], outputCollector.Items()...)
 					}
@@ -5722,7 +5790,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						// encrypted reasoning must never participate in account rotation.
 						rctx = WithPayloadRuleIdentity(rctx, attemptIdentity)
 						lastUpstreamCancel = rcancel
-						roundResp, roundErr := ExecuteRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+						roundResp, roundErr := executeCodexResponsesRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 						// 续想轮同样消耗账号额度：成功开轮后同步上游用量头，
 						// 否则多轮隐藏请求的额度对自动暂停/配速不可见。
 						if roundErr == nil && roundResp != nil && roundResp.StatusCode == http.StatusOK {
@@ -5948,8 +6016,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
 				}
 				if isStream && len(completedResponseData) > 0 {
-					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), completedResponseData, completedResponseOutputItems)
+					cacheCommittedCodexHTTPResponse(resp, respCacheOwner, expandedInputRaw, completedResponseData, completedResponseOutputItems, account)
 				}
+				finishSearchContextCommit()
 			}
 		}
 		_ = streamAttempt.Close()
@@ -6025,6 +6094,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 				})
 			} else if responseJSON != nil {
+				if id := gjson.GetBytes(completedResponseData, "response.id").String(); isCodexSearchResponseID(id) {
+					finishSearchContextCommit = beginNativeWSCommit(respCacheOwner, id)
+				}
 				c.Header("Content-Type", "application/json")
 				c.Status(http.StatusOK)
 				if err := writeAll(c.Writer, responseJSON); err == nil {
@@ -6032,8 +6104,9 @@ func (h *Handler) Responses(c *gin.Context) {
 						h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
 					}
 					if len(completedResponseData) > 0 {
-						cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), completedResponseData, completedResponseOutputItems)
+						cacheCommittedCodexHTTPResponse(resp, respCacheOwner, expandedInputRaw, completedResponseData, completedResponseOutputItems, account)
 					}
+					finishSearchContextCommit()
 				}
 			} else {
 				c.JSON(http.StatusBadGateway, gin.H{
@@ -6210,6 +6283,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// compact 强制非流式
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
 
+	// Compact has no private-search replay/provenance commit path. Do not let
+	// its native-relay exception forward an unresolvable logical response ID.
+	if isCodexSearchResponseID(gjson.GetBytes(rawBody, "previous_response_id").String()) {
+		sendResponseContextUnavailable(c, http.StatusConflict, "search_context_requires_responses")
+		return
+	}
 	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
 	bodyPreparation := prepareCompactResponsesBodyForOwnerDetailed(rawBody, responseCacheOwner(apiKeyID))
 	codexBody := bodyPreparation.Body
@@ -6627,7 +6706,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if compactViaResponses {
 			upstreamEndpointLabel = "/v1/responses"
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(c.Request.Context(), func() (*http.Response, error) {
-				return ExecuteRequest(c.Request.Context(), account, appendCompactionTriggerToResponsesBody(codexBody), upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
+				return executeCodexResponsesRequest(c.Request.Context(), account, appendCompactionTriggerToResponsesBody(codexBody), upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
 			})
 		} else {
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(c.Request.Context(), func() (*http.Response, error) {
@@ -7121,6 +7200,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
+	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	antigravityRefreshRetried := map[int64]bool{}
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -7139,6 +7219,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var selectionErr error
 	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
+		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+			return
+		}
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
@@ -7309,7 +7392,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
 			guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
-				return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+				return executeCodexResponsesRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 			})
 		}
 		durationMs := int(time.Since(start).Milliseconds())
@@ -7982,6 +8065,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
+			c.Set(AccessLogStatusContextKey, outcome.logStatusCode)
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3
@@ -8021,10 +8105,18 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		} else if !isStream {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolChat) {
 				// The deadline owns the terminal response.
-			} else if len(terminalFailurePayload) > 0 {
-				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
-				})
+			} else if outcome.logStatusCode != http.StatusOK {
+				// A compact result is built even when the upstream closes without a
+				// terminal. Never return that empty/partial result as successful 200.
+				status := logStatusCode
+				errorInfo := gin.H{"message": outcome.failureMessage, "type": ErrorTypeUpstreamError}
+				if status == logStatusUpstreamStreamBreak {
+					status = http.StatusBadGateway
+					errorInfo["code"] = ErrorCodeUpstreamStreamBreak
+				} else if status < 400 || status > 599 {
+					status = http.StatusBadGateway
+				}
+				c.JSON(status, gin.H{"error": errorInfo})
 			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)
 			} else {

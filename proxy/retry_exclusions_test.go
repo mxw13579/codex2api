@@ -539,6 +539,74 @@ func TestWebsocketHTTPFallbackStateRetainsLeaseOnce(t *testing.T) {
 	}
 }
 
+func TestWebsocketHTTPFallbackStateReleaseRetained(t *testing.T) {
+	account := &auth.Account{DBID: 7}
+	var state websocketHTTPFallbackState
+	state.Retain(account, "http://proxy.example", time.Second, websocketHandshakeForbiddenFallbackSource)
+	fallbackID := state.ID()
+	releases := 0
+	release := func(got *auth.Account) {
+		releases++
+		if got != account {
+			t.Fatalf("released account = %p, want %p", got, account)
+		}
+		if _, _, ok := state.Take(); ok {
+			t.Fatal("lease remained owned by state during release")
+		}
+	}
+	func() {
+		defer state.ReleaseRetained(release)
+		// Model an exit after Retain but before the next attempt's Take.
+	}()
+	state.ReleaseRetained(release)
+	if releases != 1 {
+		t.Fatalf("release calls = %d, want exactly 1", releases)
+	}
+	if state.account != nil || state.proxyURL != "" {
+		t.Fatal("cleanup left the account or proxy retained")
+	}
+	if !state.ForceHTTP() || state.ID() != fallbackID || state.Source() != websocketHandshakeForbiddenFallbackSource || state.WSElapsed() != time.Second {
+		t.Fatal("cleanup discarded fallback routing/logging metadata")
+	}
+}
+
+func TestWebsocketHTTPFallbackStateCleanupAfterTakeDoesNotRelease(t *testing.T) {
+	account := &auth.Account{DBID: 7}
+	var state websocketHTTPFallbackState
+	state.Retain(account, "http://proxy.example", time.Second, "peer_close")
+	releases := 0
+	release := func(got *auth.Account) {
+		if got != account {
+			t.Fatalf("released account = %p, want %p", got, account)
+		}
+		releases++
+	}
+	func() {
+		defer state.ReleaseRetained(release)
+		got, _, ok := state.Take()
+		if !ok || got != account {
+			t.Fatal("attempt did not take the retained lease")
+		}
+		state.ReleaseRetained(release)
+		if releases != 0 {
+			t.Fatal("cleanup released a lease owned by the active attempt")
+		}
+		// Success and terminal failure both use the attempt's release path.
+		release(got)
+	}()
+	if releases != 1 {
+		t.Fatalf("release calls = %d, want only the attempt's release", releases)
+	}
+}
+
+func TestWebsocketHTTPFallbackStateEmptyCleanup(t *testing.T) {
+	for _, state := range []*websocketHTTPFallbackState{nil, {}} {
+		state.ReleaseRetained(func(*auth.Account) {
+			t.Fatal("empty state released an account")
+		})
+	}
+}
+
 func TestWebsocketHTTPFallbackStateLogsAttemptsWithoutInventingFirstEvent(t *testing.T) {
 	previousWriter := log.Writer()
 	previousFlags := log.Flags()

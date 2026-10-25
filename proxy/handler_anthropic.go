@@ -717,6 +717,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
+	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	antigravityRefreshRetried := map[int64]bool{}
 
 	var lastUpstreamCancel context.CancelFunc
@@ -733,6 +734,9 @@ func (h *Handler) Messages(c *gin.Context) {
 	grokQualityAttempts := 0
 	var lastClaudePolicyErr *Error
 	for attempt := 0; ; attempt++ {
+		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+			return
+		}
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}

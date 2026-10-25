@@ -646,13 +646,7 @@ func isConnLimitErrorFrame(payload []byte) bool {
 
 // normalizeCompletionEvent 标准化完成事件类型
 func normalizeCompletionEvent(payload []byte) []byte {
-	if gjson.GetBytes(payload, "type").String() == "response.done" {
-		updated, err := sjson.SetBytes(payload, "type", "response.completed")
-		if err == nil && len(updated) > 0 {
-			return updated
-		}
-	}
-	return payload
+	return proxy.NormalizeResponsesTerminalEvent(payload)
 }
 
 // compactJSONOneLine 把可能带换行的 JSON 压缩为单行；非法 JSON 或空串返回 ""。

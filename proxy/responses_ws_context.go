@@ -18,6 +18,7 @@ import (
 // incremental request sent over a healthy upstream WebSocket. Missing ancestry
 // must not turn a partial input into a supposedly complete cached conversation.
 func responsesWSReplayInput(body []byte, owner string) (string, *api.APIError) {
+	owner = codexSearchContextOwner(owner, gjson.GetBytes(body, "previous_response_id").String())
 	if strings.HasPrefix(owner, nativeWSCachePrefix) {
 		return responsesWSReplayInputWithLookup(body, owner, nativeWSContextLookup)
 	}
@@ -223,7 +224,7 @@ func degradeResponsesWSContinuationWithSource(body []byte, owner string, source 
 		if strings.HasPrefix(owner, nativeWSCachePrefix) {
 			return nil, false, nativeResponsesWSContextError(apiErr)
 		}
-		if !responsesWSContinuationFailOpen() {
+		if isCodexSearchResponseID(gjson.GetBytes(body, "previous_response_id").String()) || !responsesWSContinuationFailOpen() {
 			return nil, false, apiErr
 		}
 		// 逃生阀：退回旧行为，剥掉 previous_response_id 后按原样转发当轮 input。
@@ -299,6 +300,7 @@ type responsesWSReplaySource struct {
 }
 
 func newResponsesWSReplaySource(body []byte, owner string) *responsesWSReplaySource {
+	owner = codexSearchContextOwner(owner, gjson.GetBytes(body, "previous_response_id").String())
 	source := &responsesWSReplaySource{body: body, owner: owner}
 	if previousID := gjson.GetBytes(body, "previous_response_id").String(); previousID != "" {
 		respCache.mu.RLock()

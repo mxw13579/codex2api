@@ -60,6 +60,33 @@ func TestPrepareAnthropicCodexWebSearch(t *testing.T) {
 	}
 }
 
+func TestNativeResponsesHostedWebSearchPreparesAlphaSearch(t *testing.T) {
+	plain := []byte(`{"tools":[{"type":"function","name":"web_search","parameters":{"type":"object"}}]}`)
+	if codexResponsesBodyHasHostedWebSearch(plain) {
+		t.Fatal("custom function named web_search must stay a function")
+	}
+	body := []byte(`{"model":"gpt-6.1-sol","input":[{"role":"user","content":"hi"}],"tools":[{"type":"web_search_preview"},{"type":"function","name":"shell","parameters":{"type":"object"}}],"tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"web_search_preview"}]}}`)
+	if !codexResponsesBodyHasHostedWebSearch(body) {
+		t.Fatal("hosted web_search was not detected")
+	}
+	out, bridge, err := prepareAnthropicCodexWebSearch(body, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bridge == nil || bridge.model != "gpt-6.1-sol" || bridge.remaining != anthropicCodexMaxSearchUses {
+		t.Fatalf("bridge = %+v", bridge)
+	}
+	if gjson.GetBytes(out, "tools.0.type").String() != "function" || gjson.GetBytes(out, "tools.0.name").String() != bridge.name || gjson.GetBytes(out, "tools.1.name").String() != "shell" {
+		t.Fatalf("hosted tool was not replaced: %s", out)
+	}
+	if gjson.GetBytes(out, "tool_choice.tools.0.type").String() != "function" || gjson.GetBytes(out, "tool_choice.tools.0.name").String() != bridge.name {
+		t.Fatalf("tool_choice still forces hosted search: %s", out)
+	}
+	if strings.Contains(gjson.GetBytes(out, "tools").Raw, `"web_search`) {
+		t.Fatalf("hosted web_search remained in tools: %s", out)
+	}
+}
+
 func TestAnthropicCodexWebSearchOfficialRoundTrip(t *testing.T) {
 	body, bridge, err := prepareAnthropicCodexWebSearch([]byte(`{"model":"gpt-6-luna","tools":[{"type":"web_search","filters":{"allowed_domains":["python.org"]}}],"tool_choice":"required","input":[{"role":"user","content":"Find Python"}]}`), []byte(`{"tools":[{"name":"web_search","max_uses":1}]}`))
 	if err != nil {

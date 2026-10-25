@@ -565,12 +565,16 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// 官方 Codex 每个 turn 都使用新的 ModelClientSession，并只在同一 turn 的
 	// 后续请求里回送 x-codex-turn-state。只有该信号和既有绑定同时存在时，才允许
 	// 忽略本地 WHAM 100% 快照；previous_response_id 本身不足以证明这是活跃 turn。
-	continuationPinned := turnContinuation && turnHasBinding
+	searchContinuation := isCodexSearchResponseID(gjson.GetBytes(codexBody, "previous_response_id").String())
+	continuationPinned := turnContinuation && turnHasBinding && !searchContinuation
 	continuationDegraded := false
 	if err := waitNativeWSCommit(c.Request.Context(), lookupOwner, gjson.GetBytes(codexBody, "previous_response_id").String()); err != nil {
 		return writeResponsesWSErrorForContext(c, conn, nativeResponsesWSContextError(responsesWSContextUnavailable(http.StatusServiceUnavailable, "context_commit_pending")))
 	}
 	turnReplay := newResponsesWSReplaySource(codexBody, lookupOwner)
+	if contextErr := codexSearchReplayLookupError(turnReplay); contextErr != nil {
+		return writeResponsesWSRecoveryErrorForContext(c, conn, contextErr)
+	}
 	accountFilter = nativeWSReplayAccountFilter(accountFilter, turnReplay)
 	degradeContinuation := func(reason string, attempt int) *api.APIError {
 		expanded, lost, contextErr := degradeResponsesWSContinuationWithSource(codexBody, lookupOwner, turnReplay)
@@ -597,6 +601,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return hasPreviousResponse && !continuationDegraded
 	}
 	var wsHTTPFallback websocketHTTPFallbackState
+	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	var lastUpstreamCancel context.CancelFunc
 	defer func() {
 		if lastUpstreamCancel != nil {
@@ -620,7 +625,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			if !continuationPinned && hasPreviousResponse && !continuationDegraded {
+			if !continuationPinned && hasPreviousResponse && !continuationDegraded && !searchContinuation {
 				// 绑定账号已被本次请求硬排除（上一轮 429/5xx 等）时不必再等它 30s：
 				// 排除在本请求内不会解除，直接剥离 previous_response_id 换号。
 				// 这与 turn-state 的 WHAM 例外无关：即使不是活跃 turn，旧续链
@@ -687,6 +692,15 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		turnReplay.setAccount(account)
+		if isCodexSearchResponseID(gjson.GetBytes(codexBody, "previous_response_id").String()) {
+			// A logical search ID is never an upstream continuation, even on a
+			// healthy WS connection. Expand only after checking account provenance.
+			if contextErr := degradeContinuation("logical search context", attempt+1); contextErr != nil {
+				h.store.Release(account)
+				return writeResponsesWSRecoveryErrorForContext(c, conn, contextErr)
+			}
+			turnReplay.setAccount(account)
+		}
 		if continuationDegraded && turnReplay.Input() == "" && turnReplay.err != nil {
 			h.store.Release(account)
 			return writeResponsesWSRecoveryErrorForContext(c, conn, turnReplay.err)
@@ -783,7 +797,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if account.OpenAIResponsesUsesUpstreamWebsocket() {
 				return ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			}
-			return ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			return executeCodexResponsesRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		})
 		durationMs := int(time.Since(start).Milliseconds())
 		if c.Request.Context().Err() != nil {
@@ -1040,6 +1054,20 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		preserveAffinity := preserveContinuationBinding()
 		allowContinuationDegrade := canDegradeContinuation()
 		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, lineageScope, attemptReplay, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
+			var retryErr *responsesWSRetryableStreamError
+			if errors.As(err, &retryErr) && useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+				// The stream helper leaves this lease acquired for HTTP fallback.
+				// Accept ownership before any cancellation/deadline exit below.
+				wsElapsed := time.Since(start)
+				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(retryErr.outcome.failureMessage))
+				if c.Request.Context().Err() != nil {
+					return errResponsesWSClientGone
+				}
+				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
+				globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
+				log.Printf("Responses WebSocket upstream close 1009 before first event; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), retryErr.outcome.failureMessage)
+				continue
+			}
 			if continuousRetryDeadlineExceeded(c.Request.Context()) {
 				return errResponsesWSClientGone
 			}
@@ -1052,16 +1080,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				}
 				continue
 			}
-			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
-				if useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
-					wsElapsed := time.Since(start)
-					globalWSSizeRouter.RecordMessageTooBig(len(codexBody))
-					wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(retryErr.outcome.failureMessage))
-					log.Printf("Responses WebSocket upstream close 1009 before first event; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), retryErr.outcome.failureMessage)
-					continue
-				}
 				eventType := strings.TrimSpace(retryErr.eventType)
 				if retryEnabled && shouldTransparentRetryStreamEventWithBudgets(retryErr.outcome, eventType, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, false, c.Request.Context().Err(), nil, continuousRetryPolicy) {
 					rememberContinuousRetryStreamFailure(c.Request.Context(), retryErr.outcome, retryErr.outcome.failurePayload)
@@ -1557,10 +1577,13 @@ func (h *Handler) streamResponsesWSUpstream(
 			}
 			// Committed completed/incomplete responses can be continuation history.
 			// Failed attempts and locally blocked/unwritable replays leave no cache.
-			if !outputCollector.overflow {
+			if !outputCollector.overflow || isCodexSearchResponseID(gjson.GetBytes(completedResponsePayload, "response.id").String()) {
 				committedInput := replayInput.Input()
-				cacheCommittedResponsesWSContext(nativeWSCompletedContext{owner: respCacheOwner, input: committedInput,
-					completed: completedResponsePayload, outputs: outputCollector.Items(), provenance: replayInput.committedProvenance()})
+				snapshot := nativeWSCompletedContext{owner: respCacheOwner, input: committedInput,
+					completed: completedResponsePayload, outputs: outputCollector.Items(), provenance: replayInput.committedProvenance()}
+				if !cacheCodexSearchContinuation(resp, snapshot) {
+					cacheCommittedResponsesWSContext(snapshot)
+				}
 				if committedInput != "" && options != nil && options.lineage != nil {
 					options.lineage.remember(gjson.GetBytes(completedResponsePayload, "response.id").String(), respCacheOwner, lineageScope)
 				}

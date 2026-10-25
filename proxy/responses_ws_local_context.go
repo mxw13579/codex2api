@@ -64,6 +64,7 @@ func nativeWSLocalLookup(owner, responseID string) responseCacheLookupResult {
 
 // 终态暴露前建立屏障，跨下游重连须等提交完成再读取快照。
 func beginNativeWSCommit(owner, responseID string) func() {
+	owner = codexSearchContextOwner(owner, responseID)
 	if !strings.HasPrefix(owner, nativeWSCachePrefix) || responseID == "" {
 		return func() {}
 	}
@@ -90,6 +91,7 @@ func beginNativeWSCommit(owner, responseID string) func() {
 }
 
 func waitNativeWSCommit(ctx context.Context, owner, responseID string) error {
+	owner = codexSearchContextOwner(owner, responseID)
 	nativeWSCommits.Lock()
 	done := nativeWSCommits.pending[responseCacheStoreKey(owner, responseID)]
 	nativeWSCommits.Unlock()

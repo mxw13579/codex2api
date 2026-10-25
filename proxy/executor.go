@@ -1632,6 +1632,9 @@ func ReadSSEStreamWithEvent(body io.Reader, callback func(event string, data []b
 			data = bytes.Join(dataLines, []byte("\n"))
 		}
 		isDone := bytes.Equal(data, []byte("[DONE]"))
+		if !isDone {
+			event, data = normalizeUpstreamResponsesTerminalEvent(event, data)
+		}
 		keepReading := !isDone && callback(event, data)
 		// 清掉 backing array 中的切片引用，避免最后一个大事件一直被
 		// dataLines 的容量槽位持有到整条流结束。

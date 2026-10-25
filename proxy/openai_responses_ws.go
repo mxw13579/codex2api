@@ -285,10 +285,16 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 
 		terminal := false
 		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
-			if id := strings.TrimSpace(gjson.GetBytes(frame, "response.id").String()); id != "" {
-				pool.bind(conn, id)
+			frame = NormalizeResponsesTerminalEvent(frame)
+			eventType := gjson.GetBytes(frame, "type").String()
+			// Preserve existing created/intermediate bindings, but do not add a
+			// continuation binding from a failed terminal (including done aliases).
+			if eventType != "response.failed" && eventType != "error" {
+				if id := strings.TrimSpace(gjson.GetBytes(frame, "response.id").String()); id != "" {
+					pool.bind(conn, id)
+				}
 			}
-			switch gjson.GetBytes(frame, "type").String() {
+			switch eventType {
 			case "response.completed", "response.failed", "response.incomplete", "error":
 				terminal = true
 			}
