@@ -1378,7 +1378,8 @@ func (db *DB) migrate(ctx context.Context) error {
 			response_cache_write_policy VARCHAR(20) NOT NULL DEFAULT 'always',
 			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
 			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608,
-			codex_transient_429_cooldown_enabled BOOLEAN NOT NULL DEFAULT FALSE
+			codex_transient_429_cooldown_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			codex_transient_429_cooldown_generation BIGINT NOT NULL DEFAULT 0
 		);
 	CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
 		api_key_id BIGINT NOT NULL,
@@ -1563,6 +1564,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_transient_429_cooldown_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_transient_429_cooldown_generation BIGINT NOT NULL DEFAULT 0;
+	-- Fence generationless cache records when upgrading an already-enabled policy.
+	UPDATE system_settings SET codex_transient_429_cooldown_generation = 1
+	WHERE codex_transient_429_cooldown_enabled = TRUE AND codex_transient_429_cooldown_generation = 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
@@ -2411,7 +2416,7 @@ type SystemSettings struct {
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	ContinuousRetryPolicy              string // JSON: database.ContinuousRetryPolicy
-	CodexTransient429CooldownEnabled   bool   // Default false; write only via UpdateCodexTransient429CooldownEnabled.
+	CodexTransient429CooldownEnabled   bool   // Default false; narrow policy update only.
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
 	CodexModelMapping                  string // JSON: {"requested_codex_model": "upstream_codex_model", ...}
@@ -2464,6 +2469,10 @@ type SystemSettings struct {
 	BillingTierPolicy                  string
 	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 	ShowFullUsageNumbers               bool
+
+	// Durable transient-429 revision; never written by UpdateSystemSettings.
+	CodexTransient429CooldownGeneration int64
+
 	// ShowUpstreamModelMismatch 控制用量页是否标出上游响应模型与请求模型不一致。
 	// 只影响展示和筛选，不停止记录。默认开启。
 	ShowUpstreamModelMismatch       bool
@@ -2667,6 +2676,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(max_retries, 2),
 		       COALESCE(max_rate_limit_retries, 1),
 		       COALESCE(codex_transient_429_cooldown_enabled, false),
+		       COALESCE(codex_transient_429_cooldown_generation, 0),
 		       COALESCE(allow_remote_migration, false),
 		       COALESCE(auto_clean_error, false),
 		       COALESCE(auto_clean_expired, false),
@@ -2785,7 +2795,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestContent, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.SchedulerEngine, &s.MaxRetries, &s.MaxRateLimitRetries,
-		&s.CodexTransient429CooldownEnabled, &s.AllowRemoteMigration,
+		&s.CodexTransient429CooldownEnabled, &s.CodexTransient429CooldownGeneration, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.SchedulerMode,
@@ -3029,8 +3039,8 @@ func NormalizeCodexFingerprintDefaultMode(mode string) string {
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
 // codex_synced_cli_version 与 model_pricing_* 由各自的窄更新独立维护；冲突更新时
 // 保留数据库当前值，避免管理员保存其他设置时回滚后台同步刚写入的数据。
-// continuous_retry_policy 和 codex_transient_429_cooldown_enabled 完全不在本方法中写入，
-// 分别使用 UpdateContinuousRetryPolicy 和 UpdateCodexTransient429CooldownEnabled，
+// continuous_retry_policy、codex_transient_429_cooldown_enabled 及其 generation 不在本方法中写入，
+// 分别使用 UpdateContinuousRetryPolicy 和 UpdateCodexTransient429CooldownPolicy，
 // 避免无关设置的陈旧快照覆盖新值；首次插入也使用数据库默认值。
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
 	reasoningEffortModels := strings.TrimSpace(s.ReasoningEffortModels)

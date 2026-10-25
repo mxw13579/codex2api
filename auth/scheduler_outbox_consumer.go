@@ -31,8 +31,9 @@ const (
 	// schedulerOutboxReconcileEvery is the belt-and-braces full reconcile: it
 	// repairs anything the event stream missed (skipped hole past its grace, a
 	// consumer bug) without putting scans back on the request path.
-	schedulerOutboxReconcileEvery = 5 * time.Minute
-	schedulerOutboxCleanupLoops   = 20
+	schedulerOutboxReconcileEvery           = 5 * time.Minute
+	schedulerOutboxSettingsReconcileTimeout = 5 * time.Second
+	schedulerOutboxCleanupLoops             = 20
 )
 
 type schedulerOutboxKey struct {
@@ -81,8 +82,9 @@ func (c *schedulerOutboxCursor) dueHoleIDs(now time.Time) []int64 {
 }
 
 // startSchedulerOutboxConsumer starts after the initial account snapshot has
-// loaded. startWatermark is captured before that load, so changes committed by
-// another process during startup are replayed and cannot be lost.
+// loaded. startWatermark is captured before that load, so higher-ID changes
+// committed during startup are replayed. Late commits at/below the initial
+// watermark are not tracked as holes; settings also have a periodic reread.
 func (s *Store) startSchedulerOutboxConsumer(startWatermark int64) {
 	if s == nil || s.db == nil || !s.schedulerOutboxStarted.CompareAndSwap(false, true) {
 		return
@@ -140,6 +142,11 @@ func (s *Store) startSchedulerOutboxConsumer(startWatermark int64) {
 			case <-reconcile.C:
 				// 事件流之外的兜底:低频全量对账修复任何被漏掉的状态。
 				s.TriggerDispatchStateReconcileAsync()
+				if err := s.reconcileSchedulerSettings(ctx); err != nil {
+					// A failed reread must not stop event polling or later
+					// reconciles; the next periodic tick retries it.
+					s.recordSchedulerOutboxError(err)
+				}
 			case <-cleanup.C:
 				cutoff := time.Now().Add(-schedulerOutboxRetention)
 				for i := 0; i < schedulerOutboxCleanupLoops; i++ {
@@ -776,15 +783,32 @@ func (s *Store) writeBackAntigravityConfig(ctx context.Context, raw string, merg
 	return nil
 }
 
+// reconcileSchedulerSettings repairs settings even without a consumable outbox
+// event. PostgreSQL can allocate ID N before startup, expose committed N+1 as
+// the initial watermark, then commit N after Init's settings read. Such an ID
+// is never tracked as a hole. Bound the reread, retain the last valid settings
+// on failure, and let the periodic caller retry without stopping the consumer.
+func (s *Store) reconcileSchedulerSettings(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, schedulerOutboxSettingsReconcileTimeout)
+	defer cancel()
+	return s.reloadSchedulerEngineSetting(ctx)
+}
+
 // reloadSchedulerEngineSetting also applies the persisted transient-429 pause
 // switch on every replica. Pinning the scheduler engine must not prevent other
-// live settings from propagating through the outbox.
+// live settings from propagating through the outbox or periodic reconciliation.
 func (s *Store) reloadSchedulerEngineSetting(ctx context.Context) error {
 	settings, err := s.db.GetSystemSettings(ctx)
 	if err != nil || settings == nil {
 		return err
 	}
-	s.SetCodexTransient429CooldownEnabled(settings.CodexTransient429CooldownEnabled)
+	s.SetCodexTransient429CooldownPolicy(settings.CodexTransient429Policy())
 	if strings.TrimSpace(os.Getenv("CODEX_SCHEDULER_ENGINE")) == "" {
 		s.SetSchedulerEngine(settings.SchedulerEngine)
 	}

@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"math"
 	"time"
 
 	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
 )
 
 const (
@@ -20,47 +22,75 @@ const (
 )
 
 // transient429CooldownPolicy is published atomically so readers cannot mix
-// the enabled flag with a cutoff from a different admin update.
+// the enabled flag with a generation from a different committed admin update.
 type transient429CooldownPolicy struct {
-	enabled      bool
-	ignoreBefore time.Time
+	enabled    bool
+	generation int64
 }
 
 // CodexTransient429CooldownEnabled reports whether transient Codex 429s freeze
 // the account. A bare Store retains the legacy policy; NewStore loads the
 // persisted setting, whose default in this fork is false.
 func (s *Store) CodexTransient429CooldownEnabled() bool {
-	if s == nil {
-		return true
-	}
-	policy := s.transient429Policy.Load()
-	return policy == nil || policy.enabled
+	return s.CodexTransient429CooldownPolicy().Enabled
 }
 
-// SetCodexTransient429CooldownEnabled applies a persisted admin setting live.
-// It releases only positively identified transient pauses, never quota/auth
-// cooldowns, and does not delete shared cache entries by account ID.
+// CodexTransient429CooldownPolicy reads the pair atomically. A bare test Store
+// retains the legacy enabled generation-zero policy; NewStore defaults off.
+func (s *Store) CodexTransient429CooldownPolicy() database.CodexTransient429CooldownPolicy {
+	if s != nil {
+		if policy := s.transient429Policy.Load(); policy != nil {
+			return database.CodexTransient429CooldownPolicy{Enabled: policy.enabled, Generation: policy.generation}
+		}
+	}
+	return database.CodexTransient429CooldownPolicy{Enabled: true}
+}
+
+// SetCodexTransient429CooldownEnabled is only a convenience for bare/in-memory
+// Stores. DB-backed Stores must publish a durable policy, not invent local
+// generations. Production callers use SetCodexTransient429CooldownPolicy.
 func (s *Store) SetCodexTransient429CooldownEnabled(enabled bool) {
-	if s == nil {
+	if s == nil || s.db != nil {
 		return
 	}
 	s.transient429PolicyMu.Lock()
 	defer s.transient429PolicyMu.Unlock()
-	if s.CodexTransient429CooldownEnabled() == enabled {
+	current := s.CodexTransient429CooldownPolicy()
+	if current.Enabled == enabled || current.Generation == math.MaxInt64 {
 		return
 	}
-	// Re-enabling must not revive a pre-toggle Redis record, including a
-	// delayed publication from an attempt already in flight when disabled.
-	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: enabled, ignoreBefore: time.Now()})
-	if enabled {
+	s.setCodexTransient429CooldownPolicyLocked(database.CodexTransient429CooldownPolicy{Enabled: enabled, Generation: current.Generation + 1})
+}
+
+// SetCodexTransient429CooldownPolicy publishes a committed DB revision. Older
+// reads and conflicting values for the same revision cannot roll it back.
+func (s *Store) SetCodexTransient429CooldownPolicy(policy database.CodexTransient429CooldownPolicy) {
+	if s == nil || policy.Generation < 0 {
 		return
 	}
+	s.transient429PolicyMu.Lock()
+	defer s.transient429PolicyMu.Unlock()
+	s.setCodexTransient429CooldownPolicyLocked(policy)
+}
+
+func (s *Store) setCodexTransient429CooldownPolicyLocked(policy database.CodexTransient429CooldownPolicy) {
+	if current := s.transient429Policy.Load(); current != nil && policy.Generation <= current.generation {
+		return
+	}
+	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: policy.Enabled, generation: policy.Generation})
+	// A consumer can skip the intermediate off event. Advancing on -> on must
+	// still clear the old ladder/window. Mark/apply read the policy under acc.mu
+	// and tag that exact revision; do not clear a new-generation window created
+	// after publication while this sweep was waiting for the account lock.
 	for _, acc := range s.accountSnapshotAccounts() {
 		if acc == nil {
 			continue
 		}
 		acc.mu.Lock()
-		cleared := acc.clearTransient429CooldownLocked()
+		cleared := false
+		if !policy.Enabled || acc.transientRateLimitGeneration != policy.Generation {
+			cleared = acc.clearTransient429CooldownLocked()
+		}
 		if cleared {
 			acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 		}
@@ -78,8 +108,12 @@ func (s *Store) ignoreTransient429CooldownRecord(record runtimeCooldownRecord) b
 	if s == nil || record.Kind != cache.CooldownKindTransient || normalizeCooldownReason(record.Reason) != ResponsesRateLimitedCooldownReason {
 		return false
 	}
-	policy := s.transient429Policy.Load()
-	return policy != nil && (!policy.enabled || (!policy.ignoreBefore.IsZero() && !record.UpdatedAt.After(policy.ignoreBefore)))
+	policy := s.CodexTransient429CooldownPolicy()
+	// Missing generations are legacy zero, accepted only by bare/in-memory
+	// generation-zero policies. DB migration seeds an already-enabled policy
+	// at one. Future records wait for the outbox; cache publications never
+	// change the policy itself.
+	return !policy.Enabled || record.PolicyGeneration != policy.Generation
 }
 
 // clearTransient429CooldownLocked resets the transient ladder and timer, but
@@ -93,6 +127,7 @@ func (a *Account) clearTransient429CooldownLocked() bool {
 		a.CooldownReason = ""
 	}
 	a.transientRateLimitBackoff = 0
+	a.transientRateLimitGeneration = 0
 	a.transientRateLimitUntil = time.Time{}
 	if a.transientRateLimitTimer != nil {
 		a.transientRateLimitTimer.Stop()
@@ -139,6 +174,13 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 		return nextTransientRateLimitCooldown(0, retryAfter)
 	}
 	acc.mu.Lock()
+	// Capture once under the account lock. If Set publishes while we hold it,
+	// this window retains the old revision and its sweep will clear it. If Set
+	// published first, discard the old window before computing a new deadline.
+	policy := s.CodexTransient429CooldownPolicy()
+	if !policy.Enabled || acc.transientRateLimitGeneration != policy.Generation {
+		acc.clearTransient429CooldownLocked()
+	}
 	now := time.Now()
 	until := acc.CooldownUtil
 	sameWindow := acc.Status == StatusCooldown && until.After(now)
@@ -148,8 +190,7 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 		acc.mu.Unlock()
 		return until.Sub(now)
 	}
-	if !s.CodexTransient429CooldownEnabled() {
-		acc.clearTransient429CooldownLocked()
+	if !policy.Enabled {
 		if accountDispatchBlocked(acc) || acc.Status == StatusError || acc.healthTierLocked() == HealthTierBanned {
 			acc.mu.Unlock()
 			return 0
@@ -193,16 +234,18 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 	acc.LastRateLimitedAt = now
 	acc.setCooldownUntilLocked(until, ResponsesRateLimitedCooldownReason)
 	acc.transientRateLimitUntil = until
+	acc.transientRateLimitGeneration = policy.Generation
 	acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	acc.armTransientRateLimitRecoveryLocked(s)
 	record := runtimeCooldownRecord{
 		Kind: cache.CooldownKindTransient, Reason: ResponsesRateLimitedCooldownReason,
 		ResetAt: until, UpdatedAt: now, BackoffLevel: acc.transientRateLimitBackoff,
+		PolicyGeneration: policy.Generation,
 	}
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	merged := s.cacheAccountCooldownRecord(acc.DBID, record)
-	if merged.Kind != record.Kind || !merged.ResetAt.Equal(record.ResetAt) || merged.BackoffLevel != record.BackoffLevel {
+	if merged.Kind != record.Kind || merged.Reason != record.Reason || merged.PolicyGeneration != record.PolicyGeneration || !merged.ResetAt.Equal(record.ResetAt) || merged.BackoffLevel != record.BackoffLevel {
 		s.applyCachedAccountCooldown(acc, merged)
 	}
 	_, deadline := acc.GetCooldownSnapshot()
@@ -227,6 +270,7 @@ func (a *Account) armTransientRateLimitRecoveryLocked(s *Store) {
 		a.transientRateLimitTimer.Stop()
 	}
 	until := a.CooldownUtil
+	generation := a.transientRateLimitGeneration
 	a.transientRateLimitTimer = time.AfterFunc(max(time.Until(until), 0), func() {
 		if s.backgroundCtx.Err() != nil {
 			return
@@ -238,7 +282,7 @@ func (a *Account) armTransientRateLimitRecoveryLocked(s *Store) {
 			return
 		}
 		a.mu.Lock()
-		if !a.isTransientRateLimitCooldownLocked() || !a.CooldownUtil.Equal(until) || time.Now().Before(until) {
+		if !a.isTransientRateLimitCooldownLocked() || a.transientRateLimitGeneration != generation || !a.CooldownUtil.Equal(until) || time.Now().Before(until) {
 			a.mu.Unlock()
 			return
 		}

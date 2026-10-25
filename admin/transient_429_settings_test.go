@@ -27,6 +27,7 @@ func TestTransient429SettingsGetPutAndOmittedField(t *testing.T) {
 	}{
 		{"default", http.MethodGet, "", false},
 		{"enable", http.MethodPut, `{"codex_transient_429_cooldown_enabled":true}`, true},
+		{"same-value save", http.MethodPut, `{"codex_transient_429_cooldown_enabled":true}`, true},
 		{"get enabled", http.MethodGet, "", true},
 		{"omitted", http.MethodPut, `{"site_name":"synthetic unrelated save"}`, true},
 		{"null is omitted", http.MethodPut, `{"codex_transient_429_cooldown_enabled":null}`, true},
@@ -59,10 +60,11 @@ func TestTransient429SettingsSaveFailureDoesNotToggle(t *testing.T) {
 			}
 			t.Run(name, func(t *testing.T) {
 				handler, db, path := newTransient429SettingsAdminHandler(t)
-				if err := db.UpdateCodexTransient429CooldownEnabled(context.Background(), initial); err != nil {
+				policy, err := db.UpdateCodexTransient429CooldownPolicy(context.Background(), initial)
+				if err != nil {
 					t.Fatal(err)
 				}
-				handler.store.SetCodexTransient429CooldownEnabled(initial)
+				handler.store.SetCodexTransient429CooldownPolicy(policy)
 				installTransient429SettingsTrigger(t, path, stage.trigger)
 				body := `{"codex_transient_429_cooldown_enabled":true}`
 				if initial {
@@ -85,7 +87,7 @@ func TestTransient429SettingsOmittedFieldPreservesNewerDatabaseValue(t *testing.
 	if err := db.UpdateCodexTransient429CooldownEnabled(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
-	handler.store.SetCodexTransient429CooldownEnabled(false)
+	// Keep the runtime's old default-off revision until outbox reload.
 	installTransient429SettingsTrigger(t, path, `CREATE TRIGGER reject_omitted_transient_429
 		BEFORE UPDATE OF codex_transient_429_cooldown_enabled ON system_settings
 		BEGIN SELECT RAISE(ABORT, 'omitted switch must not be written'); END`)
@@ -179,6 +181,9 @@ func assertTransient429AdminState(t *testing.T, handler *Handler, db *database.D
 	}
 	if settings.CodexTransient429CooldownEnabled != persistedWant {
 		t.Fatalf("persisted transient 429 cooldown enabled = %t, want %t", settings.CodexTransient429CooldownEnabled, persistedWant)
+	}
+	if runtimeWant == persistedWant && handler.store.CodexTransient429CooldownPolicy() != settings.CodexTransient429Policy() {
+		t.Fatal("runtime bool and generation do not match the committed policy")
 	}
 }
 

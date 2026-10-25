@@ -12190,12 +12190,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	// Persist the narrow switch only after the other requested saves succeeded.
 	// Never publish a stale full-settings snapshot or a value from a failed write.
 	if req.CodexTransient429CooldownEnabled != nil {
-		enabled := *req.CodexTransient429CooldownEnabled
-		if updateErr := h.db.UpdateCodexTransient429CooldownEnabled(c.Request.Context(), enabled); updateErr != nil {
+		policy, updateErr := h.db.UpdateCodexTransient429CooldownPolicy(c.Request.Context(), *req.CodexTransient429CooldownEnabled)
+		if updateErr != nil {
 			writeError(c, http.StatusInternalServerError, "保存 Codex 临时 429 冷却设置失败，设置未生效")
 			return
 		}
-		h.store.SetCodexTransient429CooldownEnabled(enabled)
+		// Publish the pair returned by this committed write, never a later read
+		// combined with this request's bool. Store rejects delayed revisions.
+		h.store.SetCodexTransient429CooldownPolicy(policy)
 	}
 
 	if h.store.GetAutoCleanUnauthorized() || h.store.GetAutoCleanRateLimited() || h.store.GetAutoCleanError() {

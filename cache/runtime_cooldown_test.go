@@ -17,6 +17,7 @@ func TestMemoryRuntimeCooldownMerge(t *testing.T) {
 	c := NewMemory(1)
 	t.Cleanup(func() { _ = c.Close() })
 	testRuntimeCooldownMerge(t, c)
+	testTransient429GenerationMerge(t, c)
 }
 
 func TestRedisRuntimeCooldownMerge(t *testing.T) {
@@ -30,7 +31,9 @@ func TestRedisRuntimeCooldownMerge(t *testing.T) {
 	}
 	client := redis.NewClient(options)
 	t.Cleanup(func() { _ = client.Close() })
-	testRuntimeCooldownMerge(t, &redisTokenCache{client: client})
+	c := &redisTokenCache{client: client}
+	testRuntimeCooldownMerge(t, c)
+	testTransient429GenerationMerge(t, c)
 }
 
 func testRuntimeCooldownMerge(t *testing.T, c TokenCache) {

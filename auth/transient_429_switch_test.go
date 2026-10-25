@@ -131,14 +131,15 @@ func TestTransient429SwitchIgnoresSharedTransientWithoutDeletingIt(t *testing.T)
 
 func TestTransient429SwitchFencesDelayedPublicationAcrossOffOn(t *testing.T) {
 	tc := &delayedTransientCooldownCache{TokenCache: cache.NewMemory(1), entered: make(chan struct{}), resume: make(chan struct{})}
-	defer tc.Close()
-	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
-	s := (&Store{accounts: []*Account{acc}, tokenCache: tc}).withMaxConcurrency(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	db := newTransient429PolicyTestDB(t)
+	commitTransient429Policy(t, db, true)
+	s, acc := newTransient429PolicyTestStore(t, db, tc)
 	done := make(chan struct{})
 	go func() { s.MarkTransientRateLimited(acc, 2*time.Minute); close(done) }()
 	<-tc.entered
-	s.SetCodexTransient429CooldownEnabled(false)
-	s.SetCodexTransient429CooldownEnabled(true)
+	s.SetCodexTransient429CooldownPolicy(commitTransient429Policy(t, db, false))
+	s.SetCodexTransient429CooldownPolicy(commitTransient429Policy(t, db, true))
 	close(tc.resume)
 	<-done
 	if acc.HasActiveCooldown() || s.accountHasCachedCooldown(acc) || acc.TransientRateLimitBackoff() != 0 {

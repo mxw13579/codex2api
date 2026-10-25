@@ -433,6 +433,8 @@ type Account struct {
 	// exponent for account-wide Codex throttle (bare 429 / rate_limit*).
 	// It is not persisted: a restart simply starts again at 15s.
 	transientRateLimitBackoff int
+	// Shared policy revision owning both the transient window and its ladder.
+	transientRateLimitGeneration int64
 	// transientRateLimitUntil mirrors CooldownUtil while the active cooldown
 	// was created by MarkTransientRateLimited. A later quota cooldown moves
 	// CooldownUtil away from it, which is how the two are told apart.
@@ -4311,14 +4313,15 @@ func (s *Store) getCachedAccountCooldown(accountID int64) (runtimeCooldownRecord
 	if !ok || len(payload) == 0 {
 		return runtimeCooldownRecord{}, false
 	}
+	// This payload is only a snapshot. Never delete by account ID based on
+	// parse/expiry checks: a newer generation or quota/auth publication may
+	// already own the key. Leave reclamation to the cache's TTL instead.
 	var record runtimeCooldownRecord
 	if err := json.Unmarshal(payload, &record); err != nil {
 		log.Printf("[账号 %d] 解析账号冷却缓存失败: %v", accountID, err)
-		s.deleteCachedAccountCooldown(accountID)
 		return runtimeCooldownRecord{}, false
 	}
 	if !record.ResetAt.After(time.Now()) {
-		s.deleteCachedAccountCooldown(accountID)
 		return runtimeCooldownRecord{}, false
 	}
 	record.Reason = normalizeCooldownReason(record.Reason)
@@ -4356,6 +4359,7 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 		return
 	}
 	reason := normalizeCooldownReason(record.Reason)
+	record.Reason = reason
 	baseLimit := s.maxConcurrency.Load()
 	acc.mu.Lock()
 	// Recheck under the account lock: the admin switch may have changed
@@ -4364,16 +4368,20 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 		acc.mu.Unlock()
 		return
 	}
+	if record.Strength() == 1 && acc.transientRateLimitGeneration != record.PolicyGeneration {
+		acc.clearTransient429CooldownLocked()
+	}
 	current := runtimeCooldownRecord{Reason: acc.CooldownReason, ResetAt: acc.CooldownUtil}
 	if acc.isTransientRateLimitCooldownLocked() {
 		current.Kind = cache.CooldownKindTransient
+		current.PolicyGeneration = acc.transientRateLimitGeneration
 	}
-	if record.Kind == cache.CooldownKindTransient && (acc.Status == StatusError || accountDispatchBlocked(acc) || acc.healthTierLocked() == HealthTierBanned) {
+	if record.Strength() == 1 && (acc.Status == StatusError || accountDispatchBlocked(acc) || acc.healthTierLocked() == HealthTierBanned) {
 		acc.mu.Unlock()
 		return
 	}
 	if acc.Status == StatusCooldown && current.ResetAt.After(time.Now()) &&
-		(current.Strength() > record.Strength() || current.Strength() == record.Strength() && current.ResetAt.After(record.ResetAt)) {
+		current.Outranks(record) {
 		acc.mu.Unlock()
 		return
 	}
@@ -4383,6 +4391,7 @@ func (s *Store) applyCachedAccountCooldown(acc *Account, record runtimeCooldownR
 	acc.transientRateLimitUntil = time.Time{}
 	if record.Kind == cache.CooldownKindTransient && reason == ResponsesRateLimitedCooldownReason {
 		acc.transientRateLimitUntil = record.ResetAt
+		acc.transientRateLimitGeneration = record.PolicyGeneration
 		acc.transientRateLimitBackoff = max(acc.transientRateLimitBackoff, record.BackoffLevel)
 		acc.armTransientRateLimitRecoveryLocked(s)
 	} else if acc.transientRateLimitTimer != nil {
@@ -4806,7 +4815,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		antigravityCoordinator:     NewAntigravityCoordinator(4),
 	}
 	s.maxConcurrency.Store(int64(settings.MaxConcurrency))
-	s.transient429Policy.Store(&transient429CooldownPolicy{enabled: settings.CodexTransient429CooldownEnabled})
+	s.transient429Policy.Store(&transient429CooldownPolicy{
+		enabled: settings.CodexTransient429CooldownEnabled, generation: settings.CodexTransient429CooldownGeneration,
+	})
 	s.usageFramePersist.start(s)
 	s.testConcurrency.Store(int64(settings.TestConcurrency))
 	s.codexRequestCompression.Store(settings.CodexRequestCompression)
@@ -5996,13 +6007,21 @@ func (s *Store) CleanExpiredNow() int {
 // Init 初始化：从数据库加载账号
 func (s *Store) Init(ctx context.Context) error {
 	// Capture the durable change-log position before the full snapshot. Events
-	// committed while loadFromDB is running are replayed after publication.
+	// with higher IDs committed during loading are replayed after publication;
+	// periodic settings reconciliation also covers lower-ID late commits.
 	outboxWatermark := int64(0)
 	if s.db != nil {
 		var err error
 		outboxWatermark, err = s.db.SchedulerOutboxHighWatermark(ctx)
 		if err != nil {
 			return fmt.Errorf("读取调度 outbox 水位失败: %w", err)
+		}
+		// main's settings snapshot can predate this watermark. Refresh after
+		// capturing it: visible commits are in the read, higher-ID later commits
+		// replay through the outbox. A lower-ID transaction still uncommitted at
+		// this read is covered by periodic settings reconciliation instead.
+		if err := s.reloadSchedulerEngineSetting(ctx); err != nil {
+			return fmt.Errorf("刷新启动调度设置失败: %w", err)
 		}
 	}
 	// 1. 从数据库加载账号到内存

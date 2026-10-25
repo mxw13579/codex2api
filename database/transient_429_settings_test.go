@@ -28,12 +28,15 @@ func TestSQLiteTransient429DefaultFalse(t *testing.T) {
 
 	// A full save must use the schema default even when its snapshot says true.
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         "synthetic default",
-		CodexTransient429CooldownEnabled: true,
+		SiteName:                            "synthetic default",
+		CodexTransient429CooldownEnabled:    true,
+		CodexTransient429CooldownGeneration: 999,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	assertTransient429SettingsValue(t, db, false)
+	if got := assertTransient429SettingsValue(t, db, false); got.CodexTransient429CooldownGeneration != 0 {
+		t.Fatal("full save wrote the policy generation on insert")
+	}
 
 	if _, err := db.conn.ExecContext(ctx, `DELETE FROM system_settings WHERE id = 1`); err != nil {
 		t.Fatal(err)
@@ -87,10 +90,14 @@ func TestSQLiteTransient429FullSavePreservesSwitch(t *testing.T) {
 
 		stale.SiteName = "synthetic unrelated save"
 		stale.MaxConcurrency++
+		stale.CodexTransient429CooldownGeneration = 999
 		if err := db.UpdateSystemSettings(ctx, stale); err != nil {
 			t.Fatal(err)
 		}
 		got := assertTransient429SettingsValue(t, db, enabled)
+		if got.CodexTransient429CooldownGeneration != afterNarrow.CodexTransient429CooldownGeneration {
+			t.Fatal("full save changed the policy generation")
+		}
 		if got.SiteName != stale.SiteName || got.MaxConcurrency != stale.MaxConcurrency {
 			t.Fatal("unrelated settings were not saved")
 		}

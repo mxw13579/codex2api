@@ -370,6 +370,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					retry_interval_ms INTEGER DEFAULT 0,
 					transport_retry_policy TEXT DEFAULT 'rotate',
 					codex_transient_429_cooldown_enabled INTEGER NOT NULL DEFAULT 0,
+					codex_transient_429_cooldown_generation INTEGER NOT NULL DEFAULT 0,
 					continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}',
 					codex_synced_cli_version TEXT DEFAULT '',
 					codex_synced_desktop_mac_build TEXT DEFAULT '',
@@ -621,6 +622,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "credential_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"system_settings", "continuous_retry_policy", "TEXT DEFAULT '{\"enabled\":false,\"catch_all\":false,\"categories\":[\"transport\",\"http_429\",\"http_5xx\",\"stream_error\"],\"status_codes\":[],\"error_codes\":[]}'"},
 		{"system_settings", "codex_transient_429_cooldown_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"system_settings", "codex_transient_429_cooldown_generation", "INTEGER NOT NULL DEFAULT 0"},
 		{"api_keys", "quota_limit", "REAL DEFAULT 0"},
 		{"api_keys", "quota_used", "REAL DEFAULT 0"},
 		{"api_keys", "total_used", "REAL DEFAULT 0"},
@@ -824,6 +826,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		if err := db.ensureSQLiteColumn(ctx, column.table, column.name, column.def); err != nil {
 			return err
 		}
+	}
+	// Initialize an already-enabled legacy policy above generationless cache
+	// records. This is idempotent; normal narrow updates never produce on/0.
+	if _, err := db.conn.ExecContext(ctx, `
+		UPDATE system_settings SET codex_transient_429_cooldown_generation = 1
+		WHERE codex_transient_429_cooldown_enabled = 1 AND codex_transient_429_cooldown_generation = 0
+	`); err != nil {
+		return err
 	}
 	if _, err := db.conn.ExecContext(ctx, `
 		UPDATE proxies

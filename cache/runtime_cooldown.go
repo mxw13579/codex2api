@@ -18,7 +18,10 @@ type RuntimeCooldown struct {
 	ResetAt      time.Time `json:"reset_at"`
 	UpdatedAt    time.Time `json:"updated_at,omitempty"`
 	BackoffLevel int       `json:"backoff_level,omitempty"`
-	ExpiresAtMS  int64     `json:"expires_at_ms,omitempty"`
+	// Missing generation is legacy zero. Decimal strings preserve int64
+	// revisions through Redis Lua/cjson (whose numbers are IEEE-754 doubles).
+	PolicyGeneration int64 `json:"policy_generation,omitempty,string"`
+	ExpiresAtMS      int64 `json:"expires_at_ms,omitempty"`
 }
 
 // RuntimeCooldownMerger prevents delayed short freezes from replacing quota or
@@ -31,10 +34,23 @@ func (c RuntimeCooldown) Strength() int {
 	if c.Reason == "unauthorized" {
 		return 3
 	}
-	if c.Kind == CooldownKindTransient {
+	if c.Kind == CooldownKindTransient && c.Reason == "responses_rate_limited" {
 		return 1
 	}
 	return 2
+}
+
+// Outranks compares strength first. Only two positively identified transient
+// freezes compare generations before deadlines; quota/auth never lose to a
+// newer transient policy. Backoff may only be merged within one generation.
+func (c RuntimeCooldown) Outranks(other RuntimeCooldown) bool {
+	if c.Strength() != other.Strength() {
+		return c.Strength() > other.Strength()
+	}
+	if c.Strength() == 1 && c.PolicyGeneration != other.PolicyGeneration {
+		return c.PolicyGeneration > other.PolicyGeneration
+	}
+	return c.ResetAt.After(other.ResetAt)
 }
 
 func (tc *MemoryTokenCache) MergeRuntimeCooldown(ctx context.Context, namespace, key string, incoming RuntimeCooldown) (RuntimeCooldown, error) {
@@ -51,10 +67,10 @@ func (tc *MemoryTokenCache) MergeRuntimeCooldown(ctx context.Context, namespace,
 	if entry, ok := tc.runtime[mapKey]; ok && entry.expiresAt.After(time.Now()) {
 		var current RuntimeCooldown
 		if json.Unmarshal(entry.value, &current) == nil && current.ResetAt.After(time.Now()) {
-			if current.Strength() > incoming.Strength() || current.Strength() == incoming.Strength() && current.ResetAt.After(incoming.ResetAt) {
+			if current.Outranks(incoming) {
 				winner = current
 			}
-			if current.Kind == CooldownKindTransient && incoming.Kind == CooldownKindTransient {
+			if current.Strength() == 1 && incoming.Strength() == 1 && current.PolicyGeneration == incoming.PolicyGeneration {
 				winner.BackoffLevel = max(current.BackoffLevel, incoming.BackoffLevel)
 			}
 		}
@@ -75,7 +91,7 @@ local now = tonumber(stamp[1]) * 1000 + math.floor(tonumber(stamp[2]) / 1000)
 local winner = incoming
 local function strength(record)
     if record.reason == 'unauthorized' then return 3 end
-    if record.kind == 'transient' then return 1 end
+    if record.kind == 'transient' and record.reason == 'responses_rate_limited' then return 1 end
     return 2
 end
 local payload = redis.call('GET', KEYS[1])
@@ -87,8 +103,18 @@ if payload then
         current.expires_at_ms = expires
         if expires > now then
             local oldStrength, newStrength = strength(current), strength(incoming)
-            if oldStrength > newStrength or (oldStrength == newStrength and expires > incoming.expires_at_ms) then winner = current end
-            if current.kind == 'transient' and incoming.kind == 'transient' then winner.backoff_level = math.max(tonumber(current.backoff_level) or 0, tonumber(incoming.backoff_level) or 0) end
+            local oldGeneration = current.policy_generation or '0'
+            local newGeneration = incoming.policy_generation or '0'
+            if oldStrength ~= newStrength then
+                if oldStrength > newStrength then winner = current end
+            elseif oldStrength == 1 and oldGeneration ~= newGeneration then
+                if #oldGeneration > #newGeneration or (#oldGeneration == #newGeneration and oldGeneration > newGeneration) then winner = current end
+            elseif expires > incoming.expires_at_ms then
+                winner = current
+            end
+            if oldStrength == 1 and newStrength == 1 and oldGeneration == newGeneration then
+                winner.backoff_level = math.max(tonumber(current.backoff_level) or 0, tonumber(incoming.backoff_level) or 0)
+            end
         end
     end
 end
