@@ -548,6 +548,93 @@ func TestProbeProxyFallsBackToIPv6Echo(t *testing.T) {
 	}
 }
 
+func TestProbeProxyHTTPBadGatewayFallsBackToIPv6Echo(t *testing.T) {
+	echo := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ip":"2605:1234:5678::1"}`))
+	}))
+	t.Cleanup(echo.Close)
+	echoURL := echo.URL
+
+	oldEcho := proxyProbeIPv6EchoURLsFn
+	oldGeo := proxyProbeLookupGeoFn
+	proxyProbeIPv6EchoURLsFn = func() []string { return []string{echoURL} }
+	proxyProbeLookupGeoFn = func(_ context.Context, ip, lang string) (string, string, string, string) {
+		if ip != "2605:1234:5678::1" || lang != "zh-CN" {
+			t.Fatalf("geo lookup ip=%q lang=%q", ip, lang)
+		}
+		return "美国", "加利福尼亚", "圣何塞", "Oracle Corporation"
+	}
+	t.Cleanup(func() {
+		proxyProbeIPv6EchoURLsFn = oldEcho
+		proxyProbeLookupGeoFn = oldGeo
+	})
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.Contains(req.URL.String(), "ip-api.com") {
+			http.Error(w, "Upstream request failed", http.StatusBadGateway)
+			return
+		}
+		if req.Method == http.MethodConnect {
+			destConn, err := net.DialTimeout("tcp", req.Host, 2*time.Second)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				destConn.Close()
+				return
+			}
+			clientConn, _, err := hijacker.Hijack()
+			if err != nil {
+				destConn.Close()
+				return
+			}
+			go func() {
+				defer destConn.Close()
+				defer clientConn.Close()
+				_, _ = io.Copy(destConn, clientConn)
+			}()
+			go func() {
+				defer destConn.Close()
+				defer clientConn.Close()
+				_, _ = io.Copy(clientConn, destConn)
+			}()
+			return
+		}
+		outReq, err := http.NewRequestWithContext(req.Context(), req.Method, req.RequestURI, req.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		outReq.Header = req.Header.Clone()
+		resp, err := http.DefaultTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		for k, vv := range resp.Header {
+			for _, v := range vv {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	t.Cleanup(proxyServer.Close)
+
+	result := probeProxy(context.Background(), proxyServer.URL, "zh-CN")
+	if !result.Success || !result.Conclusive || result.IP != "2605:1234:5678::1" {
+		t.Fatalf("probe result = %#v, want IPv6 fallback success", result)
+	}
+	if result.Location != "美国·加利福尼亚·圣何塞" || result.ISP != "Oracle Corporation" {
+		t.Fatalf("probe result = %#v, want gateway geo fields", result)
+	}
+}
+
 func TestShouldFallbackToIPv6Probe(t *testing.T) {
 	if shouldFallbackToIPv6Probe(proxyProbeResult{Success: true, Conclusive: true}) {
 		t.Fatal("successful probe must not fallback")
@@ -562,6 +649,21 @@ func TestShouldFallbackToIPv6Probe(t *testing.T) {
 		Error: "连接失败: socks connect tcp proxy->ip-api.com:80: unknown error host unreachable",
 	}) {
 		t.Fatal("SOCKS IPv4 target unreachable must fallback")
+	}
+	if !shouldFallbackToIPv6Probe(proxyProbeResult{
+		Error: "代理检测服务暂时不可用 (HTTP 502)",
+	}) {
+		t.Fatal("HTTP proxy 502 bad gateway must fallback")
+	}
+	if !shouldFallbackToIPv6Probe(proxyProbeResult{
+		Error: "代理检测服务暂时不可用 (HTTP 504)",
+	}) {
+		t.Fatal("HTTP proxy 504 gateway timeout must fallback")
+	}
+	if !shouldFallbackToIPv6Probe(proxyProbeResult{
+		Error: "连接失败: proxyconnect tcp: 502 Bad Gateway",
+	}) {
+		t.Fatal("HTTP CONNECT 502 bad gateway must fallback")
 	}
 }
 

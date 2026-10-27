@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -266,26 +264,28 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Set("Cache-Control", "no-cache")
 	resp.Header.Set("Connection", "keep-alive")
+	control := &openAIResponsesWSInterrupt{}
+	unregisterInterrupt := RegisterResponsesWSInterrupt(ctx, func(payload []byte) error {
+		return control.send(ctx, conn.conn, payload)
+	})
 
 	go func() {
 		defer pw.Close()
-		var finished atomic.Bool
+		defer unregisterInterrupt()
+		defer control.stop()
 		stop := make(chan struct{})
 		socket := conn.conn
 		go func() {
 			select {
 			case <-ctx.Done():
-				if !finished.Load() && socket != nil {
-					_ = socket.Close()
-				}
+				control.closeIfUnfinished(socket)
 			case <-stop:
 			}
 		}()
 		defer close(stop)
 
 		terminal := false
-		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
-			frame = NormalizeResponsesTerminalEvent(frame)
+		emit := func(frame []byte) bool {
 			eventType := gjson.GetBytes(frame, "type").String()
 			// Preserve existing created/intermediate bindings, but do not add a
 			// continuation binding from a failed terminal (including done aliases).
@@ -298,28 +298,27 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 			case "response.completed", "response.failed", "response.incomplete", "error":
 				terminal = true
 			}
-			line := frame
-			if bytes.IndexByte(frame, '\n') >= 0 {
-				var compacted bytes.Buffer
-				if json.Compact(&compacted, frame) == nil {
-					line = compacted.Bytes()
-				} else {
-					line = bytes.ReplaceAll(frame, []byte("\n"), []byte(" "))
-				}
-			}
-			if _, err := pw.Write([]byte("data: ")); err != nil {
+			if err := writeOpenAIResponsesSSE(pw, frame); err != nil {
 				return false
 			}
-			if _, err := pw.Write(line); err != nil {
+			return true
+		}
+		var controlErr error
+		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
+			frame, err := control.accept(frame)
+			if err != nil {
+				controlErr = err
 				return false
 			}
-			if _, err := pw.Write([]byte("\n\n")); err != nil {
+			if len(frame) > 0 && !emit(frame) {
 				return false
 			}
-			return !terminal
+			return !control.done()
 		})
-		finished.Store(true)
-		if err != nil || !terminal || ctx.Err() != nil {
+		if controlErr != nil {
+			err = controlErr
+		}
+		if err != nil || !terminal {
 			pool.retire(conn)
 			if err != nil && err != io.EOF {
 				_ = pw.CloseWithError(err)

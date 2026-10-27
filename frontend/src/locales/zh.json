@@ -5835,7 +5835,7 @@
         "block": "触及生图能力的请求(gpt-image-* 模型、/v1/images 端点,或带 image_generation 工具/意图)一律返回 403。"
       },
       "allowLive": "允许 ChatGPT Live",
-      "allowLiveHint": "默认关闭。开启后该 Key 可调用 /v1/live 与 Codex realtime/calls，占用长会话并发。Linux / Docker 无法生成 DeviceCheck，未带客户端 attestation 时上游可能拒绝。",
+      "allowLiveHint": "允许调用 /v1/live 与 Codex realtime/calls，占用长会话并发。",
       "rpm": "每分钟请求",
       "rpmSuffix": "/min",
       "rpd": "每天请求",

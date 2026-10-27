@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { intelligenceWindow, intelligenceColor, intelligenceQuery, latestRequestGuard } from './intelligenceCheck.ts'
+import { intelligenceWindow, intelligenceColor, intelligenceQuery, latestRequestGuard, intelligenceTargetConflict } from './intelligenceCheck.ts'
 test('last 20 completed checks remain chronological and errors do not dilute pass rate', () => {
   const records = Array.from({ length: 23 }, (_, i) => ({ id: i, status: i % 3 === 0 ? 'normal' : i % 3 === 1 ? 'degraded' : 'error', created_at: new Date(i * 1000).toISOString() }))
   records.push({ id: 24, status: 'running' })
@@ -27,4 +27,11 @@ test('queries escape filters and stale async responses are rejected after newer 
   assert.equal(guard.isCurrent(second), true)
   guard.next()
   assert.equal(guard.isCurrent(second), false)
+})
+test('conflict actions require structured account details and never infer IDs from an error message', () => {
+  const details = { code: 'intelligence_check_target_conflict', target_group_id: 8, target_group_channel: 'codex', conflict_count: 1, conflicts: [{ account_id: 68876, account_name: 'Claude', channel: 'claude' }] }
+  assert.deepEqual(intelligenceTargetConflict({ details }), details)
+  for (const error of [null, new Error('1 enabled accounts belong to another channel'), { details: null }, { details: {...details, code: 'revision_conflict'} }, { details: {...details, conflicts: [{account_id: -1}]} }, { details: {...details, conflicts: []} }]) {
+    assert.equal(intelligenceTargetConflict(error), null)
+  }
 })

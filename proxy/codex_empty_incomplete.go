@@ -65,6 +65,10 @@ func isEmptyIncompleteResponse(response gjson.Result) bool {
 	if !response.Exists() || !response.IsObject() {
 		return false
 	}
+	switch response.Get("incomplete_details.reason").String() {
+	case "interrupted", "steered", "content_filter", "max_messages":
+		return false
+	}
 	if output := response.Get("output"); output.IsArray() && len(output.Array()) > 0 {
 		return false
 	}

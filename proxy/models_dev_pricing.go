@@ -36,7 +36,7 @@ type modelsDevProvider struct {
 	Models map[string]modelsDevModel `json:"models"`
 }
 
-var modelsDevFirstPartyProviders = []string{"openai", "xai", "anthropic"}
+var modelsDevFirstPartyProviders = []string{"openai", "xai", "anthropic", "google"}
 
 // convertModelsDevPricing 优先使用规范模型 ID，仅合并第一方供应商数据。
 func convertModelsDevPricing(providers map[string]modelsDevProvider) map[string]database.ModelPricingOverride {
@@ -76,6 +76,9 @@ func mergeModelsDevProviders(providers map[string]modelsDevProvider, names []str
 	for _, name := range names {
 		for id, model := range providers[name].Models {
 			if name == "anthropic" && !strings.HasPrefix(id, "claude-") {
+				continue
+			}
+			if name == "google" && !strings.HasPrefix(id, "gemini-") {
 				continue
 			}
 			if _, exists := merged[id]; !exists {

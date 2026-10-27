@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   ArrowDown,
@@ -23,7 +23,10 @@ import { Switch } from "../components/ui/switch";
 import { Select } from "../components/ui/select";
 import { useToast } from "../hooks/useToast";
 import { getErrorMessage } from "../utils/error";
+import { refreshIntelligenceBars } from "../hooks/useIntelligenceBars";
 import {
+  intelligenceTargetConflict,
+  type IntelligenceTargetConflict,
   type IntelligenceQuestion,
   type IntelligenceSettings,
 } from "../lib/intelligenceCheck";
@@ -46,13 +49,21 @@ export default function IntelligenceCheck() {
   const runID = Number(params.get("run")) || null;
   const [settings, setSettings] = useState<IntelligenceSettings | null>(null);
   const [saved, setSaved] = useState<IntelligenceSettings | null>(null);
-  const [groups, setGroups] = useState<{ id: number; name: string }[]>([]);
+  const [groups, setGroups] = useState<
+    { id: number; name: string; channel?: string }[]
+  >([]);
+  const [targetConflict, setTargetConflict] = useState<IntelligenceTargetConflict | null>(null);
+  const conflictPanel = useRef<HTMLDivElement>(null);
   const [configError, setConfigError] = useState("");
   const [busy, setBusy] = useState(false);
   const [editor, setEditor] = useState<string | null>(null);
   const { showToast } = useToast();
   const dirty =
     !!settings && JSON.stringify(settings) !== JSON.stringify(saved);
+
+  useEffect(() => {
+    if (targetConflict) conflictPanel.current?.scrollIntoView({ block: "center" });
+  }, [targetConflict]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -84,14 +95,24 @@ export default function IntelligenceCheck() {
   const change = <K extends keyof IntelligenceSettings>(
     key: K,
     value: IntelligenceSettings[K],
-  ) => setSettings((s) => (s ? { ...s, [key]: value } : s));
+  ) => {
+    if (key === "action" || key === "target_group_id") setTargetConflict(null);
+    setSettings((s) => (s ? { ...s, [key]: value } : s));
+  };
   const mutate = async (fn: () => Promise<unknown>, message: string) => {
     setBusy(true);
     try {
       await fn();
       showToast(message);
     } catch (e) {
-      showToast(getErrorMessage(e), "error");
+      const conflict = intelligenceTargetConflict(e);
+      if (conflict) setTargetConflict(conflict);
+      showToast(
+        conflict
+          ? `有 ${conflict.conflict_count} 个账号的检测通道不兼容，请处理下方列表后重新保存`
+          : getErrorMessage(e),
+        "error",
+      );
     } finally {
       setBusy(false);
     }
@@ -102,7 +123,17 @@ export default function IntelligenceCheck() {
       const next = await api.saveIntelligenceSettings(settings);
       setSettings(next);
       setSaved(next);
+      setTargetConflict(null);
     }, "检测配置和题库已保存");
+  const disableConflicts = () =>
+    mutate(async () => {
+      if (!targetConflict) return;
+      await api.setIntelligenceAccounts(
+        targetConflict.conflicts.map(a => a.account_id), false,
+      );
+      refreshIntelligenceBars();
+      setTargetConflict(null);
+    }, "已关闭所列账号的自动检测，请重新保存配置");
   const question = settings?.questions.find((q) => q.id === editor);
   const editQuestion = (patch: Partial<IntelligenceQuestion>) => {
     if (settings)
@@ -248,7 +279,7 @@ export default function IntelligenceCheck() {
                   checked={settings.new_accounts_enabled}
                   onCheckedChange={(v) => change("new_accounts_enabled", v)}
                 />,
-                "已有账号不受此选项影响。",
+                "仅支持 Codex 和 Claude；切换分组时，仅同通道新账号默认参与。已有账号不受此选项影响。",
               )}
             </CardContent>
           </Card>
@@ -295,13 +326,83 @@ export default function IntelligenceCheck() {
                         change("target_group_id", Number(v))
                       }
                       placeholder="选择分组"
-                      options={groups.map((g) => ({
-                        value: String(g.id),
-                        label: g.name,
-                      }))}
+                      options={groups
+                        .filter(g => !g.channel || g.channel === "codex" || g.channel === "claude")
+                        .map(g => ({
+                          value: String(g.id),
+                          label: `${g.name}（${g.channel === "claude" ? "Claude" : "Codex"}）`,
+                        }))}
                     />,
                   )}
               </div>
+              {targetConflict && (
+                <div
+                  ref={conflictPanel}
+                  role="alert"
+                  className="space-y-3 rounded-md border border-destructive/40 p-3 text-sm"
+                >
+                  <p className="font-medium">
+                    有 {targetConflict.conflict_count}{" "}
+                    个账号的检测通道与目标分组不兼容，配置尚未保存。
+                  </p>
+                  <p className="text-muted-foreground">
+                    目标分组：
+                    {groups.find(
+                      (g) => g.id === targetConflict.target_group_id,
+                    )?.name || `#${targetConflict.target_group_id}`}
+                    （{targetConflict.target_group_channel}
+                    ）。可关闭下列账号的自动检测后重新保存，或调整处置策略。
+                  </p>
+                  <ul className="max-h-60 space-y-2 overflow-y-auto">
+                    {targetConflict.conflicts.map((account) => (
+                      <li
+                        key={account.account_id}
+                        className="flex flex-wrap items-center justify-between gap-2"
+                      >
+                        <span className="min-w-0 break-all">
+                          #{account.account_id} ·{" "}
+                          {account.account_name || "未命名账号"} ·{" "}
+                          {account.channel}
+                        </span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => {
+                            const next = new URLSearchParams(params);
+                            next.delete("run");
+                            next.set(
+                              "account_id",
+                              String(account.account_id),
+                            );
+                            setParams(next);
+                          }}
+                        >
+                          查看账号检测
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                  {targetConflict.conflict_count >
+                    targetConflict.conflicts.length && (
+                    <p className="text-muted-foreground">
+                      当前列出前 {targetConflict.conflicts.length}{" "}
+                      个；处理后重新保存可查看剩余冲突。
+                    </p>
+                  )}
+                  <Button
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => void disableConflicts()}
+                  >
+                    关闭以上 {targetConflict.conflicts.length}{" "}
+                    个账号的自动检测
+                  </Button>
+                  <p className="text-xs text-muted-foreground">
+                    仅关闭自动检测，账号的业务调度和已有处置恢复状态保持不变。
+                  </p>
+                </div>
+              )}
               <p className="text-xs leading-relaxed text-muted-foreground">
                 上游错误不打断连续次数。人工修改调度或分组优先，并重置连续次数。关闭暂停策略不会自动释放已有暂停；关闭切组策略后，已切组账号仍可按恢复阈值还原原分组。检测暂停期间继续检测。
               </p>

@@ -193,11 +193,13 @@ type RequestOptions = RequestInit & { timeoutMs?: number }
 
 export class AdminAPIError extends Error {
   readonly status: number
+  readonly details: unknown
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, details?: unknown) {
     super(message)
     this.name = 'AdminAPIError'
     this.status = status
+    this.details = details
   }
 }
 
@@ -261,7 +263,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
     if (res.status === 401) {
       resetAdminAuthState()
     }
-    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status))
+    let details: unknown
+    try { details = JSON.parse(body) } catch { /* Non-JSON errors retain their message. */ }
+    throw new AdminAPIError(res.status, extractAdminErrorMessage(body, res.status), details)
   }
 
   if (res.status === 204) {

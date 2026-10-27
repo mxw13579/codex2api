@@ -277,6 +277,9 @@ func CanonicalBillingModelKey(model string) string {
 	if key := GrokMediaPricingKey(normalized); key != "" {
 		return key
 	}
+	if canonical := antigravityCanonicalPricingModel(normalized); canonical != "" {
+		return canonical
+	}
 	return strings.ToLower(normalized)
 }
 
@@ -294,6 +297,9 @@ func PricingManagementModelKey(model string) string {
 	normalized := normalizeBillingModelName(model)
 	compact := strings.NewReplacer(" ", "-", "_", "-").Replace(normalized)
 	if compact == "codex-auto-review" {
+		return compact
+	}
+	if isAntigravityPricingAlias(compact) {
 		return compact
 	}
 	return CanonicalBillingModelKey(normalized)
@@ -314,6 +320,36 @@ func daybreakPricingAliasKey(model string) string {
 		return normalized
 	}
 	return ""
+}
+
+func antigravityCanonicalPricingModel(model string) string {
+	normalized := normalizeBillingModelName(model)
+	if normalized == "" {
+		return ""
+	}
+	lower := strings.ToLower(strings.TrimSpace(normalized))
+	if strings.HasPrefix(lower, "gemini-") {
+		for _, suffix := range []string{"-high", "-medium", "-low", "-tiered"} {
+			if strings.HasSuffix(lower, suffix) {
+				return strings.TrimSuffix(lower, suffix)
+			}
+		}
+	}
+	if strings.HasPrefix(lower, "claude-") {
+		if strings.HasSuffix(lower, "-thinking") {
+			return strings.TrimSuffix(lower, "-thinking")
+		}
+		for _, suffix := range []string{"-high", "-medium", "-low"} {
+			if strings.HasSuffix(lower, suffix) {
+				return strings.TrimSuffix(lower, suffix)
+			}
+		}
+	}
+	return ""
+}
+
+func isAntigravityPricingAlias(model string) bool {
+	return antigravityCanonicalPricingModel(model) != ""
 }
 
 // PricingAliasTarget reports the canonical fallback for an independently
@@ -337,6 +373,14 @@ func ModelPricingSourceFor(canonical string) string {
 			return ModelPricingSourceCustom
 		}
 		return ModelPricingSourceSynced
+	}
+	if target := PricingAliasTarget(canonical); target != "" {
+		if ov, ok := lookupModelPricingOverride(target); ok {
+			if ov.Source == ModelPricingSourceCustom {
+				return ModelPricingSourceCustom
+			}
+			return ModelPricingSourceSynced
+		}
 	}
 	return "default"
 }

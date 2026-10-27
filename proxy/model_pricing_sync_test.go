@@ -201,3 +201,48 @@ func TestParseModelPricingPayloadModelsDevIncludesXAI(t *testing.T) {
 		t.Fatalf("openai entries must survive alongside xai: %+v", ov5)
 	}
 }
+
+func TestParseModelPricingPayloadModelsDevIncludesGoogle(t *testing.T) {
+	body := []byte(`{
+		"openai": {
+			"id": "openai",
+			"models": {"gpt-5.5": {"id": "gpt-5.5", "cost": {"input": 5, "output": 30, "cache_read": 0.5}}}
+		},
+		"google": {
+			"id": "google",
+			"models": {
+				"gemini-3.8-flash": {
+					"id": "gemini-3.8-flash",
+					"cost": {
+						"input": 0.75, "output": 3.75, "cache_read": 0.075
+					}
+				},
+				"non-gemini-model": {
+					"id": "non-gemini-model",
+					"cost": {"input": 1, "output": 1}
+				}
+			}
+		},
+		"google-reseller": {
+			"id": "google-reseller",
+			"models": {"gemini-3.8-flash": {"cost": {"input": 99, "output": 99}}}
+		}
+	}`)
+
+	got, err := parseModelPricingPayload(body)
+	if err != nil {
+		t.Fatalf("parse models.dev payload: %v", err)
+	}
+
+	ov, ok := got["gemini-3.8-flash"]
+	if !ok {
+		t.Fatalf("missing gemini-3.8-flash, got keys: %v", got)
+	}
+	if ov.Input != 0.75 || ov.Output != 3.75 || ov.CachedInput != 0.075 {
+		t.Fatalf("gemini-3.8-flash pricing = %+v, want $0.75/$3.75/cache $0.075", ov)
+	}
+
+	if _, ok := got["non-gemini-model"]; ok {
+		t.Fatalf("non-gemini google models should be filtered out")
+	}
+}

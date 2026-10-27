@@ -77,22 +77,27 @@ func TestPrepareWebsocketHeadersUsesConfiguredDefaultsAndBetaFeatures(t *testing
 	}
 }
 
-// TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent 验证 WS 路径同样
-// 只在下游携带 DeviceCheck token（openai/codex#20619）时透传，缺失不伪造。
-func TestPrepareWebsocketHeadersForwardsAttestationOnlyWhenPresent(t *testing.T) {
+// TestPrepareWebsocketHeadersUsesProjectAttestation 验证 WS 证明仅由本项目生成。
+func TestPrepareWebsocketHeadersUsesProjectAttestation(t *testing.T) {
 	exec := NewExecutor()
-	acc := &auth.Account{DBID: 42, AccountID: "42"}
+	acc := &auth.Account{DBID: 42, AccountID: "42", CustomHeaders: map[string]string{
+		"X-Oai-Attestation": "v1.account-override",
+	}}
 
 	withToken := exec.prepareWebsocketHeaders(context.Background(), "token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{
+		"User-Agent":        {"codex-tui/0.164.0 (Windows 11; x86_64) unknown"},
 		"X-Oai-Attestation": []string{"v1.real-devicecheck-token"},
 	}, nil, "")
-	if got := withToken.Get("X-Oai-Attestation"); got != "v1.real-devicecheck-token" {
-		t.Fatalf("X-Oai-Attestation = %q, want passthrough of downstream token", got)
+	if got := withToken.Get("X-Oai-Attestation"); !strings.HasPrefix(got, `{"v":1,"s":0,"t":"v1.`) {
+		t.Fatalf("X-Oai-Attestation = %q, want project-generated envelope", got)
 	}
 
-	without := exec.prepareWebsocketHeaders(context.Background(), "token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{}, nil, "")
+	without := exec.prepareWebsocketHeaders(context.Background(), "token-123", acc, "42", "session-123", "api-key-1", nil, http.Header{
+		"User-Agent":        {"codex-tui/0.164.0 (Linux Ubuntu 24.04; x86_64) unknown"},
+		"X-Oai-Attestation": {"v1.real-devicecheck-token"},
+	}, nil, "")
 	if got := without.Get("X-Oai-Attestation"); got != "" {
-		t.Fatalf("X-Oai-Attestation = %q, want empty (never fabricate)", got)
+		t.Fatalf("X-Oai-Attestation = %q, want empty for Linux", got)
 	}
 }
 

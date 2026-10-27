@@ -50,7 +50,7 @@ SDK 示例的基础调用与流式事件按 [OpenAI SDK 文档](https://develope
 | 视频生成 / 编辑 / 延展 | `/v1/videos/generations`、`/edits`、`/extensions` | 需要可用付费 Grok 账号；创建后轮询 request_id 并下载 `/content` |
 | 本地 Token 估算 | `/v1/messages/count_tokens`、`/v1/responses/input_tokens` | 不调用上游，用于兼容探测，不作为准确 tokenizer 或计费依据 |
 | 上下文压缩 | `POST /v1/responses/compact` | 提交完整历史，保留返回的压缩项和不透明字段 |
-| Responses WebSocket | `GET /v1/responses` | 通过认证头建立连接后发送 `response.create`；同 `stream_id` 保序、不同独立流并行（最多 16 个活动轮次、32 个命名流）；`response.append` 与 `response.steer` 返回 `unsupported_feature`，可用下一轮 `response.create` + `previous_response_id` |
+| Responses WebSocket | `GET /v1/responses` | 通过认证头建立连接后发送 `response.create`；同 `stream_id` 保序、不同独立流并行（最多 16 个活动轮次、32 个命名流）；支持向当前 WebSocket 上游租约发送 `response.interrupt`；`response.append` 与 `response.steer` 返回 `unsupported_feature`，可用下一轮 `response.create` + `previous_response_id` |
 
 GPT Image 2.5 的 Flare / Sunburst 支持 `auto/low/medium/high/xhigh/max`；省略模型仍默认 `gpt-image-2`。`-2k/-4k` 是网关尺寸档位别名。直接通过 Responses 生图时，顶层 `model` 是文本驱动，`tools[].model` 是图片模型。完整参数见 [Images](API.md#3-images)。
 

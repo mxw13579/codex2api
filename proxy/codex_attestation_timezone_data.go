@@ -4,7 +4,7 @@ import "strings"
 
 // IANA tzdb zone.tab 和 backward 的时区到地区代码映射。
 // 来源: https://data.iana.org/time-zones/tzdb/ 。
-var windowsTimezoneZonesByCountry = map[string]string{
+var codexAttestationZonesByCountry = map[string]string{
 	"AD": "Europe/Andorra",
 	"AE": "Asia/Dubai",
 	"AF": "Asia/Kabul",
@@ -254,9 +254,9 @@ var windowsTimezoneZonesByCountry = map[string]string{
 	"ZW": "Africa/Harare",
 }
 
-var windowsTimezoneCountryByZone = func() map[string]string {
+var codexAttestationCountryByZone = func() map[string]string {
 	result := make(map[string]string)
-	for country, zones := range windowsTimezoneZonesByCountry {
+	for country, zones := range codexAttestationZonesByCountry {
 		for _, zone := range strings.Split(zones, ",") {
 			result[zone] = country
 		}

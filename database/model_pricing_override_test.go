@@ -127,6 +127,12 @@ func TestPricingManagementModelKeyPreservesIndependentAlias(t *testing.T) {
 		{model: "codex auto review", want: "codex-auto-review"},
 		{model: "gpt-5.4", want: "gpt-5.4"},
 		{model: "gpt-5.4-openai-compact", want: "gpt-5.4"},
+		{model: "gemini-3.8-flash-high", want: "gemini-3.8-flash-high"},
+		{model: "gemini-3.8-flash-low", want: "gemini-3.8-flash-low"},
+		{model: "gemini-3.8-flash-medium", want: "gemini-3.8-flash-medium"},
+		{model: "gemini-3.8-flash", want: "gemini-3.8-flash"},
+		{model: "claude-opus-4-6-thinking", want: "claude-opus-4-6-thinking"},
+		{model: "claude-opus-5-5-high", want: "claude-opus-5-5-high"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
@@ -134,6 +140,61 @@ func TestPricingManagementModelKeyPreservesIndependentAlias(t *testing.T) {
 				t.Fatalf("PricingManagementModelKey(%q) = %q, want %q", tt.model, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAntigravityPricingAliasInheritance(t *testing.T) {
+	t.Cleanup(func() { SetModelPricingOverrides(nil) })
+
+	if target := PricingAliasTarget("gemini-3.8-flash-high"); target != "gemini-3.8-flash" {
+		t.Fatalf("PricingAliasTarget(gemini-3.8-flash-high) = %q, want gemini-3.8-flash", target)
+	}
+	if target := PricingAliasTarget("claude-opus-4-6-thinking"); target != "claude-opus-4-6" {
+		t.Fatalf("PricingAliasTarget(claude-opus-4-6-thinking) = %q, want claude-opus-4-6", target)
+	}
+
+	// 1. 默认状态：基础模型生效官方默认价 $0.75/$3.75
+	base := GetModelPricing("gemini-3.8-flash-high")
+	if base.InputPricePerMToken != 0.75 || base.OutputPricePerMToken != 3.75 || base.CacheReadPricePerMToken != 0.075 {
+		t.Fatalf("gemini-3.8-flash-high default pricing = %+v, want $0.75/$3.75/cache $0.075", base)
+	}
+	if source := ModelPricingSourceFor("gemini-3.8-flash-high"); source != "default" {
+		t.Fatalf("gemini-3.8-flash-high default source = %q, want default", source)
+	}
+
+	// 2. 模拟同步源写入 gemini-3.8-flash 覆盖：变体应自动继承
+	syncedOverrides := map[string]ModelPricingOverride{
+		"gemini-3.8-flash": {
+			Source:      ModelPricingSourceSynced,
+			Input:       0.80,
+			Output:      4.00,
+			CachedInput: 0.08,
+		},
+	}
+	SetModelPricingOverrides(syncedOverrides)
+
+	synced := GetModelPricing("gemini-3.8-flash-high")
+	if synced.InputPricePerMToken != 0.80 || synced.OutputPricePerMToken != 4.00 || synced.CacheReadPricePerMToken != 0.08 {
+		t.Fatalf("gemini-3.8-flash-high should inherit synced base price: %+v", synced)
+	}
+	if source := ModelPricingSourceFor("gemini-3.8-flash-high"); source != ModelPricingSourceSynced {
+		t.Fatalf("gemini-3.8-flash-high source = %q, want synced", source)
+	}
+
+	// 3. 管理员显式为 high 档设置自定义价格：优先命中 alias custom
+	syncedOverrides["gemini-3.8-flash-high"] = ModelPricingOverride{
+		Source: ModelPricingSourceCustom,
+		Input:  1.50,
+		Output: 7.50,
+	}
+	SetModelPricingOverrides(syncedOverrides)
+
+	custom := GetModelPricing("gemini-3.8-flash-high")
+	if custom.InputPricePerMToken != 1.50 || custom.OutputPricePerMToken != 7.50 {
+		t.Fatalf("gemini-3.8-flash-high explicit custom override failed: %+v", custom)
+	}
+	if source := ModelPricingSourceFor("gemini-3.8-flash-high"); source != ModelPricingSourceCustom {
+		t.Fatalf("gemini-3.8-flash-high source = %q, want custom", source)
 	}
 }
 

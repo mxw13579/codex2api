@@ -377,6 +377,18 @@ func proxyProbeErrorLooksLikeTargetUnreachable(message string) bool {
 		"connect: network is unreachable",
 		"connect: host unreachable",
 		"no route to host",
+		"network is unreachable",
+		"host is unreachable",
+		"(http 502)",
+		"(http 503)",
+		"(http 504)",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
+		"bad gateway",
+		"gateway timeout",
+		"upstream connect failed",
+		"upstream request failed",
 	} {
 		if strings.Contains(message, fragment) {
 			return true
@@ -475,20 +487,27 @@ func proxyProbeErrorIsConclusive(
 		if !state.StartedSOCKSTargetConnect {
 			return true
 		}
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, targetFailure := range []string{
+		"unknown error network unreachable",
+		"unknown error host unreachable",
+		"unknown error connection refused",
+		"unknown error ttl expired",
+		"502 bad gateway",
+		"503 service unavailable",
+		"504 gateway timeout",
+		"bad gateway",
+		"gateway timeout",
+		"upstream connect failed",
+		"upstream request failed",
+	} {
+		if strings.Contains(message, targetFailure) {
 			return false
-		}
-		message := strings.ToLower(err.Error())
-		for _, targetFailure := range []string{
-			"unknown error network unreachable",
-			"unknown error host unreachable",
-			"unknown error connection refused",
-			"unknown error ttl expired",
-		} {
-			if strings.Contains(message, targetFailure) {
-				return false
-			}
 		}
 	}
 	return true

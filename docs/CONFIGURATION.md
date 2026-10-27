@@ -9,10 +9,21 @@
 - [系统设置（数据库）](#系统设置数据库)
 - [模型与价格自动更新](#模型与价格自动更新)
 - [API Key 模型周请求次数预算](#api-key-模型周请求次数预算)
+- [降智检测与目标分组](#降智检测与目标分组)
+- [Codex 出站 attestation](#codex-出站-attestation)
 - [配置文件示例](#配置文件示例)
 - [配置优先级](#配置优先级)
 
 ---
+
+## 降智检测与目标分组
+
+管理后台「降智检测」支持 Codex 和 Claude 账号。「新增账号默认检测」只影响之后创建的账号，不会修改已有账号的检测开关。
+
+- 自动处置为「不自动处置」或「暂停业务调度」时，两个通道的新账号均按默认开关决定是否参与检测。
+- 自动处置为「切换分组」时，仅与目标分组通道一致的新账号默认参与检测；其他通道的账号仍可正常创建。目标分组不存在或通道不兼容时，新账号不自动参与检测。
+- 当前配置只有一个目标分组。已有账号同时启用了两个通道的检测时，保存切组策略会返回冲突账号的 ID、名称和通道。页面可查看账号检测记录，或关闭所列账号的自动检测后重新保存；超过 200 个冲突时分批处理。关闭检测不会关闭账号的业务调度，也不会删除检测历史或已有处置的恢复状态。
+- 升级会替换 SQLite 和 PostgreSQL 的新账号触发器，但保留已有账号的检测开关。旧版本产生的冲突需要通过上述入口处理；仅关闭「新增账号默认检测」不会清除已有冲突。
 
 ## 模型与价格自动更新
 
@@ -31,6 +42,14 @@ Codex 注册表中管理员禁用的模型不会重新启用，账号清单学�
 Daybreak 派生别名（如 `gpt-6-sol-daybreak-blue`、`gpt-6.1-sol-daybreak-blue`）按基础型号同步完整标准、Fast 和长上下文价格，不要求参考 JSON 单独收录别名。别名有精确价目时优先采用；别名自定义价优先，基础模型自定义价也不会被别名同步价压过。未查到基础型号价格时继续按既定来源顺序回退。官方 `gpt-daybreak-blue-latest`、`gpt-daybreak-red-latest` 的默认快照目前分别是 `gpt-5.6-sol`、`gpt-5.6-cyber`；Cyber 使用独立公开定价，不再按 Sol 兜底。来源：[Daybreak 指南](https://developers.openai.com/api/docs/guides/daybreak)、[官方价格页](https://developers.openai.com/api/docs/pricing)。
 
 Antigravity 模型仍使用「刷新全部模型」。「立即同步官方价」保持仅同步价格，模型发现由定时轮询执行。新协议、特殊权限或特殊计费规则仍可能需要更新程序。
+
+## Codex 出站 attestation
+
+Codex HTTP、WebSocket 和 Live 共用出站证明服务，按最终 User-Agent 选择平台：
+Windows 自动发送平台不可用状态，Linux 不自动补头，macOS 尝试原生 DeviceCheck，
+生成失败时发送桌面端对应的内层错误状态。证明统一由本项目生成，忽略客户端及账号
+自定义请求头中的 `X-Oai-Attestation`；Live sideband 复用服务端冻结的建连结果。
+无需新增环境变量或数据库设置；详见 [平台矩阵、Mac 依赖与 Live 快照](CODEX_ATTESTATION.md)。
 
 ## 配置层级
 
@@ -104,7 +123,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_STATSIG_API_KEY` | 否 | 内置公开 key | 覆盖 Codex Desktop/CLI 共用的公开 Statsig SDK key，仅遥测开启时使用 |
 | `CODEX_SESSION_HEADER_MODE` | 否 | `native` | 出站会话头形态。`native` 发真实客户端的 `session-id` / `thread-id` / `x-client-request-id`；`legacy` 回退到旧的 `Session_id`（WS 另带 `Conversation_id`） |
 | `CODEX_SESSION_HEADER_ALIGN_CONVERGED` | 否 | `false` | 开启后 `session-id` 头改用指纹收敛后的会话身份，与 turn metadata 的 `session_id` 对齐。默认关：请求体 `prompt_cache_key` 始终独立隔离，但上游是否也拿该头参与缓存分组无法从客户端源码确认 |
-| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102 |
+| `DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` | 否 | `30s` | 下游 HTTP/SSE 保活周期，使用 Go duration；`0` 关闭。流式端点从首个心跳起建立 SSE 200，发送注释或 Messages ping；非流式端点发送 HTTP 102，但 Codex/GPT Images 除外：其非流式请求不发送中间响应，直接等待最终 JSON |
 | `DOWNSTREAM_WS_KEEPALIVE_INTERVAL` | 否 | `45s` | 下游 WebSocket Ping 周期，使用 Go duration；`0` 关闭。覆盖 Responses、Realtime 与 Live Sideband |
 
 配额帧读路径只更新内存和调度器；用量、credits、套餐及冷却的写库共用后台合并路径。并发观测锁争用时，每账号最多保留 64 个待应用 partial 帧，按原始时间顺序处理；溢出保留最新的有界尾部，并通过已有探针补齐权威快照。停机丢弃未完成的缓存写，重启后由探针重建。冷却写失败会在后续观测重试，不重复计入失败次数。
@@ -407,9 +426,11 @@ Codex 的 `/v1/responses`（HTTP / WebSocket）托管 `web_search` / `web_search
 
 `catch_all` 是默认关闭的超级模式。开启后不再依赖已知类别或错误码清单；除明确的上游 `cyber_policy` 外，任何真实上游 HTTP、传输、流读取、`error`、`response.failed` 或未知失败都会进入持续重试，包括永久额度、余额、鉴权、无效请求和其他结构化安全策略错误。明确的上游 `cyber_policy` 始终终止当前请求，不换号、不重放。文本推理只接受上游 HTTP `200` 及协议正常终态；其他状态、失败终态及无终态 EOF 都会丢弃整次尝试并继续。管理界面的超级开关会在一次保存中同时设置 `enabled=true` 和 `catch_all=true`；关闭总开关会同步清除 `catch_all`，避免隐藏启用。
 
-持续重试会把每次流式上游尝试完整暂存；失败整次丢弃，正常终态才一次性回放。目标端点等待上游响应头、读取响应体或流数据时保持下游连接：Responses、Chat Completions 和 Images 在首个保活周期到达时建立 SSE 200 并发送 `: keepalive` 注释，Messages 发送 Anthropic 原生 `event: ping`；Responses、Realtime 与 Live Sideband WebSocket 使用 Ping 控制帧。原生 Grok SSE 仍保留上游帧格式并允许插入保活帧。心跳提交 SSE 后，随后的上游错误会使用协议错误事件，不再改变 HTTP 200。非流式 JSON（包括 relay/native Responses、compact、Images、Grok 图片和 Alpha Search）使用标准 HTTP `102 Processing` 信息响应，不提交最终状态或 JSON；Cloudflare 收到 102 后仍要求在 125 秒内收到最终响应，因此它只能延长等待，不是无限期保活。`max_duration_seconds` 设置无限预算的墙钟时间上限（默认 600 秒，范围 1 到 900 秒），从请求第一次进入无限重试时开始，后续尝试不会重置。期限到达会立即取消上游并返回最近一次真实上游失败；仅在尚无失败可返回时使用 `504 upstream_timeout`。普通自选模式不会无限重试未选中的结构化安全策略拒绝；`catch_all` 可覆盖其他拒绝，但不能覆盖明确的上游 `cyber_policy` 或本地重试期限。
+持续重试会把每次流式上游尝试完整暂存；失败整次丢弃，正常终态才一次性回放。目标端点等待上游响应头、读取响应体或流数据时保持下游连接：Responses、Chat Completions 和 Images 在首个保活周期到达时建立 SSE 200 并发送 `: keepalive` 注释，Messages 发送 Anthropic 原生 `event: ping`；Responses、Realtime 与 Live Sideband WebSocket 使用 Ping 控制帧。原生 Grok SSE 仍保留上游帧格式并允许插入保活帧。心跳提交 SSE 后，随后的上游错误会使用协议错误事件，不再改变 HTTP 200。非流式 JSON（包括 relay/native Responses、compact、Grok 图片和 Alpha Search，但不包括 Codex/GPT Images）使用标准 HTTP `102 Processing` 信息响应，不提交最终状态或 JSON；Cloudflare 收到 102 后仍要求在 125 秒内收到最终响应，因此它只能延长等待，不是无限期保活。`max_duration_seconds` 设置无限预算的墙钟时间上限（默认 600 秒，范围 1 到 900 秒），从请求第一次进入无限重试时开始，后续尝试不会重置。期限到达会立即取消上游并返回最近一次真实上游失败；仅在尚无失败可返回时使用 `504 upstream_timeout`。普通自选模式不会无限重试未选中的结构化安全策略拒绝；`catch_all` 可覆盖其他拒绝，但不能覆盖明确的上游 `cyber_policy` 或本地重试期限。
 
-上述 HTTP/SSE 保活覆盖 `/v1/responses`（含 relay/native、stream 与 non-stream）、`/v1/chat/completions`、`/v1/messages`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/images/generations` 和 `/v1/images/edits`；视频、image jobs 与 `POST /v1/live` 不启用这套保活。Claude 原生 Messages 的首字前及已提交流保活继续由 `stream_keepalive_enabled` 共同控制，缺省为开启。
+Codex/GPT Images 在 `stream=false` 或省略 `stream` 时不发送 HTTP 102、不提前提交 200，直接等待最终 JSON，避免部分反向代理错误转发信息响应；调用方仍需为完整生成时长设置足够的等待/空闲超时。其 `stream=true` 请求继续使用 SSE 心跳。此例外不改变 Grok 图片或其他非流式端点的 102 行为，也不改变重试和截止时间。
+
+上述 HTTP/SSE 保活覆盖 `/v1/responses`（含 relay/native、stream 与 non-stream）、`/v1/chat/completions`、`/v1/messages`、`/v1/responses/compact`、`/v1/alpha/search`、`/v1/images/generations` 和 `/v1/images/edits`（Codex/GPT 仅覆盖 `stream=true`，Grok 图片的 HTTP 102 保活保持不变）；视频、image jobs 与 `POST /v1/live` 不启用这套保活。Claude 原生 Messages 的首字前及已提交流保活继续由 `stream_keepalive_enabled` 共同控制，缺省为开启。
 
 配置 API Key 模型请求次数预算时，额度准入完成前不会因保活提交 SSE 200；准入或重试也不会重新开启已关闭的 Claude 保活。普通 Responses、Chat Completions 和 Messages 请求在下游取消后停止发送心跳，并沿用最多 5 秒的上游 usage 补读窗口；持续重试的响应读取仍随下游取消立即结束。
 

@@ -29,6 +29,26 @@ export interface IntelligenceSettings {
   target_group_id: number;
   questions: IntelligenceQuestion[];
 }
+export interface IntelligenceTargetConflict {
+  code: "intelligence_check_target_conflict";
+  target_group_id: number;
+  target_group_channel: string;
+  conflict_count: number;
+  conflicts: { account_id: number; account_name: string; channel: string }[];
+}
+
+export function intelligenceTargetConflict(error: unknown): IntelligenceTargetConflict | null {
+  if (!error || typeof error !== "object" || !("details" in error)) return null;
+  const details = error.details as Partial<IntelligenceTargetConflict> | null;
+  if (!details || details.code !== "intelligence_check_target_conflict" ||
+    !Number.isSafeInteger(details.target_group_id) ||
+    typeof details.target_group_channel !== "string" ||
+    !Number.isSafeInteger(details.conflict_count) || (details.conflict_count ?? 0) <= 0 ||
+    !Array.isArray(details.conflicts) || details.conflicts.length === 0 || details.conflicts.length > 200 ||
+    details.conflicts.some(a => !a || !Number.isSafeInteger(a.account_id) || a.account_id <= 0 || typeof a.account_name !== "string" || typeof a.channel !== "string")) return null;
+  return details as IntelligenceTargetConflict;
+}
+
 export interface IntelligenceRecord {
   id: number;
   status: IntelligenceStatus;

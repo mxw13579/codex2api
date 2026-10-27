@@ -391,9 +391,6 @@ var codexAllowedForwardHeaders = []string{
 	"X-Client-Request-Id",
 	"X-Codex-Beta-Features",
 	codexResponsesLiteHeader,
-	// 下游真实客户端的证明优先透传。Windows Desktop 身份缺失时，会在出站头
-	// 装配结束后补官方客户端的 DeviceCheck 不可用状态；macOS 不模拟硬件证明。
-	"X-Oai-Attestation",
 }
 
 func codexResponsesLiteRequested(requestBody []byte, headers http.Header) bool {
@@ -1337,7 +1334,9 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	// 可整体退回旧的 Session_id 形态。
 	ApplyCodexSessionHeaders(req.Header, account, cacheKey, downstreamHeaders, false)
 	applyAccountCustomHeaders(req, account)
-	ApplyWindowsDesktopAttestation(req.Header, account)
+	if err := ApplyCodexAttestation(req.Context(), CodexAttestationInput{Headers: req.Header, Account: account}); err != nil {
+		return err
+	}
 	RecordUpstreamUserAgent(req.Context(), req.Header.Get("User-Agent"))
 	return nil
 }

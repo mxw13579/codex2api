@@ -26,3 +26,11 @@ func TestCleanPlanAllowAcceptsClaudePlans(t *testing.T) {
 		t.Fatalf("cleanPlanAllow() = %#v, want %#v", got, want)
 	}
 }
+
+func TestCleanPlanAllowAcceptsAntigravityPlans(t *testing.T) {
+	input := []string{"free", "Pro", "ULTRA", "standard", "api", "Google AI Pro", "g1-pro-tier"}
+	want := []string{"free", "pro", "ultra", "standard", "api"}
+	if got := cleanPlanAllow(input); !reflect.DeepEqual(got, want) {
+		t.Fatalf("cleanPlanAllow() = %#v, want %#v", got, want)
+	}
+}

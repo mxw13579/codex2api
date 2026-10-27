@@ -183,6 +183,10 @@ type Account struct {
 	CustomHeaders        map[string]string
 	UpstreamType         string
 	AntigravityProjectID string
+	// AntigravityPlanKey is the plan_allow key derived from the persisted
+	// entitlement tier ids (free/pro/ultra/standard, "api" for API keys).
+	// PlanType keeps Google's display name ("Google AI Pro") for the UI.
+	AntigravityPlanKey string
 	// AntigravityHardBlocked is a durable runtime fence restored from Google's
 	// authoritative permission/quota snapshots or a permanent OAuth refresh
 	// failure. It is kept separate from administrative DispatchPaused so a
@@ -6272,6 +6276,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.AccountID = row.GetCredential("account_id")
 		account.Email = row.GetCredential("email")
 		account.PlanType = row.GetCredential("plan_type")
+		account.AntigravityPlanKey = antigravityPlanKeyFromRow(row)
 		if strings.TrimSpace(apiKey) != "" {
 			account.HealthTier = HealthTierHealthy
 			account.PlanType = "api"
@@ -10318,6 +10323,11 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 				return false
 			}
 		}
+		// Antigravity plan_type is Google's display name ("Google AI Pro");
+		// match the key derived from the entitlement tier id instead.
+		if acc.isAntigravityAPILocked() {
+			plan = acc.AntigravityPlanKey
+		}
 		if _, ok := allowedPlans[plan]; !ok {
 			return false
 		}
@@ -12744,6 +12754,9 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 	acc.AccountID = strings.TrimSpace(row.GetCredential("account_id"))
 	acc.Email = strings.TrimSpace(row.GetCredential("email"))
 	acc.PlanType = strings.TrimSpace(row.GetCredential("plan_type"))
+	planKey := antigravityPlanKeyFromRow(row)
+	planKeyChanged := acc.AntigravityPlanKey != planKey
+	acc.AntigravityPlanKey = planKey
 	acc.AntigravityProjectID = strings.TrimSpace(row.GetCredential("project_id"))
 	acc.Models = models
 	acc.ProxyURL = strings.TrimSpace(row.ProxyURL)
@@ -12794,6 +12807,10 @@ func (s *Store) publishAntigravityRuntimeRow(acc *Account, row *database.Account
 		atomic.StoreInt32(&acc.DispatchPaused, 1)
 	}
 	s.fastSchedulerUpdate(acc)
+	if planKeyChanged {
+		// plan_allow 受限 Key 的路由子池按成员缓存,套餐变化须重建。
+		s.invalidateRoutingSchedulers()
+	}
 	// 配额快照与硬围栏随本行一起刷新：门禁可能刚刚转为阻断或解除阻断（reset 到期、
 	// clear 动作、止血开关翻转），必须唤醒排队中的等待者立即重新求值，否则它们会
 	// 空等到超时（Spec §6.2 #2）。

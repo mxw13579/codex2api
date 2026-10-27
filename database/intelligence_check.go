@@ -15,6 +15,27 @@ var ErrIntelligenceCheckRevisionConflict = errors.New("intelligence check settin
 var ErrIntelligenceCheckTargetGroup = errors.New("intelligence check target group is incompatible")
 var ErrIntelligenceCheckUnsupportedAccount = errors.New("account is not eligible for intelligence checks")
 
+type IntelligenceCheckTargetConflictAccount struct {
+	AccountID   int64  `json:"account_id"`
+	AccountName string `json:"account_name"`
+	Channel     string `json:"channel"`
+}
+
+// Bound the response to the same batch size accepted by the account toggle API.
+// Existing opt-ins are preserved until the administrator explicitly changes them.
+type IntelligenceCheckTargetConflictError struct {
+	TargetGroupID      int64                                    `json:"target_group_id"`
+	TargetGroupChannel string                                   `json:"target_group_channel"`
+	ConflictCount      int                                      `json:"conflict_count"`
+	Conflicts          []IntelligenceCheckTargetConflictAccount `json:"conflicts"`
+}
+
+func (e *IntelligenceCheckTargetConflictError) Error() string {
+	return fmt.Sprintf("%s: %d enabled accounts belong to another channel", ErrIntelligenceCheckTargetGroup, e.ConflictCount)
+}
+
+func (e *IntelligenceCheckTargetConflictError) Unwrap() error { return ErrIntelligenceCheckTargetGroup }
+
 type IntelligenceCheckAccountFilter struct {
 	AccountID               int64
 	Search, Channel, Status string
@@ -114,11 +135,30 @@ func (db *DB) ensureIntelligenceCheckSchema(ctx context.Context) error {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO intelligence_check_accounts(account_id,enabled) SELECT id,FALSE FROM accounts WHERE TRUE ON CONFLICT(account_id) DO NOTHING`); err != nil {
 			return err
 		}
+		// Reuse the eligibility/channel predicates used by manual enrollment and
+		// settings validation. AFTER INSERT can read the newly inserted account.
+		action := `json_extract(s.config_json,'$.action')`
+		target := `json_extract(s.config_json,'$.target_group_id')`
+		if !db.isSQLite() {
+			action = `(s.config_json::jsonb)->>'action'`
+			target = `((s.config_json::jsonb)->>'target_group_id')::bigint`
+		}
+		defaultEnabled := `COALESCE((SELECT s.new_accounts_enabled AND (` + db.intelligenceEligibleSQL() + `) AND
+			(COALESCE(` + action + `,'none')<>'switch_group' OR EXISTS (
+				SELECT 1 FROM account_groups g WHERE g.id=` + target + ` AND LOWER(TRIM(COALESCE(g.channel,'codex')))=` + db.intelligenceChannelExpr() + `))
+			FROM intelligence_check_settings s JOIN accounts a ON a.id=NEW.id WHERE s.id=1),FALSE)`
+		insert := `INSERT INTO intelligence_check_accounts(account_id,enabled) VALUES(NEW.id,` + defaultEnabled + `) ON CONFLICT(account_id) DO NOTHING;`
 		if db.isSQLite() {
-			_, err := tx.ExecContext(ctx, `CREATE TRIGGER IF NOT EXISTS intelligence_check_new_account AFTER INSERT ON accounts BEGIN INSERT INTO intelligence_check_accounts(account_id,enabled) VALUES(NEW.id,COALESCE((SELECT new_accounts_enabled FROM intelligence_check_settings WHERE id=1),FALSE)) ON CONFLICT(account_id) DO NOTHING; END`)
+			// IF NOT EXISTS would leave the old, unconditional trigger on upgrades.
+			if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS intelligence_check_new_account`); err != nil {
+				return err
+			}
+			_, err := tx.ExecContext(ctx, `CREATE TRIGGER intelligence_check_new_account AFTER INSERT ON accounts BEGIN `+insert+` END`)
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `CREATE OR REPLACE FUNCTION intelligence_check_new_account_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO intelligence_check_accounts(account_id,enabled) VALUES(NEW.id,COALESCE((SELECT new_accounts_enabled FROM intelligence_check_settings WHERE id=1),FALSE)) ON CONFLICT(account_id) DO NOTHING; RETURN NEW; END $$`); err != nil {
+		// Serialize enrollment with settings changes, including a concurrent switch
+		// from none/pause to switch_group. SQLite already serializes writers.
+		if _, err := tx.ExecContext(ctx, `CREATE OR REPLACE FUNCTION intelligence_check_new_account_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM 1 FROM intelligence_check_settings WHERE id=1 FOR SHARE; `+insert+` RETURN NEW; END $$`); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `DROP TRIGGER IF EXISTS intelligence_check_new_account ON accounts`); err != nil {
@@ -167,12 +207,26 @@ func (db *DB) SaveIntelligenceCheckSettings(ctx context.Context, s ic.Settings) 
 			if err != nil {
 				return err
 			}
-			var incompatible int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts a JOIN intelligence_check_accounts st ON st.account_id=a.id WHERE `+db.intelligenceEligibleSQL()+` AND st.enabled=TRUE AND COALESCE(`+db.intelligenceStateActionExpr("st")+`,'')='' AND `+db.intelligenceChannelExpr()+`<>$1`, channel).Scan(&incompatible); err != nil {
+			conflict := &IntelligenceCheckTargetConflictError{TargetGroupID: s.TargetGroupID, TargetGroupChannel: channel}
+			rows, err := tx.QueryContext(ctx, `SELECT a.id,COALESCE(a.name,''),`+db.intelligenceChannelExpr()+`,COUNT(*) OVER () FROM accounts a JOIN intelligence_check_accounts st ON st.account_id=a.id WHERE `+db.intelligenceEligibleSQL()+` AND st.enabled=TRUE AND COALESCE(`+db.intelligenceStateActionExpr("st")+`,'')='' AND `+db.intelligenceChannelExpr()+`<>$1 ORDER BY a.id LIMIT 200`, channel)
+			if err != nil {
 				return err
 			}
-			if incompatible > 0 {
-				return fmt.Errorf("%w: %d enabled accounts belong to another channel", ErrIntelligenceCheckTargetGroup, incompatible)
+			for rows.Next() {
+				var account IntelligenceCheckTargetConflictAccount
+				if err = rows.Scan(&account.AccountID, &account.AccountName, &account.Channel, &conflict.ConflictCount); err != nil {
+					rows.Close()
+					return err
+				}
+				conflict.Conflicts = append(conflict.Conflicts, account)
+			}
+			err = rows.Err()
+			rows.Close()
+			if err != nil {
+				return err
+			}
+			if conflict.ConflictCount > 0 {
+				return conflict
 			}
 		}
 

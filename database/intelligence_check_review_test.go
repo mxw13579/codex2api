@@ -159,8 +159,8 @@ func TestIntelligenceCheckTargetCompatibilityPreflight(t *testing.T) {
 		t.Fatal("incompatible new account blocked compatible automatic tasks", n, e)
 	}
 	states, _, e := db.ListIntelligenceCheckAccounts(ctx, IntelligenceCheckAccountFilter{Channel: "claude"})
-	if e != nil || len(states) != 2 || states[0].ConfigError != "" || states[1].ConfigError == "" {
-		t.Fatal("missing local configuration status", states, e)
+	if e != nil || len(states) != 2 || states[0].ConfigError != "" || states[1].ConfigError != "" || states[1].Enabled {
+		t.Fatal("new incompatible account opted into detection", states, e)
 	}
 	r, e := db.ClaimIntelligenceCheck(ctx, "worker", now, time.Minute)
 	if e != nil || r == nil || r.AccountID != codex {

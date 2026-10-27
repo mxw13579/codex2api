@@ -5836,7 +5836,7 @@
         "block": "Requests that touch image generation (gpt-image-* models, /v1/images endpoints, or an image_generation tool/intent) return 403."
       },
       "allowLive": "Allow ChatGPT Live",
-      "allowLiveHint": "Off by default. When enabled, this key can call /v1/live and Codex realtime/calls, which occupy long-lived concurrency. Linux/Docker cannot generate DeviceCheck; without a client attestation the upstream may reject the call.",
+      "allowLiveHint": "Allows /v1/live and Codex realtime/calls and uses long-lived concurrency.",
       "rpm": "Requests per minute",
       "rpmSuffix": "/min",
       "rpd": "Requests per day",

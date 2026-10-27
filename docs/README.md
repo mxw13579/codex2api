@@ -59,6 +59,10 @@
 
 - [真实版本配对与低流量 Windows fallback](CODEX_CLIENT_VERSIONS.md)
 
+### 9. Codex 出站证明
+
+- [统一 attestation 平台规则与 Live 会话](CODEX_ATTESTATION.md)
+
 ## 快速开始
 
 1. **新用户**: 先阅读主 README.md，然后参考 [DEPLOYMENT.md](DEPLOYMENT.md) 进行部署

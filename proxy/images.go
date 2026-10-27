@@ -1624,9 +1624,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolResponses)
 	defer stopRetryDeadline()
-	stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, stream, "text/event-stream")
-	defer stopRetryKeepalive()
-	activateContinuousRetryKeepalive(c.Request.Context())
+	// Some reverse proxies misframe HTTP 102; JSON Images must wait for the final response.
+	if stream {
+		stopRetryKeepalive := installContinuousRetrySSEKeepalive(c, true, "text/event-stream")
+		defer stopRetryKeepalive()
+		activateContinuousRetryKeepalive(c.Request.Context())
+	}
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0

@@ -25,6 +25,15 @@ func (h *Handler) registerIntelligenceCheckRoutes(api *gin.RouterGroup) {
 	api.GET("/intelligence-check/bars", h.GetIntelligenceBars)
 }
 func intelligenceAPIError(c *gin.Context, err error) {
+	var conflict *database.IntelligenceCheckTargetConflictError
+	if errors.As(err, &conflict) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": err.Error(), "code": "intelligence_check_target_conflict",
+			"target_group_id": conflict.TargetGroupID, "target_group_channel": conflict.TargetGroupChannel,
+			"conflict_count": conflict.ConflictCount, "conflicts": conflict.Conflicts,
+		})
+		return
+	}
 	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, database.ErrIntelligenceCheckRevisionConflict):
@@ -57,7 +66,7 @@ func (h *Handler) SaveIntelligenceSettings(c *gin.Context) {
 	}
 	saved, err := h.db.SaveIntelligenceCheckSettings(c.Request.Context(), settings)
 	if err != nil {
-		if errors.Is(err, database.ErrIntelligenceCheckRevisionConflict) {
+		if errors.Is(err, database.ErrIntelligenceCheckRevisionConflict) || errors.Is(err, database.ErrIntelligenceCheckTargetGroup) {
 			intelligenceAPIError(c, err)
 		} else {
 			c.JSON(400, gin.H{"error": err.Error()})

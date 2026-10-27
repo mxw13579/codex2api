@@ -945,22 +945,9 @@ func normalizeAntigravityEntitlements(payload antigravityLoadProjectResponse, no
 	if result.Restricted {
 		result.Reason = "Google marked one or more subscription tiers as ineligible"
 	}
-	if result.PaidTier != nil {
-		result.EffectiveTier = firstNonEmpty(result.PaidTier.Name, result.PaidTier.ID)
-	}
-	if result.EffectiveTier == "" && !result.Restricted && result.CurrentTier != nil {
-		result.EffectiveTier = firstNonEmpty(result.CurrentTier.Name, result.CurrentTier.ID)
-	}
-	if result.EffectiveTier == "" && len(result.AllowedTiers) > 0 {
-		selected := result.AllowedTiers[0]
-		for _, tier := range result.AllowedTiers {
-			if tier.IsDefault {
-				selected = tier
-				break
-			}
-		}
-		result.EffectiveTier = firstNonEmpty(selected.Name, selected.ID)
-		if result.Restricted && result.EffectiveTier != "" {
+	if tier, fromAllowed := effectiveAntigravityTier(&result); tier != nil {
+		result.EffectiveTier = firstNonEmpty(tier.Name, tier.ID)
+		if fromAllowed && result.Restricted {
 			result.EffectiveTier += " (Restricted)"
 		}
 	}

@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,12 +12,10 @@ import (
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
-
-// liveSidebandDialForTest 仅测试替换上游 sideband 拨号。
-var liveSidebandDialForTest func(ctx context.Context, record *liveCallRecord, headers http.Header) (*websocket.Conn, error)
 
 // LiveSideband 代理 GET /v1/live/:call_id 与 Codex call_id 控制面 WebSocket。
 func (h *Handler) LiveSideband(c *gin.Context) {
@@ -46,7 +46,10 @@ func (h *Handler) LiveSideband(c *gin.Context) {
 		api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeResourceConflict, "Live sideband is already in use", api.ErrorTypeInvalidRequest), http.StatusConflict)
 		return
 	}
+	h.serveLiveSideband(c, record)
+}
 
+func (h *Handler) serveLiveSideband(c *gin.Context, record *liveCallRecord) {
 	downstream, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {
 		go h.liveCalls().finalize(record)
@@ -66,6 +69,8 @@ func (h *Handler) LiveSideband(c *gin.Context) {
 
 	upstream, err = h.dialLiveSideband(proxyCtx, record)
 	if err != nil {
+		log.Printf("live: sideband unavailable request_id=%s account_id=%d call_hash=%s error=%s",
+			record.RequestID, record.AccountID, record.CallHash, security.SanitizeLog(err.Error()))
 		_ = downstream.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseInternalServerErr, "live sideband unavailable"))
 		h.liveCalls().finalize(record)
 		return
@@ -117,11 +122,8 @@ func (h *Handler) dialLiveSideband(ctx context.Context, record *liveCallRecord) 
 	if err != nil {
 		return nil, err
 	}
-	if liveSidebandDialForTest != nil {
-		return liveSidebandDialForTest(ctx, record, headers)
-	}
 	account := h.liveAccountForRecord(record)
-	target := strings.TrimRight(chatGPTLiveSidebandBaseURL, "/") + "/" + url.PathEscape(record.CallID)
+	target := liveSidebandTarget(record.CallID)
 	dialer := websocket.Dialer{HandshakeTimeout: 15 * time.Second}
 	if account != nil && h.store != nil {
 		if proxyURL := strings.TrimSpace(h.store.ResolveProxyForAccount(account)); proxyURL != "" {
@@ -135,9 +137,17 @@ func (h *Handler) dialLiveSideband(ctx context.Context, record *liveCallRecord) 
 		_ = resp.Body.Close()
 	}
 	if err != nil {
-		return nil, err
+		status, requestID := 0, ""
+		if resp != nil {
+			status, requestID = resp.StatusCode, resp.Header.Get("X-Request-Id")
+		}
+		return nil, fmt.Errorf("upstream sideband handshake status=%d request_id=%q: %w", status, requestID, err)
 	}
 	return conn, nil
+}
+
+func liveSidebandTarget(callID string) string {
+	return strings.TrimRight(liveSidebandUpstreamBaseURL, "/") + "/" + url.PathEscape(callID)
 }
 
 func (h *Handler) liveSidebandHeaders(ctx context.Context, record *liveCallRecord) (http.Header, error) {
@@ -149,11 +159,13 @@ func (h *Handler) liveSidebandHeaders(ctx context.Context, record *liveCallRecor
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://chatgpt.com/backend-api/codex/"+url.PathEscape(record.CallID), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, liveSidebandTarget(record.CallID), nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := h.applyLiveUpstreamHeaders(req, account, attestation, nil, ""); err != nil {
+	if err := h.applyLiveUpstreamHeaders(req, liveUpstreamHeaderInput{
+		Account: account, Identity: record.OutboundIdentity, Attestation: &attestation,
+	}); err != nil {
 		return nil, err
 	}
 	req.Header.Del("Content-Type")

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
+import ts from "typescript";
 
 const apiKeys = readFileSync(
   new URL("../pages/APIKeys.tsx", import.meta.url),
@@ -29,12 +31,53 @@ test("Claude API key fallback models use the native provider aliases", () => {
 });
 
 test("Claude API key plan allowlist is isolated from Codex plans", () => {
-  assert.match(apiKeys, /const CLAUDE_PLAN_FILTER_OPTIONS = \[/);
-  assert.match(
+  // Execute the provider selector without loading the page's React dependencies.
+  const source = ts.createSourceFile(
+    "APIKeys.tsx",
     apiKeys,
-    /if \(channel === "claude"\) return CLAUDE_PLAN_FILTER_OPTIONS;/,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TSX,
   );
-  assert.match(apiKeys, /CLAUDE_PLAN_FILTER_OPTIONS\.filter/);
+  const declarations = new Set([
+    "CODEX_PLAN_FILTER_OPTIONS",
+    "GROK_PLAN_FILTER_OPTIONS",
+    "CLAUDE_PLAN_FILTER_OPTIONS",
+    "ANTIGRAVITY_PLAN_FILTER_OPTIONS",
+    "PLAN_FILTER_OPTIONS",
+  ]);
+  const statements = source.statements.filter((statement) =>
+    ts.isVariableStatement(statement)
+      ? statement.declarationList.declarations.some((declaration) =>
+          declarations.has(declaration.name.getText(source)),
+        )
+      : ts.isFunctionDeclaration(statement) &&
+        statement.name?.text === "planOptionsForChannel",
+  );
+  const { outputText } = ts.transpileModule(
+    statements.map((statement) => statement.getText(source)).join("\n"),
+    { compilerOptions: { target: ts.ScriptTarget.ES2020 } },
+  );
+  const selectPlans = runInNewContext(`${outputText}\nplanOptionsForChannel;`);
+  const plans = (channel) => Array.from(selectPlans(channel));
+
+  assert.deepEqual(plans("claude"), [
+    "claude", "free", "pro", "max", "max-5x", "max-20x", "team",
+    "enterprise", "business",
+  ]);
+  assert.deepEqual(plans("codex"), [
+    "free", "plus", "pro", "promax", "prolite", "team", "k12", "go",
+  ]);
+  assert.deepEqual(plans("antigravity"), [
+    "free", "pro", "ultra", "standard", "api",
+  ]);
+
+  const automatic = plans("auto");
+  const providerUnion = new Set(
+    ["codex", "grok", "claude", "antigravity"].flatMap(plans),
+  );
+  assert.equal(automatic.length, new Set(automatic).size);
+  assert.deepEqual(new Set(automatic), providerUnion);
 });
 
 test("recycle-bin account projection preserves Claude provider identity", () => {

@@ -284,6 +284,13 @@ var (
 		{model: "grok-2", pricing: ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 10.0}},
 
 		// ===== Google Gemini public API estimates (USD / 1M token) =====
+		{model: "gemini-4-argon", pricing: ModelPricing{InputPricePerMToken: 1.25, OutputPricePerMToken: 10.0, CacheReadPricePerMToken: 0.125}},
+		{model: "gemini-3.8-flash", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 3.75, CacheReadPricePerMToken: 0.075}},
+		{model: "gemini-3.7-flash", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 3.75, CacheReadPricePerMToken: 0.075}},
+		{model: "gemini-3.6-flash", pricing: ModelPricing{InputPricePerMToken: 0.75, OutputPricePerMToken: 3.75, CacheReadPricePerMToken: 0.075}},
+		{model: "gemini-3.5-flash-lite", pricing: ModelPricing{InputPricePerMToken: 0.25, OutputPricePerMToken: 1.5, CacheReadPricePerMToken: 0.025}},
+		{model: "gemini-3.1-flash-lite", pricing: ModelPricing{InputPricePerMToken: 0.25, OutputPricePerMToken: 1.5, CacheReadPricePerMToken: 0.025}},
+		{model: "gemini-3-flash", pricing: ModelPricing{InputPricePerMToken: 0.5, OutputPricePerMToken: 3.0, CacheReadPricePerMToken: 0.05}},
 		{model: "gemini-3-pro-preview", pricing: ModelPricing{InputPricePerMToken: 2.0, OutputPricePerMToken: 12.0, CacheReadPricePerMToken: 0.2}},
 		{model: "gemini-2.5-pro", pricing: ModelPricing{InputPricePerMToken: 1.25, OutputPricePerMToken: 10.0, CacheReadPricePerMToken: 0.125}},
 		{model: "gemini-2.5-flash", pricing: ModelPricing{InputPricePerMToken: 0.3, OutputPricePerMToken: 2.5, CacheReadPricePerMToken: 0.03}},
@@ -301,16 +308,7 @@ func GetModelPricing(model string) *ModelPricing {
 	if alias := daybreakPricingAliasKey(model); alias != "" && alias != normalized {
 		return daybreakAliasPricing(normalized, alias)
 	}
-	canonical := normalized
-	if imageModel := GPTImage25BillingModel(normalized); imageModel != "" {
-		canonical = imageModel
-	}
-	if codexModel, ok := normalizeCodexBillingModel(normalized); ok {
-		canonical = codexModel
-	}
-	if key := GrokMediaPricingKey(normalized); key != "" {
-		canonical = key
-	}
+	canonical := CanonicalBillingModelKey(model)
 	base := baseModelPricing(normalized, canonical)
 	// 新型号沿用兜底基础价，但覆盖必须独立，不能继承另一个型号的手工价格。
 	if key := discoveredGPTPricingKey(normalized); key != "" {

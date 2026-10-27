@@ -448,6 +448,16 @@ type AntigravityRedirectChoice struct {
 	Tiers        []string `json:"tiers"`
 }
 
+// AntigravityLogicalModelIDs returns the bare logical model IDs from
+// antigravityLogicalCompatibilityCatalog (such as gemini-3.8-flash).
+func AntigravityLogicalModelIDs() []string {
+	ids := make([]string, 0, len(antigravityLogicalCompatibilityCatalog))
+	for _, logical := range antigravityLogicalCompatibilityCatalog {
+		ids = append(ids, logical.id)
+	}
+	return ids
+}
+
 // AntigravityRedirectChoices lists every logical model that can carry a
 // redirect, in catalog order, with its tier IDs (`<model>-<level>`).
 func AntigravityRedirectChoices() []AntigravityRedirectChoice {

@@ -252,7 +252,7 @@ Messages 的 `tool_use.input` 必须使用对象，因此自由文本工具输�
 
 OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设置 `responses_upstream_transport=websocket` 后，这个账号的 Responses 出站改为 WebSocket：地址由 Base URL 换成 `ws`/`wss`，路径仍是 `/v1/responses`，握手使用该账号的 API Key 和 `OpenAI-Beta: responses_websockets=2026-02-06`，上行帧为 `response.create`。这个开关只作用于 OpenAI Responses 中转账号，和全局 `codex_force_websocket` 无关；Grok、Antigravity、Claude 不会走这条连接。握手失败返回上游状态或传输错误，不会改回 HTTP。生图请求仍走 HTTP。连接按账号、Base URL 和 API Key 隔离；带 `previous_response_id` 时优先复用产出该响应的连接。客户端 `GET /v1/responses` 也会选中已打开该开关的中转账号。
 
-原生 WebSocket 入口为 `GET /v1/responses`。客户端每轮发送 `response.create`；当前网关明确拒绝 `response.append` 和官方 GPT-6 `response.steer`，返回 `status:400` 的 `unsupported_feature` WebSocket 错误帧，不会伪装成已完成的 steer。需要中途改向时，应等待当前轮结束后用 `previous_response_id` 发起新的 `response.create`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。相同 `stream_id`（含缺省流）内 FIFO，不同独立流可并行；每连接最多 16 个活动轮次、32 个命名流。每个 API Key 最多保留 64 条并发下游 WebSocket 连接，全局 4096 条；显式启用匿名访问时，匿名连接另按 IP 限制 16 条，超出返回 `503` 和 `Retry-After: 5`。命名流事件和请求级错误带回 `stream_id`，命名流请求错误或抢占不会关闭其他健康流，缺省流保留原有协议错误关闭行为。上游连接池按流隔离；同一客户端连接可从另一流已提交的 `store:false` 响应分叉，仍须命中完整缓存并满足授权范围，且指向同一父响应时仍可能等待上游原连接租约。不同 API Key 或不同路由作用域不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
+原生 WebSocket 入口为 `GET /v1/responses`。客户端每轮发送 `response.create`；生成期间可发送带 `response_id` 和 `mode: "discard_partial_items"` 的 `response.interrupt`，网关将其路由到当前 WebSocket 上游租约，并保留确认与终态的原始顺序，详见 [Responses 兼容性](RESPONSES_COMPATIBILITY.md#websocket-流与续链)。当前网关明确拒绝 `response.append` 和官方 GPT-6 `response.steer`，返回 `status:400` 的 `unsupported_feature` WebSocket 错误帧，不会伪装成已完成的 steer。需要中途改向时，应等待当前轮结束后用 `previous_response_id` 发起新的 `response.create`。通过校验与 API Key 限制后，较新的同 API Key、同渠道/分组路由作用域、同会话请求会抢占仍在运行的旧请求，并先取消旧上游以释放账号与并发位。相同 `stream_id`（含缺省流）内 FIFO，不同独立流可并行；每连接最多 16 个活动轮次、32 个命名流。每个 API Key 最多保留 64 条并发下游 WebSocket 连接，全局 4096 条；显式启用匿名访问时，匿名连接另按 IP 限制 16 条，超出返回 `503` 和 `Retry-After: 5`。命名流事件和请求级错误带回 `stream_id`，命名流请求错误或抢占不会关闭其他健康流，缺省流保留原有协议错误关闭行为。上游连接池按流隔离；同一客户端连接可从另一流已提交的 `store:false` 响应分叉，仍须命中完整缓存并满足授权范围，且指向同一父响应时仍可能等待上游原连接租约。不同 API Key 或不同路由作用域不会互相取消。只有 `prompt_cache_key`、显式会话头、`previous_response_id`、turn state、专用 affinity key 或可稳定派生的内容会话存在时才启用，纯 API Key 兜底身份不会把无关请求合并。Redis 模式支持跨实例抢占，Memory 模式仅在当前进程内生效。
 
 **上游错误与流式状态：** Codex 和 OpenAI Responses 的 WS 出站会在内部转成 SSE，内部 HTTP `200` 只表示流已建立，不代表本轮模型请求成功。`response.done` / `response.completed` 若携带明确的失败状态、非空错误或 `4xx/5xx` 状态，会按 `response.failed` 处理；正常 `incomplete` 截断仍保留。数值型 `status:503` 与 `status_code:503` 均可识别，不通过正文中的“overload”等词猜测失败。
 
@@ -317,6 +317,8 @@ OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设�
 **端点:** `POST /v1/images/generations`
 
 **说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`、`gpt-image-2.5-flare` 或 `gpt-image-2.5-sunburst`（支持日期快照及 `-2k` / `-4k` 档位后缀），内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型默认 `gpt-5.6-luna`（优先使用「系统设置 → Codex → 生图设置」中的文本模型，未配置时沿用环境变量 `CODEX_IMAGES_MAIN_MODEL`；被上游拒绝时按 `gpt-5.5` → `gpt-5.6-terra` → `gpt-5.6-sol` → `gpt-6-astra` 顺序换驱动重试），图像模型写入 `tools[0].model`。
+
+Codex/GPT 图片生成与编辑在 `stream=false` 或省略 `stream` 时，只返回最终 JSON，不发送 HTTP `102 Processing` 或提前提交 HTTP 200；`stream=true` 仍使用原有 SSE 心跳。`DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` 不再为这两个入口的 Codex/GPT 非流式分支提供保活。客户端和反向代理仍需给完整生成时长足够的等待/空闲超时；需要异步调用时可使用下文的图片任务接口。Grok 图片分支不受此例外影响，仍保留既有 102 行为。
 
 GPT Image 2.5 支持 `auto`、`low`、`medium`、`high`、`xhigh`、`max`。质量参数原样传给图片工具；工作台切回旧型号时会将 `xhigh` / `max` 调整为 `high`。省略模型仍默认使用 `gpt-image-2`。`-2k` / `-4k` 是本项目的尺寸与超分别名，发往上游前会剥掉该后缀。
 
@@ -1937,6 +1939,10 @@ HTTP `/v1/*` 响应的 `X-Codex2API-Request-ID` 对应下方可检索的 `reques
 
 创建新 API 密钥。
 
+创建时，自动渠道（省略 `limits.upstream_channel` 或设为 `auto`）和 Codex 渠道的
+`limits.allow_live` 默认 `true`；显式设为 `false` 可关闭 ChatGPT Live。
+管理台创建和编辑时均可在这两个渠道下调整开关，已有 Key 的设置不自动变更。
+
 **请求:**
 
 ```json
@@ -2201,7 +2207,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 
 `continuous_retry_catch_all` 是默认关闭的超级开关。请求同时提交 `continuous_retry_enabled=true` 与 `continuous_retry_catch_all=true` 后，除明确的上游 `cyber_policy` 外，所有被代理识别为真实上游失败的 HTTP 状态、传输/读取失败、`error` 帧、`response.failed` 以及以后出现的未知失败都会进入持续重试，不依赖当前已知错误码清单；永久额度、余额、鉴权、无效请求和其他结构化安全策略错误也包含在内。明确的上游 `cyber_policy` 始终终止当前请求，不换号、不重放。文本推理请求只把上游 HTTP `200` 及协议正常终态视为可提交结果；201、202、204、重定向、`response.failed`、独立 `error` 帧及无终态 EOF 都会丢弃整次尝试并继续重试。无状态请求会轮换可用账号；持有账号绑定加密状态的请求只有在能够安全展开为自包含请求时才换号，否则沿用相应协议的绑定语义。`continuous_retry_enabled=false` 会规范化为 `continuous_retry_catch_all=false`。
 
-开启持续重试后，流式上游尝试会先完整暂存，只有正常终态才一次性回放给客户端。因此失败尝试的半截文本、工具调用和错误帧不会泄漏，但客户端也不再实时逐 token 收到该次结果。SSE 路径在退避、等待账号、等待响应头和读取暂存流时写注释心跳并 flush；Responses WebSocket 使用 Ping。非流式 JSON（包括 Grok 图片/视频创建）在已进入无限重试后，会在退避、等待账号、等待响应头和读取响应体时发送标准 HTTP `102 Processing` 信息响应；它不会提交最终 JSON 的状态码或响应体，但中间代理可能丢弃 1xx，因此仍需依赖墙钟上限和客户端超时。`retry_interval_ms` 是本地等待下限；实际等待取该值、带抖动的指数退避（250ms 起步、30 秒封顶）和有效 `Retry-After`（最多 5 分钟）中的较大值。
+开启持续重试后，流式上游尝试会先完整暂存，只有正常终态才一次性回放给客户端。因此失败尝试的半截文本、工具调用和错误帧不会泄漏，但客户端也不再实时逐 token 收到该次结果。SSE 路径在退避、等待账号、等待响应头和读取暂存流时写注释心跳并 flush；Responses WebSocket 使用 Ping。非流式 JSON（包括 Grok 图片/视频创建，但不包括 Codex/GPT Images）在已进入无限重试后，会在退避、等待账号、等待响应头和读取响应体时发送标准 HTTP `102 Processing` 信息响应；它不会提交最终 JSON 的状态码或响应体，但中间代理可能丢弃 1xx，因此仍需依赖墙钟上限和客户端超时。Codex/GPT Images 的非流式生成与编辑即使进入无限重试，也只等待最终 JSON，不发送 102；其重试截止时间和取消行为保持不变。`retry_interval_ms` 是本地等待下限；实际等待取该值、带抖动的指数退避（250ms 起步、30 秒封顶）和有效 `Retry-After`（最多 5 分钟）中的较大值。
 
 `continuous_retry_max_duration_seconds`（默认 600，范围 1-900）是无限预算的墙钟上限，从请求第一次进入 `retryLimit=-1` 时开始，后续尝试不会重置。到期会取消正在进行的上游请求，并返回最近一次真实上游失败；已提交的 SSE 将该失败转换为协议错误事件，Responses WebSocket 使用错误帧并以 1013 关闭。若尚无上游失败可返回，才回退到 504 `upstream_timeout`。Grok 图片/视频创建保持非流式 JSON；无限重试期间使用 HTTP `102 Processing` 保活，不把 SSE 注释混入最终 JSON。该信息响应是 best-effort 的，中间代理仍可能过滤它。
 

@@ -1887,7 +1887,7 @@ type APIKeyLimits struct {
 	// 而不是直接把 400 透传给下游。默认关闭。
 	AutoCompactOnOverflow bool `json:"auto_compact_overflow,omitempty"`
 	// AllowLive 为 true 时，该 Key 可以使用 ChatGPT Live（/v1/live 与
-	// /backend-api/codex/realtime/calls）。默认关闭。
+	// /backend-api/codex/realtime/calls）。管理端新建 auto/codex Key 时默认开启。
 	AllowLive bool `json:"allow_live,omitempty"`
 	// UpstreamChannel 限定该 Key 的请求只调度到指定上游渠道的账号：
 	//   - ""/auto: 不限（默认，按模型路由）

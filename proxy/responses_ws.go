@@ -1239,7 +1239,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				finishLineageCommit = options.lineage.beginCommit(gjson.GetBytes(payload, "response.id").String(), lineageScope)
 			}
 		}
-		return writeResponsesWSMessage(conn, payload)
+		return writeResponsesWSObservedMessage(c.Request.Context(), conn, payload)
 	}
 	// 首 token 前收到不可重试的 response.failed 时置位:不把原始失败帧透传给客户端,
 	// 循环外改写 error 帧并按错误类别用非正常 close code 关闭,
@@ -1275,6 +1275,10 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 
 	readErr = readSSEStreamWithContinuousRetryKeepalive(c.Request.Context(), resp.Body, func(sseEvent string, data []byte) bool {
+		observeResponsesWSInterruptAck(c.Request.Context(), data)
+		if gotTerminal && !isResponsesWSInterruptAck(gjson.GetBytes(data, "type").String()) {
+			return true
+		}
 		if multiAgentV2State != nil && multiAgentV2State.isOptimizedFor(account.ID()) {
 			data = restoreCodexMultiAgentV2Response(data, multiAgentV2State)
 		}
@@ -1435,8 +1439,13 @@ func (h *Handler) streamResponsesWSUpstream(
 				}
 			}
 		}
-		return !standaloneErrorAfterOutput && !isResponsesTerminalEvent(eventType)
+		return !standaloneErrorAfterOutput &&
+			(!isResponsesTerminalEvent(eventType) || awaitingResponsesWSInterruptAck(c.Request.Context())) &&
+			!(gotTerminal && isResponsesWSInterruptAck(eventType))
 	})
+	if err := failPendingResponsesWSInterrupt(c.Request.Context(), conn); err != nil {
+		writeErr = err
+	}
 	if writeErr == nil && outputBuffer != nil && wsReplay == nil {
 		remaining, err := outputBuffer.Flush()
 		if err != nil {
@@ -1760,11 +1769,10 @@ func normalizeResponsesWebSocketClientPayload(raw []byte) ([]byte, string, *api.
 	if len(trimmed) > security.MaxRequestBodySize {
 		return nil, "", api.NewAPIError(api.ErrCodeInvalidRequest, "请求体过大", api.ErrorTypeInvalidRequest)
 	}
-	if !gjson.ValidBytes(trimmed) {
-		return nil, "", api.NewAPIError(api.ErrCodeInvalidRequest, "invalid websocket request payload", api.ErrorTypeInvalidRequest)
+	eventType, envelopeErr := responsesWSClientEventType(trimmed)
+	if envelopeErr != nil {
+		return nil, "", envelopeErr
 	}
-
-	eventType := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())
 	normalized := trimmed
 	switch eventType {
 	case "":
