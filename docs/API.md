@@ -157,7 +157,8 @@ Authorization: Bearer your-admin-secret
 | stream           | boolean | 否   | 是否启用流式响应，默认 false                |
 | reasoning_effort | string  | 否   | Codex 支持 none/minimal/low/medium/high/xhigh/ultra；max 按最终模型能力保留或归一为 xhigh |
 | service_tier     | string  | 否   | Codex 的 fast 映射为 priority，ultrafast 保留；auto/default 不指定上游档位 |
-| max_tokens       | integer | 否   | 最大输出 token 数（Codex 不支持，会被过滤） |
+| max_tokens       | integer | 否   | 最大输出 token 数，本地接受 `1–128000`；Codex 不支持，会被过滤 |
+| max_completion_tokens | integer | 否 | 新版 Chat 输出预算参数，本地接受 `1–128000`；同时提供时优先于 `max_tokens`，`null` 按未提供处理；Codex 同样会过滤 |
 | temperature      | float   | 否   | 温度参数（Codex 不支持，会被过滤）          |
 
 **非流式响应示例:**

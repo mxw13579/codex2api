@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,14 +15,12 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-// responsesMaxOutputTokensCap is the upper bound enforced by the local
-// validator on the /v1/responses max_output_tokens field. The translator
-// strips the field before forwarding to the Codex upstream (which does not
-// accept it), so this cap only guards against obviously-absurd client values
-// — it does not control the actual output length, which is decided upstream.
-// Aligned to 128000 to match the highest cap OpenAI currently advertises on
-// any Codex-served model, so SDKs that default to 100k+ pass through.
-const responsesMaxOutputTokensCap = 128000
+// maxOutputTokensCap is the shared local validation bound for Chat Completions
+// max_tokens/max_completion_tokens and Responses max_output_tokens. It does not
+// enforce output length: the Codex translator strips these unsupported controls,
+// leaving the actual output length to the upstream. Other translation paths can
+// preserve the requested value. The 128000 cap accepts SDK defaults above 65536.
+const maxOutputTokensCap = 128000
 
 // ValidationRule represents a validation rule function
 type ValidationRule func(value gjson.Result, path string) *ValidationError
@@ -418,6 +417,31 @@ func MaxItems(max int) ValidationRule {
 	}
 }
 
+// outputTokenLimit validates optional positive integer token budgets. Only the
+// previously unvalidated max_completion_tokens alias accepts an explicit null;
+// its translator treats null as absent and falls back to max_tokens.
+func outputTokenLimit(allowNull bool) ValidationRule {
+	rules := []ValidationRule{TypeNumber(), MinValue(1), MaxValue(maxOutputTokensCap)}
+	return func(value gjson.Result, path string) *ValidationError {
+		if !value.Exists() || (allowNull && value.Type == gjson.Null) {
+			return nil
+		}
+		for _, rule := range rules {
+			if err := rule(value, path); err != nil {
+				return err
+			}
+		}
+		if math.Trunc(value.Float()) != value.Float() {
+			return &ValidationError{
+				Field:   path,
+				Message: fmt.Sprintf("Field '%s' must be an integer", path),
+				Code:    "type_error",
+			}
+		}
+		return nil
+	}
+}
+
 // ============ Chat Completions Validation Rules ============
 
 // ChatCompletionValidationRules returns validation rules for chat completions request
@@ -426,13 +450,14 @@ func MaxItems(max int) ValidationRule {
 // Validation is kept permissive to maintain backward compatibility.
 func ChatCompletionValidationRules() map[string][]ValidationRule {
 	return map[string][]ValidationRule{
-		"model":       {Required(), TypeString(), MaxLength(64)},
-		"messages":    {Required(), TypeArray(), MinItems(1), MaxItems(4096), ValidateMessages()},
-		"max_tokens":  {TypeNumber(), MinValue(1), MaxValue(65536)},
-		"temperature": {TypeNumber(), Range(0, 2)},
-		"top_p":       {TypeNumber(), Range(0, 1)},
-		"n":           {TypeNumber(), MinValue(1), MaxValue(1)},
-		"stream":      {TypeBoolean()},
+		"model":                 {Required(), TypeString(), MaxLength(64)},
+		"messages":              {Required(), TypeArray(), MinItems(1), MaxItems(4096), ValidateMessages()},
+		"max_tokens":            {outputTokenLimit(false)},
+		"max_completion_tokens": {outputTokenLimit(true)},
+		"temperature":           {TypeNumber(), Range(0, 2)},
+		"top_p":                 {TypeNumber(), Range(0, 1)},
+		"n":                     {TypeNumber(), MinValue(1), MaxValue(1)},
+		"stream":                {TypeBoolean()},
 		// stop and tool_choice are intentionally not strictly validated
 		// as they are ignored during request translation
 		"presence_penalty":  {TypeNumber(), Range(-2, 2)},
@@ -450,7 +475,7 @@ func ChatCompletionValidationRules() map[string][]ValidationRule {
 // drops the field before forwarding to Codex, so the real upstream ceiling is
 // enforced server-side. The model argument is kept for API compatibility.
 func ResponsesMaxOutputTokensForModel(_ string) int {
-	return responsesMaxOutputTokensCap
+	return maxOutputTokensCap
 }
 
 // ResponsesAPIValidationRules returns validation rules for responses API request
@@ -463,7 +488,7 @@ func ResponsesAPIValidationRulesForModel(_ string) map[string][]ValidationRule {
 	return map[string][]ValidationRule{
 		"model": {Required(), TypeString(), MaxLength(64)},
 		// input validation is handled separately to support both string and array formats
-		"max_output_tokens": {TypeNumber(), MinValue(1), MaxValue(float64(responsesMaxOutputTokensCap))},
+		"max_output_tokens": {outputTokenLimit(false)},
 		"temperature":       {TypeNumber(), Range(0, 2)},
 		"top_p":             {TypeNumber(), Range(0, 1)},
 		"stream":            {TypeBoolean()},
