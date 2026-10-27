@@ -1271,6 +1271,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/usage/api-keys", h.GetAPIKeyTokenStats)
 	api.GET("/usage/api-keys/:id/accounts", h.GetAPIKeyAccountStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
+	api.GET("/usage/logs/:id/upstream-cookies", h.GetUsageLogUpstreamCookies)
 	api.GET("/usage/logs/error-summary", h.GetUsageLogsErrorSummary)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
@@ -9414,6 +9415,7 @@ type settingsResponse struct {
 	CodexMinCLIVersion                 string                           `json:"codex_min_cli_version"`
 	CodexUserAgentConfig               string                           `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled              bool                             `json:"codex_telemetry_enabled"`
+	CodexUpstreamCookieLogEnabled      bool                             `json:"codex_upstream_cookie_log_enabled"`
 	CodexTelemetryTimingDebug          bool                             `json:"codex_telemetry_timing_debug"`
 	CodexUnifiedClientIdentityEnabled  bool                             `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                       string                           `json:"usage_log_mode"`
@@ -9589,6 +9591,7 @@ type updateSettingsReq struct {
 	CodexMinCLIVersion                  *string                          `json:"codex_min_cli_version"`
 	CodexUserAgentConfig                *string                          `json:"codex_user_agent_config"`
 	CodexTelemetryEnabled               *bool                            `json:"codex_telemetry_enabled"`
+	CodexUpstreamCookieLogEnabled       *bool                            `json:"codex_upstream_cookie_log_enabled"`
 	CodexTelemetryTimingDebug           *bool                            `json:"codex_telemetry_timing_debug"`
 	CodexUnifiedClientIdentityEnabled   *bool                            `json:"codex_unified_client_identity_enabled"`
 	UsageLogMode                        *string                          `json:"usage_log_mode"`
@@ -10443,6 +10446,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
 		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
+		CodexUpstreamCookieLogEnabled:       runtimeCfg.CodexUpstreamCookieLogEnabled,
 		UsageLogMode:                        h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                   h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:        h.db.GetUsageLogFlushIntervalSeconds(),
@@ -11651,6 +11655,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		effectiveRuntimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 		effectiveRuntimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
 		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
+		// Cookie diagnostics are applied only after their dedicated DB update.
+		effectiveRuntimeCfg.CodexUpstreamCookieLogEnabled = current.CodexUpstreamCookieLogEnabled
 		return effectiveRuntimeCfg
 	})
 
@@ -12005,6 +12011,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
+		if req.CodexUpstreamCookieLogEnabled != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Codex Cookie 诊断设置失败，设置未生效")
+			return
+		}
 		if req.CodexTransient429CooldownEnabled != nil {
 			writeError(c, http.StatusInternalServerError, "保存 Codex 临时 429 冷却设置失败，设置未生效")
 			return
@@ -12109,6 +12119,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
 				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
+				runtimeCfg.CodexUpstreamCookieLogEnabled = current.CodexUpstreamCookieLogEnabled
 				return runtimeCfg
 			})
 			h.triggerAutoResetCreditsScan()
@@ -12119,6 +12130,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
 				runtimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
+				runtimeCfg.CodexUpstreamCookieLogEnabled = current.CodexUpstreamCookieLogEnabled
 				return runtimeCfg
 			})
 			h.triggerAutoActivate5hScan()
@@ -12136,6 +12148,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			log.Printf("设置已更新: models_list_read_max_bytes = %d", modelsListReadMaxBytes)
 		}
 	}
+
+	if req.CodexUpstreamCookieLogEnabled != nil {
+		if updateErr := h.db.UpdateCodexUpstreamCookieLogEnabled(c.Request.Context(), *req.CodexUpstreamCookieLogEnabled); updateErr != nil {
+			writeError(c, http.StatusInternalServerError, "保存 Codex Cookie 诊断设置失败，设置未生效")
+			return
+		}
+		proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+			current.CodexUpstreamCookieLogEnabled = *req.CodexUpstreamCookieLogEnabled
+			return current
+		})
+	}
+	runtimeCfg.CodexUpstreamCookieLogEnabled = proxy.CurrentRuntimeSettings().CodexUpstreamCookieLogEnabled
 
 	if modelCooldownUpdateRequested {
 		committed, updateErr := h.db.UpdateModelCooldownSettings(c.Request.Context(), database.ModelCooldownSettingsUpdate{
@@ -12371,6 +12395,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexTelemetryEnabled:               runtimeCfg.CodexTelemetryEnabled,
 		CodexTelemetryTimingDebug:           runtimeCfg.CodexTelemetryTimingDebug,
 		CodexUnifiedClientIdentityEnabled:   runtimeCfg.CodexUnifiedClientIdentityEnabled,
+		CodexUpstreamCookieLogEnabled:       runtimeCfg.CodexUpstreamCookieLogEnabled,
 		UsageLogMode:                        usageLogMode,
 		UsageLogBatchSize:                   usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:        usageLogFlushIntervalSeconds,
