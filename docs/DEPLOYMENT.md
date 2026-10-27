@@ -472,7 +472,9 @@ networks:
 
 ## 升级指南
 
-### 标准升级流程
+### 标准升级流程（单实例，会短暂中断）
+
+普通 `docker compose up -d` 更新应用时会停止并重建单个容器，不提供自动滚动更新；正在进行的长回答或 WebSocket 可能中断。需要固定入口、先启动新版、保留旧连接并支持回滚时，使用 [Compose 平滑发版流程](../deploy/rolling/README.md)。该流程复用现有 PostgreSQL / Redis，单独管理两个应用版本和 HAProxy 入口。首次从应用直连端口迁移到代理入口需单独安排，不能自动保留被替换容器上的连接。
 
 ```bash
 # 1. 备份数据库（重要！）
@@ -482,8 +484,8 @@ docker exec codex2api-postgres pg_dump -U codex2api codex2api > backup_$(date +%
 git pull
 docker compose pull
 
-# 3. 滚动更新（零停机）
-docker compose up -d
+# 3. 更新应用（单实例会有重建窗口；不重启 PostgreSQL / Redis）
+docker compose up -d --no-deps codex2api
 
 # 4. 验证状态
 docker compose ps
