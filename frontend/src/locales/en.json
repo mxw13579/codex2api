@@ -4814,7 +4814,7 @@
     "transportRetryPolicyRotate": "Rotate account (default)",
     "transportRetryPolicySticky": "Sticky same account",
     "maxRateLimitRetries": "429 Retry Switches",
-    "maxRateLimitRetriesRange": "Maximum account switches after a 429 rate limit (0~10); continuous retry is controlled separately below",
+    "maxRateLimitRetriesRange": "Maximum retries after a 429 rate limit (0~100); higher values increase wait time and upstream requests. Continuous retry is controlled separately below",
     "continuousRetryTitle": "Continuous Upstream Retry",
     "continuousRetryDesc": "Each upstream attempt is retained in full. A selected failure discards that attempt, rotates accounts, and keeps retrying; only a successful protocol terminal is sent to the client. SSE and Responses WebSocket clients receive keepalives while waiting, and non-streaming Grok media uses best-effort HTTP 102 Processing informational responses without changing its final JSON status.",
     "continuousRetryEnabled": "Enable continuous retry",

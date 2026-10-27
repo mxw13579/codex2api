@@ -4811,7 +4811,7 @@
     "transportRetryPolicyRotate": "换号重试（默认）",
     "transportRetryPolicySticky": "粘滞同号重试",
     "maxRateLimitRetries": "429 换号重试次数",
-    "maxRateLimitRetriesRange": "429 限流后最多换几个账号重试（0~10）；持续重试请使用下方独立开关",
+    "maxRateLimitRetriesRange": "429 限流重试次数上限（0~100）；较大值会增加等待时间和上游请求量。持续重试请使用下方独立开关",
     "continuousRetryTitle": "上游错误持续重试",
     "continuousRetryDesc": "开启后，每次上游响应会先完整暂存；命中所选错误时丢弃该次响应、轮换账号并持续重试，成功终态才下发给客户端。SSE 和 Responses WebSocket 在等待时保活，非流式 Grok 媒体请求使用尽力而为的 HTTP 102 Processing 信息响应保活，同时保持最终 JSON 状态不变。",
     "continuousRetryEnabled": "启用持续重试",

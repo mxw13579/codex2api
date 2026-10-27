@@ -308,7 +308,7 @@ Codex 的 `/v1/responses`（HTTP / WebSocket）托管 `web_search` / `web_search
 | `MaxConcurrency` | int | 2 | ≥1（无上限） | 单账号最大并发请求数 |
 | `GlobalRPM` | int | 0 | 0-∞ | 全局每分钟请求限制，0 表示不限 |
 | `MaxRetries` | int | 2 | 0-10 | 原有有限重试预算，覆盖传输错误及既有可重试的 5xx（含 500/502/503/504）；`0` 禁用该预算 |
-| `MaxRateLimitRetries` | int | 1 | 0-10 | 原有有限的 429 独立重试预算；`0` 禁用该预算 |
+| `MaxRateLimitRetries` | int | 1 | 0-100 | 有限的 429 独立重试预算；`0` 禁用该预算，较大值会增加等待时间和上游请求量 |
 | `RetryIntervalMS` | int | 0 | 0-30000 | 普通重试前等待的毫秒数；`0` 保持立即重试 |
 | `TransportRetryPolicy` | string | `rotate` | `rotate` / `sticky` | 传输错误重试时换号，或保留同一账号重试 |
 | `SchedulerEngine` | string | `legacy` | `legacy` / `shadow` / `indexed` | 调度执行引擎；设置页可热切换，跨实例通过数据库 outbox 增量同步 |

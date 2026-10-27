@@ -5834,7 +5834,7 @@ export default function Settings() {
                     <SettingField label={t('settings.maxRateLimitRetries')} description={t('settings.maxRateLimitRetriesRange')} suffix={t('settings.unit.times')}>
                       <DraftNumberInput
                         min={0}
-                        max={10}
+                        max={100}
                         value={settingsForm.max_rate_limit_retries}
                         emptyValue={0}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, max_rate_limit_retries: value }))}

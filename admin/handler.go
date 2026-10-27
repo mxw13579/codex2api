@@ -11435,8 +11435,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 0 {
 			v = 0
 		}
-		if v > 10 {
-			v = 10
+		if v > 100 {
+			v = 100
 		}
 		h.store.SetMaxRateLimitRetries(v)
 		log.Printf("设置已更新: max_rate_limit_retries = %d", v)
