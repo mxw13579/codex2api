@@ -18,21 +18,26 @@ import (
 // ErrResponsesWSInterruptFinished 表示目标轮次已经终止，禁止把控制帧送入后续租约。
 var ErrResponsesWSInterruptFinished = errors.New("responses websocket interrupt target has finished")
 
+var errResponsesWSInterruptNotSupported = errors.New("responses websocket interrupt has no active upstream lease")
+
 // ResponsesWSInterruptAckTimeout 限制控制帧确认等待时间，避免长期占用上游租约。
 const ResponsesWSInterruptAckTimeout = 30 * time.Second
 
 type responsesWSInterruptContextKey struct{}
 
 type responsesWSInterruptState struct {
-	mu           sync.Mutex
-	streamID     string
-	responseID   string
-	sequence     int64
-	finished     bool
-	requested    bool
-	acknowledged bool
-	binding      uint64
-	send         func([]byte) error
+	mu         sync.Mutex
+	streamID   string
+	responseID string
+	sequence   int64
+	// Hosted search owns a projected event stream. Its events and local control
+	// replies share this final write-boundary sequence; native streams stay raw.
+	projectSequence bool
+	finished        bool
+	requested       bool
+	acknowledged    bool
+	binding         uint64
+	send            func([]byte) error
 }
 
 type responsesWSInterruptRegistry struct {
@@ -68,6 +73,16 @@ func (r *responsesWSInterruptRegistry) finish(state *responsesWSInterruptState) 
 func responsesWSInterruptFromContext(ctx context.Context) *responsesWSInterruptState {
 	state, _ := ctx.Value(responsesWSInterruptContextKey{}).(*responsesWSInterruptState)
 	return state
+}
+
+// A request can retry from projected Codex search to a native Responses relay.
+// The next attempt must not inherit the old projection's sequence policy.
+func resetResponsesWSAttemptProjection(ctx context.Context) {
+	if state := responsesWSInterruptFromContext(ctx); state != nil {
+		state.mu.Lock()
+		state.projectSequence = false
+		state.mu.Unlock()
+	}
 }
 
 func isResponsesWSInterruptAck(eventType string) bool {
@@ -146,6 +161,17 @@ func validateResponsesWSEnvelopeFields(root gjson.Result) *api.APIError {
 
 // RegisterResponsesWSInterrupt 仅绑定当前上游租约，不允许中断触发重连或请求重放。
 func RegisterResponsesWSInterrupt(ctx context.Context, send func([]byte) error) func() {
+	return registerResponsesWSInterrupt(ctx, func(payload []byte) error {
+		// Logical search IDs belong to the gateway, never to a raw upstream
+		// transport. Only the search adapter may translate and accept them.
+		if send == nil || isCodexSearchResponseID(gjson.GetBytes(payload, "response_id").String()) {
+			return errResponsesWSInterruptNotSupported
+		}
+		return send(payload)
+	})
+}
+
+func registerResponsesWSInterrupt(ctx context.Context, send func([]byte) error) func() {
 	state := responsesWSInterruptFromContext(ctx)
 	if state == nil {
 		return func() {}
@@ -223,6 +249,9 @@ func (state *responsesWSInterruptState) interrupt(conn *websocket.Conn, raw []by
 	if errors.Is(err, ErrResponsesWSInterruptFinished) {
 		return state.acknowledgeFinishedLocked(conn)
 	}
+	if errors.Is(err, errResponsesWSInterruptNotSupported) {
+		return state.writeAck(conn, "interrupt_not_supported")
+	}
 	if err != nil {
 		return state.writeAck(conn, "interrupt_failed")
 	}
@@ -279,6 +308,13 @@ func writeResponsesWSObservedMessage(ctx context.Context, conn *websocket.Conn, 
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.projectSequence {
+		var err error
+		payload, err = sjson.SetBytes(payload, "sequence_number", state.sequence)
+		if err != nil {
+			return err
+		}
+	}
 	if err := writeResponsesWSMessage(conn, payload); err != nil {
 		return err
 	}

@@ -50,11 +50,15 @@ Codex 的中断控制事件与 `response.steer` 不同：
 {"type":"response.interrupt","response_id":"resp_current","mode":"discard_partial_items"}
 ```
 
-中断绕过生成队列，按当前下游连接内的 `response_id` 定位上游租约；可选 `stream_id` 进一步限制目标流，发往上游时剥离该网关路由字段。Codex OAuth 与启用 WebSocket 出站的 Responses 中转账号会把控制帧发往当前连接，不重连、不重放、不另开生成请求。上游的 `response.interrupt.accepted` / `response.interrupt.failed`、`response.output_item.interrupted` 和 `response.incomplete` 原样保留，命名流仍带回 `stream_id`。完成帧可以早于中断确认；网关保留事件及 `sequence_number` 的原始顺序，直到终态与对应确认都消费完才归还租约。
+中断绕过生成队列，按当前下游连接内的 `response_id` 定位上游租约；可选 `stream_id` 进一步限制目标流，发往上游时剥离该网关路由字段。Codex OAuth 与启用 WebSocket 出站的 Responses 中转账号会把控制帧发往当前连接，不重连、不重放、不另开生成请求。上游的 `response.interrupt.accepted` / `response.interrupt.failed`、`response.output_item.interrupted` 和 `response.incomplete` 原样保留，命名流仍带回 `stream_id`。完成帧可以早于中断确认；直通流保留事件及 `sequence_number` 的原始顺序，只有协议尾部已消费完整的连接才可复用。若失败终态或独立错误到达时仍欠确认，直接销毁对应连接，不把迟到确认留给下一轮。连接在活动租约期间达到最大年龄不会强杀该轮，归还时再关闭过期连接。
 
 已结束轮次的迟到中断会本地确认，重复中断不重复转发；连接内最多记住最近 256 个已结束轮次，不能用旧 ID 取消下一轮或其他连接的请求。中断确认等待上限为 30 秒，超时销毁对应上游连接，避免残留确认进入后续租约。未知目标返回带相同 `response_id` 的 `response.interrupt.failed`；无 WebSocket 控制通道的上游返回 `interrupt_not_supported`。缺少或类型错误的 `response_id`、不支持的 `mode`、非法 JSON、非对象载荷及重复的路由/控制字段返回请求错误。
 
-`response.incomplete` 的 `interrupted`、`steered`、`content_filter` 和 `max_messages` 原因即使输出为零也保留原终态，不进入空回复修复或自动重试。已完成输出与用量继续按原续链和计费路径处理，未完成输出是否丢弃由上游 `discard_partial_items` 语义决定。
+托管搜索桥接使用 `resp_c2a_search_*` 逻辑 ID，可能包含多个私有模型轮次。中断只映射到当前活动轮次的上游原生 ID，旧租约清理不能解绑下一轮。确认与最终终态按观察到的先后顺序投影到同一个逻辑 ID；搜索聚合事件及本地控制回复在最终 WS 写出边界统一编号，不复用各私有轮次的序号；重试切换到原生中转时恢复原始序号透传。中断被接受后不再执行尚未开始的搜索调用或模型轮次；若私有轮次已完成但聚合搜索尚未完成，公开终态为 `response.incomplete` / `interrupted`。缺失确认时停止后续工作并报告确认缺失，不伪造已接受的中断。上游明确 `response.output_item.interrupted` 的部分项不会再补成 `.done`，也不进入终态输出、私有续链快照或后续搜索执行；已完成且未中断的项仍保留。仅在稀疏终态中缺失某项并不等于该项已被中断。
+
+独立 HTTP 搜索、HTTP 模型出站以及模型轮次切换间隙没有可中断的活动 WS 租约，返回 `response.interrupt.failed` / `interrupt_not_supported`；该拒绝本身不会取消仍在运行的 HTTP 搜索，也不会误报整个逻辑响应已结束。客户端断开连接仍会在既有的有界用量收尾等待后取消当前工作，不改变原有断线计费收尾策略。
+
+`response.incomplete` 的 `interrupted`、`steered`、`content_filter` 和 `max_messages` 原因即使输出为零也保留原终态，不进入空回复修复或自动重试。已完成输出与用量继续按原续链和计费路径处理，未完成输出是否丢弃由上游 `discard_partial_items` 语义决定。启用上游 Cookie 诊断后，中断路径同样采集终态，不因终态与确认的到达顺序遗漏或重复记录；关闭诊断时不采集。
 
 ## 能力目录与工具边界
 

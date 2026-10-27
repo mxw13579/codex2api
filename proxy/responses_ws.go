@@ -727,6 +727,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
 		}
+		resetResponsesWSAttemptProjection(c.Request.Context())
 		upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)

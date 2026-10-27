@@ -25,6 +25,7 @@ type anthropicCodexWebSearch struct {
 	hostedTool  json.RawMessage
 	responseID  string
 	onCompleted func([]json.RawMessage)
+	interrupt   *codexSearchInterrupt
 }
 
 const (
@@ -131,15 +132,21 @@ func executeAnthropicCodexRequest(ctx context.Context, account *auth.Account, bo
 	}
 	// The outer Messages reader owns downstream keepalive writes.
 	ctx, cancel := context.WithCancel(context.WithValue(ctx, continuousRetryKeepaliveContextKey{}, struct{}{}))
+	ctx, unregisterInterrupt := withCodexSearchInterrupt(ctx, bridge)
 	open := func(next []byte) (*http.Response, error) {
+		if err := bridge.interrupt.beginRound(); err != nil {
+			return nil, err
+		}
 		return ExecuteRequest(ctx, account, next, sessionID, proxyURL, apiKey, deviceCfg, headers, websocket)
 	}
 	resp, err := open(body)
 	if err != nil {
+		unregisterInterrupt()
 		cancel()
 		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		unregisterInterrupt()
 		resp.Body = &anthropicSearchStreamBody{ReadCloser: resp.Body, cancel: cancel}
 		return resp, nil
 	}
@@ -150,8 +157,10 @@ func executeAnthropicCodexRequest(ctx context.Context, account *auth.Account, bo
 	wrapped := *resp
 	wrapped.Body = &anthropicSearchStreamBody{ReadCloser: reader, cancel: cancel}
 	attachCodexSearchContinuation(&wrapped, bridge)
+	bridge.interrupt.setLogicalID(bridge.responseID)
 	go func() {
 		defer cancel()
+		defer unregisterInterrupt()
 		err := bridge.run(ctx, resp, body, open, search, writer)
 		_ = writer.CloseWithError(err)
 	}()
@@ -160,7 +169,8 @@ func executeAnthropicCodexRequest(ctx context.Context, account *auth.Account, bo
 
 // The wire response is independent of the per-round upstream response. Allocate
 // a slot only when an item becomes visible (hidden calls get no slot), and use
-// that same slot for its entire lifetime and for the final response.output.
+// that same slot for its entire lifetime. Interrupted slots stay reserved but
+// are omitted from the final response.output, without reordering retained items.
 // In particular, terminal array order must not reorder already streamed items.
 type anthropicSearchOutput struct {
 	bridge    *anthropicCodexWebSearch
@@ -266,6 +276,8 @@ type anthropicSearchItem struct {
 	parts      map[string]*anthropicSearchPart
 	nextPart   int64 // First part whose text has not yet been published in full.
 	deferred   [][]byte
+
+	interrupted, interruptSent bool // Tombstones survive every alias join and later snapshot.
 }
 
 func (entry *anthropicSearchItem) classified() bool {
@@ -321,7 +333,10 @@ func (r *anthropicSearchRound) merge(entry, other *anthropicSearchItem) *anthrop
 	if entry.kind == "" {
 		entry.kind = other.kind
 	}
+	entry.interrupted = entry.interrupted || other.interrupted
+	entry.interruptSent = entry.interruptSent || other.interruptSent
 	entry.pending = append(entry.pending, other.pending...)
+	other.pending = nil
 	sort.Slice(entry.pending, func(i, j int) bool { return entry.pending[i].order < entry.pending[j].order })
 	for _, pending := range entry.pending {
 		data := gjson.ParseBytes(pending.data)
@@ -360,6 +375,9 @@ func (r *anthropicSearchRound) merge(entry, other *anthropicSearchItem) *anthrop
 	}
 	if r.current == other {
 		r.current = entry
+	}
+	if entry.interrupted && !r.interruptItem(entry, nil) {
+		return nil
 	}
 	return entry
 }
@@ -433,7 +451,11 @@ func (r *anthropicSearchRound) checkPending(extraBytes, extraEvents int) bool {
 	bytes, events, items := r.pendingBytes+extraBytes, r.pendingEvents+extraEvents, 0
 	for _, entry := range r.items {
 		if !entry.classified() {
-			items++
+			// Unknown interrupted identities still consume a tombstone slot;
+			// clearing their payload must not allow unbounded alias maps.
+			if !entry.added {
+				items++
+			}
 			bytes += len(entry.item)
 			if entry.item != nil {
 				events++
@@ -461,7 +483,44 @@ func (r *anthropicSearchRound) takePending(entry *anthropicSearchItem) []anthrop
 	return pending
 }
 
+// An explicit interruption is authoritative even if a later declaration joins
+// this tombstone to an already published item. Keep its aliases/slot, not its
+// buffered inputs or snapshots. Never publish an undeclared/private payload.
+func (r *anthropicSearchRound) interruptItem(entry *anthropicSearchItem, data []byte) bool {
+	entry.interrupted = true
+	r.takePending(entry)
+	for _, data := range entry.deferred {
+		r.pendingBytes -= len(data)
+		r.pendingEvents--
+	}
+	entry.deferred, entry.parts, entry.item = nil, nil, nil
+	entry.arguments, entry.input = "", ""
+	if entry.index >= 0 {
+		r.output.items[entry.index] = nil // Reserve this slot; later items must not reuse it.
+	}
+	if !r.checkPending(0, 0) {
+		return false
+	}
+	if !entry.added || entry.hidden || entry.interruptSent {
+		return true
+	}
+	entry.interruptSent = true
+	if len(data) == 0 {
+		// A previously unknown tombstone can join an already published alias.
+		data = []byte(`{"type":"response.output_item.interrupted"}`)
+	}
+	// Do not resurrect a discarded item snapshot, but retain other metadata
+	// on directly observed interruption events (including exact JSON numbers).
+	data, _ = sjson.DeleteBytes(data, "item")
+	data, _ = sjson.SetBytes(data, "item_id", entry.id)
+	data, _ = sjson.SetBytes(data, "output_index", entry.index)
+	return r.output.emit(data)
+}
+
 func (r *anthropicSearchRound) update(entry *anthropicSearchItem, item gjson.Result) bool {
+	if entry.interrupted {
+		return true
+	}
 	if name, previous := item.Get("name").String(), gjson.GetBytes(entry.item, "name").String(); name != "" && previous != "" && name != previous {
 		return r.fail("Codex search stream has conflicting output function names")
 	}
@@ -617,6 +676,9 @@ func (r *anthropicSearchRound) completeText(entry *anthropicSearchItem, spec ant
 }
 
 func (r *anthropicSearchRound) emitItem(entry *anthropicSearchItem, data []byte) bool {
+	if entry.interrupted {
+		return true
+	}
 	parsed := gjson.ParseBytes(data)
 	kind := parsed.Get("type").String()
 	if index, ok := anthropicSearchPartIndex(parsed); ok {
@@ -773,6 +835,9 @@ func (r *anthropicSearchRound) publishItem(entry *anthropicSearchItem, data []by
 }
 
 func (r *anthropicSearchRound) finish(entry *anthropicSearchItem) bool {
+	if entry.interrupted {
+		return true
+	}
 	if entry.hidden {
 		r.takePending(entry)
 		return true
@@ -834,6 +899,31 @@ func (r *anthropicSearchRound) event(data []byte) bool {
 	parsed := gjson.ParseBytes(data)
 	kind := parsed.Get("type").String()
 	r.eventOrder++
+	if kind == "response.output_item.interrupted" {
+		item := parsed.Get("item")
+		id, callID := parsed.Get("item_id").String(), parsed.Get("call_id").String()
+		if nested := item.Get("id").String(); nested != "" {
+			if id != "" && id != nested {
+				return r.fail("Codex search stream has conflicting interrupted output item identities")
+			}
+			id = nested
+		}
+		if nested := item.Get("call_id").String(); nested != "" {
+			if callID != "" && callID != nested {
+				return r.fail("Codex search stream has conflicting interrupted output call identities")
+			}
+			callID = nested
+		}
+		if id == "" && callID == "" && !parsed.Get("output_index").Exists() {
+			return r.fail("Codex search stream has an interrupted output item without an identity")
+		}
+		entry := r.lookup(id, callID, item.Get("type").String(), parsed.Get("output_index"), false)
+		if entry == nil {
+			return false
+		}
+		r.current = entry
+		return r.interruptItem(entry, data)
+	}
 	if kind == "response.output_item.added" || kind == "response.output_item.done" {
 		item := parsed.Get("item")
 		entry := r.lookup(item.Get("id").String(), item.Get("call_id").String(), item.Get("type").String(), parsed.Get("output_index"), false)
@@ -841,6 +931,9 @@ func (r *anthropicSearchRound) event(data []byte) bool {
 			return false
 		}
 		r.current = entry
+		if entry.interrupted {
+			return true
+		}
 		if !r.update(entry, item) {
 			return false
 		}
@@ -893,6 +986,9 @@ func (r *anthropicSearchRound) event(data []byte) bool {
 	}
 	if entry == nil {
 		return false
+	}
+	if entry.interrupted {
+		return true
 	}
 	if kind == "response.function_call_arguments.done" && parsed.Get("arguments").Type == gjson.String {
 		entry.arguments = parsed.Get("arguments").String()
@@ -951,14 +1047,32 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 	var replay []json.RawMessage
 	var usage json.RawMessage
 	for round := 0; round <= anthropicCodexMaxSearchUses; round++ {
-		var terminal []byte
+		var terminal, deferredAck []byte
+		var interruptErr error
 		state := &anthropicSearchRound{output: output, byID: map[string]*anthropicSearchItem{}, byCall: map[string]*anthropicSearchItem{}, byIndex: map[int64]*anthropicSearchItem{}}
 		err := readSSEStreamWithContinuousRetryKeepalive(ctx, resp.Body, func(event string, data []byte) bool {
 			kind := normalizedUpstreamSSEEventType(event, data)
 			data, _ = sjson.SetBytes(data, "type", kind)
+			if interruptErr = b.interrupt.observe(data); interruptErr != nil {
+				return false
+			}
+			if len(terminal) > 0 {
+				// A discard arriving while the terminal waits for its ack still
+				// invalidates that terminal's stale item snapshots.
+				if kind == "response.output_item.interrupted" {
+					return state.event(data)
+				}
+				if isResponsesWSInterruptAck(kind) {
+					// The public terminal requires output/usage aggregation first.
+					// Retain wire order rather than emitting the ack ahead of it.
+					deferredAck = append([]byte(nil), data...)
+					return false
+				}
+				return true
+			}
 			if isResponsesSuccessTerminalEvent(kind) || kind == "response.failed" || kind == "response.cancelled" {
 				terminal = append([]byte(nil), data...)
-				return false
+				return b.interrupt.awaitingAck()
 			}
 			if kind == "response.created" || kind == "response.in_progress" {
 				if round > 0 {
@@ -972,7 +1086,12 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 		if output.err != nil {
 			return output.err
 		}
-		if err != nil {
+		if interruptErr != nil {
+			return interruptErr
+		}
+		// A transport may retire a failed interrupt lease before its ack. Keep
+		// the authoritative terminal; the outer protocol reports the missing ack.
+		if err != nil && len(terminal) == 0 {
 			return err
 		}
 		if ctx.Err() != nil {
@@ -1004,6 +1123,9 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 		// Include streamed items omitted from sparse terminal arrays, after all
 		// identity joins have settled. Keep upstream identities in private replay.
 		for _, entry := range state.items {
+			if entry.interrupted {
+				continue // Neither public completion nor private replay/search may revive it.
+			}
 			if !entry.classified() {
 				if parsed.Get("type").String() != "response.completed" {
 					state.takePending(entry)
@@ -1023,6 +1145,21 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 			}
 			replay = append(replay, append(json.RawMessage(nil), entry.item...))
 		}
+		acceptedInterrupt, missingAck := b.interrupt.acceptedInterrupt(), b.interrupt.awaitingAck()
+		if len(calls) > 0 && parsed.Get("type").String() == "response.completed" && (acceptedInterrupt || missingAck) {
+			terminal = stopInterruptedSearchTerminal(terminal, acceptedInterrupt)
+			parsed = gjson.ParseBytes(terminal)
+		}
+		finalRound := len(calls) == 0 || external || parsed.Get("type").String() != "response.completed"
+		if len(deferredAck) > 0 && !finalRound {
+			// A failed interrupt can leave a private model round completed while
+			// the aggregate continues. Its hidden terminal must not finish the
+			// logical response, but the acknowledgement still belongs to it.
+			if !output.emit(deferredAck) {
+				return io.ErrClosedPipe
+			}
+			deferredAck = nil
+		}
 		if parsed.Get("type").String() == "response.completed" {
 			for _, entry := range calls {
 				_, result, err := b.executeSearch(ctx, gjson.ParseBytes(entry.item), search, func(data []byte) bool { return state.emitItem(entry, data) })
@@ -1032,8 +1169,14 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 				replay = append(replay, result)
 			}
 		}
-		if len(calls) == 0 || external || parsed.Get("type").String() != "response.completed" {
-			terminal, _ = sjson.SetBytes(terminal, "response.output", output.items)
+		if finalRound {
+			visible := make([]json.RawMessage, 0, len(output.items))
+			for _, item := range output.items {
+				if item != nil {
+					visible = append(visible, item)
+				}
+			}
+			terminal, _ = sjson.SetBytes(terminal, "response.output", visible)
 			if usage != nil {
 				terminal, _ = sjson.SetRawBytes(terminal, "response.usage", usage)
 			}
@@ -1045,6 +1188,9 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 				b.onCompleted(completed)
 			}
 			if !output.emit(terminal) {
+				return io.ErrClosedPipe
+			}
+			if len(deferredAck) > 0 && !output.emit(deferredAck) {
 				return io.ErrClosedPipe
 			}
 			return nil
