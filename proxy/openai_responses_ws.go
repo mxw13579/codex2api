@@ -224,8 +224,10 @@ func (p *openAIResponsesWSPool) roundTrip(ctx context.Context, spec openAIRespon
 	if handshake != nil || err != nil || conn == nil {
 		return handshake, err
 	}
-	if err := writeOpenAIResponsesWS(ctx, conn.conn, body); err != nil {
-		reused := conn.reused
+	p.mu.Lock()
+	socket, reused := conn.conn, conn.reused
+	p.mu.Unlock()
+	if err := writeOpenAIResponsesWS(ctx, socket, body); err != nil {
 		p.retire(conn)
 		if !reused {
 			return nil, fmt.Errorf("OpenAI Responses WebSocket 发送失败: %w", err)
@@ -234,7 +236,10 @@ func (p *openAIResponsesWSPool) roundTrip(ctx context.Context, spec openAIRespon
 		if handshake != nil || err != nil || conn == nil {
 			return handshake, err
 		}
-		if err := writeOpenAIResponsesWS(ctx, conn.conn, body); err != nil {
+		p.mu.Lock()
+		socket = conn.conn
+		p.mu.Unlock()
+		if err := writeOpenAIResponsesWS(ctx, socket, body); err != nil {
 			p.retire(conn)
 			return nil, fmt.Errorf("OpenAI Responses WebSocket 发送失败: %w", err)
 		}
@@ -243,6 +248,9 @@ func (p *openAIResponsesWSPool) roundTrip(ctx context.Context, spec openAIRespon
 }
 
 func writeOpenAIResponsesWS(ctx context.Context, conn *websocket.Conn, body []byte) error {
+	if conn == nil {
+		return io.ErrClosedPipe
+	}
 	deadline := time.Now().Add(30 * time.Second)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
@@ -264,9 +272,19 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Set("Cache-Control", "no-cache")
 	resp.Header.Set("Connection", "keep-alive")
+	// Snapshot under the pool lock, then keep the leased socket stable even
+	// if retirement clears conn.conn while a callback is already in flight.
+	pool.mu.Lock()
+	socket := conn.conn
+	pool.mu.Unlock()
+	if socket == nil {
+		pool.retire(conn)
+		_ = pw.CloseWithError(io.ErrClosedPipe)
+		return resp
+	}
 	control := &openAIResponsesWSInterrupt{}
 	unregisterInterrupt := RegisterResponsesWSInterrupt(ctx, func(payload []byte) error {
-		return control.send(ctx, conn.conn, payload)
+		return control.send(ctx, socket, payload)
 	})
 
 	go func() {
@@ -274,7 +292,6 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 		defer unregisterInterrupt()
 		defer control.stop()
 		stop := make(chan struct{})
-		socket := conn.conn
 		go func() {
 			select {
 			case <-ctx.Done():
@@ -285,6 +302,7 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 		defer close(stop)
 
 		terminal := false
+		var streamErr error
 		emit := func(frame []byte) bool {
 			eventType := gjson.GetBytes(frame, "type").String()
 			// Preserve existing created/intermediate bindings, but do not add a
@@ -299,15 +317,15 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 				terminal = true
 			}
 			if err := writeOpenAIResponsesSSE(pw, frame); err != nil {
+				streamErr = err
 				return false
 			}
 			return true
 		}
-		var controlErr error
-		err := readOpenAIResponsesWS(conn.conn, func(frame []byte) bool {
+		err := readOpenAIResponsesWS(socket, func(frame []byte) bool {
 			frame, err := control.accept(frame)
 			if err != nil {
-				controlErr = err
+				streamErr = err
 				return false
 			}
 			if len(frame) > 0 && !emit(frame) {
@@ -315,10 +333,10 @@ func openAIResponsesWSStream(ctx context.Context, pool *openAIResponsesWSPool, c
 			}
 			return !control.done()
 		})
-		if controlErr != nil {
-			err = controlErr
+		if streamErr != nil {
+			err = streamErr
 		}
-		if err != nil || !terminal {
+		if err != nil || !terminal || !control.reusable() || ctx.Err() != nil {
 			pool.retire(conn)
 			if err != nil && err != io.EOF {
 				_ = pw.CloseWithError(err)
@@ -361,19 +379,8 @@ func (p *openAIResponsesWSPool) acquire(ctx context.Context, spec openAIResponse
 		p.mu.Lock()
 		if prevID != "" {
 			if conn := p.bindings[openAIResponsesWSBindingKey(spec.accountID, prevID)]; conn != nil && conn.spec.id() == spec.id() && !conn.dead {
-				if conn.expired() {
-					socket := p.retireLocked(conn)
-					p.mu.Unlock()
-					if socket != nil {
-						_ = socket.Close()
-					}
-					continue
-				} else if !conn.busy {
-					conn.busy = true
-					conn.reused = true
-					p.mu.Unlock()
-					return conn, nil, nil
-				} else {
+				// Age limits reuse, not an active lease (including its ack wait).
+				if conn.busy {
 					ch := make(chan struct{}, 1)
 					conn.waiters = append(conn.waiters, ch)
 					p.mu.Unlock()
@@ -384,6 +391,18 @@ func (p *openAIResponsesWSPool) acquire(ctx context.Context, spec openAIResponse
 						continue
 					}
 				}
+				if conn.expired() {
+					socket := p.retireLocked(conn)
+					p.mu.Unlock()
+					if socket != nil {
+						_ = socket.Close()
+					}
+					continue
+				}
+				conn.busy = true
+				conn.reused = true
+				p.mu.Unlock()
+				return conn, nil, nil
 			}
 		}
 		if conn := p.popIdleLocked(spec); conn != nil {
@@ -523,20 +542,25 @@ func (p *openAIResponsesWSPool) release(conn *openAIResponsesWSConn) {
 		return
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if conn.dead {
 		p.wakeLocked(conn)
 		p.wakeSpecLocked(conn.spec.id())
+		p.mu.Unlock()
 		return
 	}
 	if conn.expired() {
-		p.retireLocked(conn)
+		socket := p.retireLocked(conn)
+		p.mu.Unlock()
+		if socket != nil {
+			_ = socket.Close()
+		}
 		return
 	}
 	conn.busy = false
 	conn.reused = false
 	p.wakeLocked(conn)
 	p.wakeSpecLocked(conn.spec.id())
+	p.mu.Unlock()
 }
 
 func (p *openAIResponsesWSPool) retire(conn *openAIResponsesWSConn) {

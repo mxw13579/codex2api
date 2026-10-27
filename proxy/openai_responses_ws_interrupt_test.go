@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -44,6 +45,55 @@ func TestOpenAIResponsesWSInterruptPreservesTerminalClassification(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestOpenAIResponsesWSInterruptFailureStopsAckTimer(t *testing.T) {
+	for _, frame := range []string{
+		`{"type":"response.failed","response":{"status":"failed"}}`,
+		`{"type":"response.done","response":{"status":"failed"}}`,
+		`{"type":"error","error":{"code":"fixture_error"}}`,
+	} {
+		for _, ackFirst := range []bool{false, true} {
+			control := &openAIResponsesWSInterrupt{
+				responseID: "resp_fixture", timer: time.NewTimer(time.Hour),
+			}
+			defer control.stop()
+			if ackFirst {
+				if _, err := control.accept([]byte(`{"type":"response.interrupt.accepted","response_id":"resp_fixture"}`)); err != nil {
+					t.Fatal(err)
+				}
+				if control.done() || control.reusable() {
+					t.Fatal("ack alone finished or released the lease")
+				}
+			}
+			if _, err := control.accept([]byte(frame)); err != nil {
+				t.Fatal(err)
+			}
+			if !control.done() || control.reusable() != ackFirst {
+				t.Errorf("failure lease: done=%v reusable=%v, ackFirst=%v", control.done(), control.reusable(), ackFirst)
+			}
+			// Stop returns false only if accept already stopped this hour-long timer.
+			if control.timer.Stop() {
+				t.Error("failure left the ack timer running")
+			}
+			if err := control.send(context.Background(), nil, nil); !errors.Is(err, ErrResponsesWSInterruptFinished) {
+				t.Errorf("late callback error = %v, want finished", err)
+			}
+		}
+	}
+}
+
+func TestOpenAIResponsesWSInterruptStopSealsCallback(t *testing.T) {
+	control := &openAIResponsesWSInterrupt{timer: time.NewTimer(time.Hour)}
+	control.stop()
+	if control.timer.Stop() {
+		t.Error("stop left the ack timer running")
+	}
+	// Early EOF/downstream failure must seal a retained callback too, before
+	// it can touch a retired socket or write into a later lease.
+	if err := control.send(context.Background(), nil, nil); !errors.Is(err, ErrResponsesWSInterruptFinished) {
+		t.Errorf("stopped callback error = %v, want finished", err)
 	}
 }
 

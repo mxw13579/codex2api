@@ -29,7 +29,8 @@ func (control *openAIResponsesWSInterrupt) send(ctx context.Context, conn *webso
 	}
 	control.responseID = gjson.GetBytes(payload, "response_id").String()
 	if err := writeOpenAIResponsesWS(ctx, conn, payload); err != nil {
-		control.responseID = ""
+		// A failed control write also makes the lease unsafe to reuse.
+		control.finished = true
 		_ = conn.Close()
 		return err
 	}
@@ -46,6 +47,8 @@ func (control *openAIResponsesWSInterrupt) send(ctx context.Context, conn *webso
 func (control *openAIResponsesWSInterrupt) stop() {
 	control.mu.Lock()
 	defer control.mu.Unlock()
+	// Seal callbacks retained by a caller even when reading ended with an error.
+	control.finished = true
 	if control.timer != nil {
 		control.timer.Stop()
 	}
@@ -59,7 +62,8 @@ func (control *openAIResponsesWSInterrupt) closeIfUnfinished(conn *websocket.Con
 	}
 }
 
-// 保留原始 sequence_number 顺序，同时把租约保留到终态与确认均已消费。
+// 保留原始 sequence_number 顺序。正常终态等待确认；失败终态立即结束读取，
+// 未消费的确认由 reusable 判定并丢弃整条连接，不能泄漏到后续租约。
 func (control *openAIResponsesWSInterrupt) accept(frame []byte) ([]byte, error) {
 	control.mu.Lock()
 	defer control.mu.Unlock()
@@ -79,7 +83,13 @@ func (control *openAIResponsesWSInterrupt) accept(frame []byte) ([]byte, error) 
 		return frame, nil
 	}
 	if isResponsesTerminalEvent(eventType) || eventType == "error" {
+		control.terminalSeen = true
 		control.finished = true
+		// Failure may never be followed by an ack. Stop promptly, but retain
+		// responseID as evidence that this connection must not be pooled.
+		if control.timer != nil {
+			control.timer.Stop()
+		}
 	}
 	return frame, nil
 }
@@ -100,6 +110,14 @@ func (control *openAIResponsesWSInterrupt) done() bool {
 	control.mu.Lock()
 	defer control.mu.Unlock()
 	return control.finished
+}
+
+// Finishing the reader is not sufficient to release a lease: a failed terminal
+// can finish it with an interrupt acknowledgement still outstanding.
+func (control *openAIResponsesWSInterrupt) reusable() bool {
+	control.mu.Lock()
+	defer control.mu.Unlock()
+	return control.finished && control.responseID == ""
 }
 
 func writeOpenAIResponsesSSE(writer io.Writer, frame []byte) error {
