@@ -537,7 +537,13 @@ func (r *WsResponse) ReadStream(callback func(data []byte) bool) error {
 
 		// 解析并处理消息
 		payload = normalizeCompletionEvent(payload)
-		handled, interruptErr := r.handleInterruptMessage(payload, callback)
+		handled, interruptErr := r.handleInterruptMessage(payload, func(data []byte) bool {
+			// A terminal before the interrupt ack bypasses handleMessage. Observe
+			// it before downstream can stop reading, just like the normal path.
+			// Error frames still go through buildErrorEvent in handleMessage.
+			r.cookieTrace.ObserveEvent(data)
+			return callback(data)
+		})
 		if !handled {
 			interruptErr = r.handleMessage(payload, callback)
 		}
