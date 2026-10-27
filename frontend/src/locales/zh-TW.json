@@ -534,6 +534,8 @@
     "hrefClickHint": "點擊開啟跳轉位址（未設定時開啟 api-base）；Alt/Option+點擊 設定自訂連結"
   },
   "settings": {
+    "codexUpstreamCookieLog": "在請求日誌中記錄上游 Cookie",
+    "codexUpstreamCookieLogDesc": "預設關閉。將原始 Cookie / Set-Cookie 請求與回應標頭，以及 __oailb / unified 路由資訊儲存至現有請求日誌詳情，供管理員檢視。修改後自動儲存並立即生效，僅影響後續請求，無需重新啟動。遵循用量日誌的記錄模式和保留策略：僅錯誤模式只保留錯誤日誌，關閉模式不儲存日誌。",
     "codexClientVersions": {
       "platform": "用戶端 / 平台",
       "pair": "應用程式 / 內建 CLI",
@@ -1679,6 +1681,31 @@
     "cyberRiskSubjectEvents": "{{count}} 筆事件"
   },
   "usage": {
+    "upstreamCookies": {
+      "button": "Cookie",
+      "open": "檢視日誌 #{{id}} 的上游 Cookie 詳情",
+      "title": "上游 Cookie 詳情 · 日誌 #{{id}}",
+      "description": "顯示所有已記錄的上游互動，包括最終成功請求中的重試和靜默 429。連線握手與請求輪次的結果分別展示。展開項目可檢視或複製原始 Cookie / Set-Cookie 標頭和 __oailb 值。Unified 主機來自未驗證簽章的 Cookie 宣告，不代表已確認的推理工作節點。",
+      "empty": "此日誌未收集上游 Cookie 資料。啟用收集後，既有上游 WebSocket 連線需等正常重連才會有握手快照；歷史日誌不會補錄。資料遵循用量日誌的記錄模式和保留策略。",
+      "notFound": "此請求日誌不存在，或已按日誌保留策略清除。",
+      "loadFailed": "無法載入上游 Cookie 詳情，請重試。",
+      "truncated": "記錄資料已被截斷，部分項目或請求與回應標頭可能不完整。",
+      "entryTruncated": "標頭已截斷",
+      "entryCount": "已記錄互動：{{count}} 筆",
+      "handshake": "連線握手",
+      "turn": "請求輪次",
+      "exchange": "上游互動",
+      "handshakeContext": "連線握手上下文",
+      "status": "事件狀態",
+      "notRecorded": "未記錄",
+      "unifiedHost": "Unified 主機",
+      "unifiedSource": "Unified 來源",
+      "source": "來源",
+      "upgradeOnly": "HTTP 101 僅表示協定升級，不能據此判斷請求輪次是否成功。",
+      "expand": "原始標頭與詳情",
+      "entryJson": "項目 JSON",
+      "copy": "複製{{label}}"
+    },
     "usageAnalysis": "用量分析",
     "modelStatsDesc": "主要模型的請求、Token 與金額分布。",
     "modelStatsScope": "占比依金額排名前 10 的模型計算。",

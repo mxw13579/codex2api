@@ -156,6 +156,51 @@ Antigravity 渠道的首绑 / Fresh 选号默认启用加权避险：候选账�
 | `LOG_DISABLED` | 否 | `false` | 设为 `true` 时禁用文件型错误日志与安全审计日志 |
 | `SECURITY_LOG_DIR` | 否 | `${LOG_DIR}/security` | 安全审计日志目录；未设置时跟随 `LOG_DIR` |
 
+#### Codex Cookie / unified 排查日志
+
+在管理后台「系统设置 → Codex」打开 **在请求日志中记录上游 Cookie**。
+设置默认关闭，自动保存到数据库并即时生效，重启后保留；也可通过
+`PUT /api/admin/settings` 设置 `codex_upstream_cookie_log_enabled`。无需环境变量，
+不受文件日志的 `LOG_DISABLED` 控制。采集来自实际业务请求，不发送探针。
+
+采集结果保存在原有 `usage_logs` 的 `upstream_cookie_trace` 字段。
+在「使用统计」的日志行或「运维错误」的详情中点击 **Cookie**，按需展开与复制原始头。
+详情接口为 `GET /api/admin/usage/logs/:id/upstream-cookies`，只允许管理员读取，返回
+`{ "entries": [...], "truncated": false }`；普通日志列表、导出和公开用量查询不包含原始 Cookie。
+
+保留与清理遵循原有用量日志策略：`full` 保存成功和失败记录，`errors` 仅保存原策略认定的
+错误记录，`off` 不保存。要对比成功与 429，使用 `full`；最终成功的日志也会包含此前被静默重试
+隐藏的 429。日志使用原有异步写入队列，因此请求结束到详情可查之间可能有短暂延迟。
+关闭开关只停止新采集，已保存的数据随原日志保留或清理。
+
+`cookie` / `set_cookie` 保留原始值与属性；每个方向最多 64 个头、合计 64 KiB，
+超出会设置 `cookie_truncated=true`。每个请求最多保留 128 条事件、512 KiB 事件 JSON，
+超限在详情中标记 `truncated=true`。只采集 Codex 上游的 Cookie，
+不复制 Authorization、API Key、代理密码、提示词或输出正文，也不将 Cookie 透传到下游。
+
+主要字段：
+
+| 字段 | 含义 |
+|---|---|
+| `account_id`、`model`、`request_id` | 账号、模型、网关请求 ID；业务请求可与 `X-Codex2API-Request-ID` 及用量日志关联 |
+| `attempt_id`、`connection_id` | 单次 HTTP 尝试 / WS 轮次标识、WS 连接标识；重试和复用连接不会混为一轮 |
+| `event` | `http_response`、`websocket_handshake`、`websocket_turn`、`response.completed`、`response.failed` 等；握手成功不代表推理成功 |
+| `http_status`、`status` | HTTP/握手原始状态，以及本条事件状态；WS 握手 `101` 后的流内限流会另记 `status=429` |
+| `cookie`、`set_cookie` | 实际请求的 Cookie 和上游下发的 Set-Cookie 列表；WS 轮次沿用其连接建连时的快照，未发送 Cookie 时为 `[]` |
+| `__oailb` | 同名 Cookie 的原始值、`source`（request/response）及 JWT 解出的 `host`、`iat`、`exp`；格式错误仍保留原值 |
+| `unified_host`、`unified_source` | 优先采用本次响应 Cookie 中的路由主机，没有响应 Cookie 时采用请求 Cookie；只解码，未验证 JWT 签名，不用于改变路由，也不代表已确认的推理工作节点 |
+| `handshake_cf_ray`、`handshake_request_id` | WS 建连时的 Cloudflare / 上游请求标识 |
+| `cf_ray`、`upstream_request_id` | HTTP 响应或当前 WS 轮次 metadata 中实际观测到的标识；不会用握手或前一轮值补填 |
+| `error_code`、`error_type` | 上游终态错误分类，如 `turn_rate_limit_exceeded` / `rate_limit_error` |
+
+握手直接返回 403/429 时也记录 Cookie；已建连的 WS 在静默重试吞掉错误帧前记录失败。
+同一个连接的成功、限流轮次都携带同一握手 Cookie 快照。每个下游请求有独立采集缓冲，
+握手标识与每轮 metadata 标识分开保存。HTTP 记录响应头，并在常规 SSE 消费路径中记录终态。
+
+历史请求无法补采。开启前已建立的上游 WS 连接没有握手 Cookie 快照，需等其正常重连后
+才能采集；不会为此主动断开连接。即使缺少 Cookie，也不能依据相邻请求推定其网关。
+统计推理成功时使用 `response.completed`，不要把 `http_status=200` 或握手 `101` 当作完成。
+
 #### SQLite 模式
 
 | 变量 | 必填 | 默认值 | 说明 |

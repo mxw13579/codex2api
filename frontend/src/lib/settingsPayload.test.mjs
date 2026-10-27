@@ -26,6 +26,25 @@ for (const enabled of [false, true]) {
   });
 }
 
+for (const enabled of [false, true]) {
+  test(`writable settings payload preserves upstream Cookie collection = ${enabled}`, () => {
+    const settings = Object.freeze({
+      codex_upstream_cookie_log_enabled: enabled,
+      usage_log_mode: "errors",
+      response_cache_config_generation: 7,
+    });
+
+    assert.deepEqual(buildWritableSettingsPayload(settings), {
+      codex_upstream_cookie_log_enabled: enabled,
+      usage_log_mode: "errors",
+    });
+    assert.equal(settings.codex_upstream_cookie_log_enabled, enabled);
+    assert.deepEqual(buildWritableSettingsPayload({ codex_upstream_cookie_log_enabled: enabled }), {
+      codex_upstream_cookie_log_enabled: enabled,
+    });
+  });
+}
+
 test("writable settings payload omits response cache generation regardless of value", () => {
   for (const generation of [7, 0, null, undefined]) {
     const settings = {

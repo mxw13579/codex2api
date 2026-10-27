@@ -143,6 +143,7 @@ import type {
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
+  UsageLogUpstreamCookiesResponse,
   UsageStats,
   AccountGroup,
   AccountRow,
@@ -1234,6 +1235,12 @@ export const api = {
     if (params.pageSize) searchParams.set('page_size', String(params.pageSize))
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
+  getUsageLogUpstreamCookies: (id: number, signal?: AbortSignal) =>
+    request<UsageLogUpstreamCookiesResponse>(`/usage/logs/${encodeURIComponent(String(id))}/upstream-cookies`, { signal })
+      .catch((error: unknown) => {
+        // Never expose a response body (which may contain raw headers) as an error.
+        throw new AdminAPIError(error instanceof AdminAPIError ? error.status : 0, 'Unable to load upstream Cookie details')
+      }),
   getUsageLogsErrorSummary: (params: UsageLogQueryParams) => {
     const searchParams = buildUsageLogSearchParams(params)
     return request<OpsErrorSummary>(`/usage/logs/error-summary?${searchParams.toString()}`)

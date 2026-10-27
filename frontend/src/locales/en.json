@@ -2653,6 +2653,31 @@
     "reason7dUrgency": "7d Reset Soon"
   },
   "usage": {
+    "upstreamCookies": {
+      "button": "Cookie",
+      "open": "View upstream Cookie details for log #{{id}}",
+      "title": "Upstream Cookie details · Log #{{id}}",
+      "description": "All recorded exchanges are shown, including retries and silent 429s within an ultimately successful request. Handshake events and request turns have separate outcomes. Expand an entry to view or copy raw Cookie / Set-Cookie headers and __oailb values. The Unified host is an unverified Cookie claim, not confirmation of the inference worker.",
+      "empty": "No upstream Cookie data was collected for this log. Existing upstream WebSocket connections acquire handshake snapshots after they reconnect normally; older logs are not backfilled. Data follows the usage log mode and retention policy.",
+      "notFound": "This request log does not exist or has been removed by log retention.",
+      "loadFailed": "Unable to load upstream Cookie details. Please retry.",
+      "truncated": "The recorded data was truncated. Some entries or header values may be incomplete.",
+      "entryTruncated": "Headers truncated",
+      "entryCount": "Recorded exchanges: {{count}}",
+      "handshake": "Connection handshake",
+      "turn": "Request turn",
+      "exchange": "Upstream exchange",
+      "handshakeContext": "Connection handshake context",
+      "status": "Event status",
+      "notRecorded": "Not recorded",
+      "unifiedHost": "Unified host",
+      "unifiedSource": "Unified source",
+      "source": "Source",
+      "upgradeOnly": "HTTP 101 indicates a protocol upgrade only. It does not establish whether a request turn succeeded.",
+      "expand": "Raw headers and details",
+      "entryJson": "entry JSON",
+      "copy": "Copy {{label}}"
+    },
     "usageAnalysis": "Usage breakdown",
     "imageInputTokens": "Image input tokens",
     "imageOutputTokens": "Image output tokens",
@@ -4417,6 +4442,8 @@
     }
   },
   "settings": {
+    "codexUpstreamCookieLog": "Record upstream Cookies in request logs",
+    "codexUpstreamCookieLogDesc": "Off by default. Saves raw Cookie / Set-Cookie headers and __oailb / unified routing details in existing request log details for administrators. Changes are saved and apply immediately to future requests only; no restart is needed. Collection follows the usage log mode and retention policy: errors mode retains only error logs, and off mode saves no logs.",
     "codexClientVersions": {
       "platform": "Client / platform",
       "pair": "App / embedded CLI",

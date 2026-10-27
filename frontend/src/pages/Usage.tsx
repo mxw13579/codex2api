@@ -12,6 +12,7 @@ import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
 import ChannelLogo from '../components/ChannelLogo'
 import CompactionBadges from '../components/CompactionBadges'
 import UsageDaybreakBadge from '../components/UsageDaybreakBadge'
+import UpstreamCookieDetails from '../components/UpstreamCookieDetails'
 import ModelLogo from '../components/ModelLogo'
 import Modal from '../components/Modal'
 import ColumnSettingsMenu from '../components/ColumnSettingsMenu'
@@ -2671,6 +2672,7 @@ export default function Usage() {
                             </button>
                           )}
                           {log.upstream_error_kind === 'cyber_policy' ? <CyberPolicyDetailButton log={log} /> : null}
+                          <UpstreamCookieDetails log={log} />
                           {visibleColumns.type && log.via_websocket ? (
                             <Badge
                               variant="outline"
@@ -2887,6 +2889,7 @@ export default function Usage() {
                       {visibleColumns.cost && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableCost')}</TableHead>}
                       {visibleColumns.error && <TableHead className={usageTableHeadClass}>{t('usage.tableError')}</TableHead>}
                       {visibleColumns.time && <TableHead className={`${usageTableHeadClass} text-right`}>{t('usage.tableTime')}</TableHead>}
+                      <TableHead className={usageTableHeadClass}>{t('usage.upstreamCookies.button')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -3063,6 +3066,7 @@ export default function Usage() {
                         {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-right whitespace-nowrap`}>
                           <UsageTimeCell value={log.created_at} />
                         </TableCell>}
+                        <TableCell><UpstreamCookieDetails log={log} /></TableCell>
                       </TableRow>
                       )
                     })}

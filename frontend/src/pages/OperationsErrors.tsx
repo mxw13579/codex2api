@@ -20,6 +20,7 @@ import { StatTile } from '../components/StatTile'
 import { SegmentedTabs } from '../components/SegmentedTabs'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
+import UpstreamCookieDetails from '../components/UpstreamCookieDetails'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
@@ -607,7 +608,8 @@ export default function OperationsErrors() {
                 </DetailPanel>
               </div>
 
-              <div className="flex justify-end gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                <UpstreamCookieDetails log={selectedLog} />
                 <Button variant="outline" onClick={() => void copyLog(selectedLog)}>
                   <Copy className="size-3.5" />
                   {t('opsErrors.copyJson')}

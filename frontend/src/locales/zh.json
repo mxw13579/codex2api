@@ -2653,6 +2653,31 @@
     "reason7dUrgency": "7d 快重置"
   },
   "usage": {
+    "upstreamCookies": {
+      "button": "Cookie",
+      "open": "查看日志 #{{id}} 的上游 Cookie 详情",
+      "title": "上游 Cookie 详情 · 日志 #{{id}}",
+      "description": "显示所有已记录的上游交互，包括最终成功请求中的重试和静默 429。连接握手与请求轮次的结果分别展示。展开条目可查看或复制原始 Cookie / Set-Cookie 头和 __oailb 值。Unified 主机来自未验证签名的 Cookie 声明，不代表已确认的推理工作节点。",
+      "empty": "此日志未采集上游 Cookie 数据。开启采集后，已有的上游 WebSocket 连接需等正常重连才会有握手快照；历史日志不会补录。数据遵循用量日志的记录模式和保留策略。",
+      "notFound": "此请求日志不存在，或已按日志保留策略清理。",
+      "loadFailed": "无法加载上游 Cookie 详情，请重试。",
+      "truncated": "记录数据已被截断，部分条目或请求与响应头可能不完整。",
+      "entryTruncated": "头信息已截断",
+      "entryCount": "已记录交互：{{count}} 条",
+      "handshake": "连接握手",
+      "turn": "请求轮次",
+      "exchange": "上游交互",
+      "handshakeContext": "连接握手上下文",
+      "status": "事件状态",
+      "notRecorded": "未记录",
+      "unifiedHost": "Unified 主机",
+      "unifiedSource": "Unified 来源",
+      "source": "来源",
+      "upgradeOnly": "HTTP 101 仅表示协议升级，不能据此判断请求轮次是否成功。",
+      "expand": "原始头信息与详情",
+      "entryJson": "条目 JSON",
+      "copy": "复制{{label}}"
+    },
     "usageAnalysis": "用量分析",
     "imageInputTokens": "图片输入 token",
     "imageOutputTokens": "图片输出 token",
@@ -4416,6 +4441,8 @@
     }
   },
   "settings": {
+    "codexUpstreamCookieLog": "在请求日志中记录上游 Cookie",
+    "codexUpstreamCookieLogDesc": "默认关闭。将原始 Cookie / Set-Cookie 请求与响应头，以及 __oailb / unified 路由信息保存到现有请求日志详情，供管理员查看。修改后自动保存并立即生效，仅影响后续请求，无需重启。遵循用量日志的记录模式和保留策略：仅错误模式只保留错误日志，关闭模式不保存日志。",
     "codexClientVersions": {
       "platform": "客户端 / 平台",
       "pair": "应用 / 内置 CLI",

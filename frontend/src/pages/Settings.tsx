@@ -2643,6 +2643,7 @@ export default function Settings() {
       ...cacheNormalized,
       codex_transient_429_cooldown_enabled: cacheNormalized.codex_transient_429_cooldown_enabled ?? false,
       codex_images_main_model: cacheNormalized.codex_images_main_model ?? '',
+      codex_upstream_cookie_log_enabled: cacheNormalized.codex_upstream_cookie_log_enabled ?? false,
       codex_telemetry_enabled: cacheNormalized.codex_telemetry_enabled ?? false,
       codex_telemetry_timing_debug: cacheNormalized.codex_telemetry_timing_debug ?? false,
       codex_unified_client_identity_enabled: cacheNormalized.codex_unified_client_identity_enabled ?? false,
@@ -2698,6 +2699,7 @@ export default function Settings() {
     auto_reset_credits_before_expiry_min: 60,
     auto_activate_5h_window_enabled: false,
     codex_force_websocket: false,
+    codex_upstream_cookie_log_enabled: false,
     codex_telemetry_enabled: false,
     codex_telemetry_timing_debug: false,
     codex_unified_client_identity_enabled: false,
@@ -4264,6 +4266,20 @@ export default function Settings() {
                       <Switch
                         checked={settingsForm.codex_ws_busy_overflow_enabled}
                         onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_busy_overflow_enabled', checked)}
+                      />
+                    </SettingField>
+                  </div>
+
+                  <div className="border-t border-border/80 pt-4">
+                    <SettingField
+                      label={t('settings.codexUpstreamCookieLog')}
+                      description={t('settings.codexUpstreamCookieLogDesc')}
+                      layout="row"
+                    >
+                      <Switch
+                        aria-label={t('settings.codexUpstreamCookieLog')}
+                        checked={settingsForm.codex_upstream_cookie_log_enabled}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_upstream_cookie_log_enabled', checked)}
                       />
                     </SettingField>
                   </div>

@@ -2211,6 +2211,7 @@ export interface SystemSettings {
   fast_scheduler_enabled: boolean
   scheduler_engine: 'legacy' | 'shadow' | 'indexed'
   codex_force_websocket: boolean
+  codex_upstream_cookie_log_enabled: boolean
   codex_telemetry_enabled: boolean
   codex_telemetry_timing_debug: boolean
   codex_unified_client_identity_enabled: boolean
@@ -3690,6 +3691,46 @@ export interface UsageLog {
   upstream_error_kind: string
 	error_message: string
 	prompt_policy_incident_id?: string
+}
+
+/** Loaded only from an individual admin usage log's upstream-cookies endpoint. */
+export interface UpstreamCookieEntry {
+  time: string
+  event: string
+  transport: string
+  account_id: number
+  model?: string
+  request_id?: string
+  attempt_id?: string
+  connection_id?: string
+  http_status?: number
+  status?: number
+  cookie: string[]
+  set_cookie: string[]
+  __oailb?: {
+    source: string
+    value: string
+    host?: string
+    iat?: number
+    exp?: number
+  }[]
+  unified_host?: string
+  unified_source?: string
+  cookie_truncated?: boolean
+  cf_ray?: string
+  handshake_cf_ray?: string
+  upstream_request_id?: string
+  handshake_request_id?: string
+  response_id?: string
+  error_code?: string
+  error_type?: string
+  proxy_id?: number
+  proxy_name?: string
+}
+
+export interface UsageLogUpstreamCookiesResponse {
+  entries: UpstreamCookieEntry[]
+  truncated: boolean
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
