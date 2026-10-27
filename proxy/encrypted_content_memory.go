@@ -270,6 +270,10 @@ type encryptedErrorObserver struct {
 	record                      func([]byte)
 }
 
+func (r *encryptedErrorObserver) observeUpstreamCookieEvent(payload []byte) {
+	forwardUpstreamCookieEvent(r.ReadCloser, payload)
+}
+
 func (r *encryptedErrorObserver) Read(p []byte) (int, error) {
 	n, err := r.ReadCloser.Read(p)
 	r.mu.Lock()

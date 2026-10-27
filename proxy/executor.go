@@ -569,6 +569,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if daybreakErr != nil {
 		return nil, daybreakErr
 	}
+	if upstreamCookieLoggingEnabled() {
+		ctx = context.WithValue(ctx, upstreamCookieModelKey{}, gjson.GetBytes(requestBody, "model").String())
+	}
 	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
 	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
 	headers = PrepareCodexFingerprintHeaders(account, headers, requestBody)
@@ -1134,6 +1137,9 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	var encryptedAttempt *encryptedContentAttempt
 	requestBody, encryptedAttempt = prepareEncryptedContentAttempt(ctx, account, requestBody, sessionID, headers)
 	defer func() { encryptedAttempt.observeResponse(upstreamResponse, requestBody) }()
+	if upstreamCookieLoggingEnabled() {
+		ctx = context.WithValue(ctx, upstreamCookieModelKey{}, gjson.GetBytes(requestBody, "model").String())
+	}
 	responsesLite := gateResponsesLiteForAccount(codexResponsesLiteRequested(requestBody, headers), requestBody, account)
 
 	account.Mu().RLock()
@@ -1595,6 +1601,7 @@ func ReadSSEStream(body io.Reader, callback func(data []byte) bool) error {
 // ReadSSEStreamWithEvent preserves the optional SSE event field while keeping
 // ReadSSEStream's data-only API compatible for existing callers.
 func ReadSSEStreamWithEvent(body io.Reader, callback func(event string, data []byte) bool) error {
+	cookieObserver, _ := body.(upstreamCookieEventObserver)
 	// 使用 sync.Pool 复用缓冲区，减少 GC 压力
 	buf := sseBufferPool.Get().([]byte)
 	defer sseBufferPool.Put(buf)
@@ -1628,6 +1635,9 @@ func ReadSSEStreamWithEvent(body io.Reader, callback func(event string, data []b
 		isDone := bytes.Equal(data, []byte("[DONE]"))
 		if !isDone {
 			event, data = normalizeUpstreamResponsesTerminalEvent(event, data)
+			if cookieObserver != nil {
+				cookieObserver.observeUpstreamCookieEvent(data)
+			}
 		}
 		keepReading := !isDone && callback(event, data)
 		// 清掉 backing array 中的切片引用，避免最后一个大事件一直被

@@ -31,6 +31,7 @@ func (m *Manager) createConnection(ctx context.Context, input connectionDialRequ
 	}
 	session, poolKey := m.newDialSession(ctx, input)
 	conn, resp, err := dialer.DialContext(ctx, input.url, input.headers)
+	cookieTrace := proxy.NewUpstreamCookieTrace(ctx, input.account, "websocket", "", input.headers, resp)
 	if err != nil {
 		m.sessions.CompareAndDelete(poolKey, session)
 		session.Close()
@@ -38,6 +39,7 @@ func (m *Manager) createConnection(ctx context.Context, input connectionDialRequ
 	}
 	logCompressionNegotiation(resp, input.account.ID())
 	wc = m.wrapDialedConnection(dialedConnection{conn: conn, response: resp, session: session, poolKey: poolKey, request: input})
+	wc.cookieTrace = cookieTrace
 	input.capacity.attach(wc)
 	select {
 	case <-m.stopCleanup:

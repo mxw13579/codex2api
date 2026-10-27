@@ -1805,6 +1805,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if pipeline := pipelineFromContext(c.Request.Context()); pipeline != nil {
+			cookieObserver, _ := resp.Body.(upstreamCookieEventObserver)
 			file, err := pipeline.collectResponse(c.Request.Context(), resp.Body)
 			if err != nil {
 				h.store.Release(account)
@@ -1812,7 +1813,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				return
 			}
 			defer removePipelineFile(file)
-			resp.Body = &pipelineResponseReader{File: file, err: pipeline.responseReadError}
+			resp.Body = &pipelineResponseReader{File: file, err: pipeline.responseReadError, cookieObserver: cookieObserver}
 		}
 
 		if resp.StatusCode != http.StatusOK {

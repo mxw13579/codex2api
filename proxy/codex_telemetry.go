@@ -401,6 +401,10 @@ type codexTelemetryBody struct {
 	dropping bool
 }
 
+func (b *codexTelemetryBody) observeUpstreamCookieEvent(payload []byte) {
+	forwardUpstreamCookieEvent(b.ReadCloser, payload)
+}
+
 func (b *codexTelemetryBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if n > 0 {

@@ -36,6 +36,7 @@ func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte,
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
+	attachUpstreamTrace(ginCtx, h.store)
 
 	// 每个批量输出都是一次真实上游请求，因此复用标准 Images handler 的
 	// API Key 限额。并发槽由调用方决定：入队时已经为整个任务占过槽的路径
@@ -97,6 +98,7 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
+	attachUpstreamTrace(ginCtx, h.store)
 
 	if sharedAPIKeyConcurrency {
 		ginCtx.Set(contextAPIKeyConcurrencyInherited, true)

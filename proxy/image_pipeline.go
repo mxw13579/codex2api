@@ -163,6 +163,7 @@ func (h *Handler) GenerateQueuedImage(ctx context.Context, build func() ([]byte,
 	}
 	c.Set(contextAPIKeyConcurrencyInherited, true)
 	c.Request = request
+	attachUpstreamTrace(c, h.store)
 	if status, msg := h.applyAdminScopeBudget(ctx, c, key); status != 0 {
 		return nil, status, fmt.Errorf("%s", msg)
 	}
@@ -414,7 +415,14 @@ func (p *ImagePipeline) decodeResult(result *imageCallResult) (QueuedImageResult
 
 type pipelineResponseReader struct {
 	*os.File
-	err error
+	err            error
+	cookieObserver upstreamCookieEventObserver
+}
+
+func (r *pipelineResponseReader) observeUpstreamCookieEvent(payload []byte) {
+	if r.cookieObserver != nil {
+		r.cookieObserver.observeUpstreamCookieEvent(payload)
+	}
 }
 
 func (r *pipelineResponseReader) Read(b []byte) (int, error) {

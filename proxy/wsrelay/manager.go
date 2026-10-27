@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gorilla/websocket"
 )
@@ -94,8 +95,9 @@ type WsConnection struct {
 	closeErr           error
 	disconnectNotified atomic.Bool
 
-	// HTTP 握手响应
-	httpResp *http.Response
+	// HTTP 握手响应及建连时实际收发的 Cookie 诊断快照。
+	httpResp    *http.Response
+	cookieTrace *proxy.UpstreamCookieTrace
 
 	// 连接关闭回调
 	onDisconnected func(accountID int64)

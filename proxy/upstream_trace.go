@@ -22,12 +22,13 @@ type upstreamTraceAttempt struct {
 }
 
 type upstreamTraceSnapshot struct {
-	RequestID         string
-	accountID         int64
-	UpstreamRequestID string
-	Proxy             auth.ProxyAuditLabel
-	InjectedTurnState string
-	UpstreamTurnState string
+	RequestID           string
+	accountID           int64
+	UpstreamRequestID   string
+	Proxy               auth.ProxyAuditLabel
+	InjectedTurnState   string
+	UpstreamTurnState   string
+	UpstreamCookieTrace string
 }
 
 func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
@@ -37,7 +38,7 @@ func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	result := upstreamTraceSnapshot{RequestID: a.requestID}
+	result := upstreamTraceSnapshot{RequestID: a.requestID, UpstreamCookieTrace: SnapshotUpstreamCookieLog(ctx)}
 	if a.current != nil {
 		result.accountID = a.current.accountID
 		result.UpstreamRequestID = a.current.requestID
@@ -49,6 +50,7 @@ func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
 
 func (s upstreamTraceSnapshot) apply(input *database.UsageLogInput) {
 	input.RequestID = s.RequestID
+	input.UpstreamCookieTrace = s.UpstreamCookieTrace
 	if s.accountID == input.AccountID {
 		input.UpstreamRequestID = s.UpstreamRequestID
 		input.UpstreamProxyID = s.Proxy.ID
@@ -78,7 +80,7 @@ func attachUpstreamTrace(c *gin.Context, store *auth.Store) {
 		return
 	}
 	a := &upstreamTraceAudit{requestID: NewUpstreamSessionUUID(), store: store}
-	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), upstreamTraceContextKey{}, a))
+	c.Request = c.Request.WithContext(context.WithValue(WithUpstreamCookieLog(c.Request.Context()), upstreamTraceContextKey{}, a))
 	c.Header("X-Codex2API-Request-ID", a.requestID)
 }
 
@@ -92,6 +94,7 @@ func resetUpstreamRequestTrace(c *gin.Context) {
 		a.current = nil
 		a.mu.Unlock()
 	}
+	c.Request = c.Request.WithContext(WithUpstreamCookieLog(c.Request.Context()))
 }
 
 func resetUpstreamAttemptTrace(ctx context.Context) {
@@ -170,6 +173,13 @@ func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *au
 	record := beginUpstreamTrace(req.Context(), account, proxyURL, false)
 	resp, err := client.Do(req)
 	record(resp)
+	sentRequest := req
+	if resp != nil && resp.Request != nil {
+		sentRequest = resp.Request
+	}
+	if trace := NewUpstreamCookieTrace(req.Context(), account, "http", "", sentRequest.Header, resp); trace != nil && resp != nil && resp.Body != nil {
+		resp.Body = &upstreamCookieBody{ReadCloser: resp.Body, trace: trace}
+	}
 	return resp, err
 }
 
@@ -187,6 +197,7 @@ func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	input.RequestID = a.requestID
+	input.UpstreamCookieTrace = SnapshotUpstreamCookieLog(c.Request.Context())
 	if current := a.current; current != nil && current.accountID == input.AccountID {
 		input.UpstreamRequestID = current.requestID
 		input.UpstreamProxyID = current.proxy.ID

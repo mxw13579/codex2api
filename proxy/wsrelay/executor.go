@@ -291,6 +291,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		readErrChan:       make(chan error, 1),
 		upstreamUserAgent: wc.upstreamUserAgent,
 		upstreamVersion:   wc.upstreamVersion,
+		cookieTrace:       wc.cookieTrace.BeginTurn(ctx, pr.RequestID, gjson.GetBytes(wsBody, "model").String()),
 	}, nil
 }
 
@@ -480,6 +481,7 @@ type WsResponse struct {
 	// 承载本请求的连接在握手时发出的客户端身份。
 	upstreamUserAgent string
 	upstreamVersion   string
+	cookieTrace       *proxy.UpstreamCookieTrace
 	// connBroken 标记读流因上游 WS 异常(非正常关闭)或下游写入失败而终止；
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
@@ -545,6 +547,7 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 	// 上游错误帧：透传给下游(转成 SSE 错误事件)，而不是转成 Go error 后静默关闭 pipe。
 	// 否则下游只会读到一个底层 read error → 表现为空响应，无从得知具体错误。
 	if errEvent, isErr := r.buildErrorEvent(payload); isErr {
+		r.cookieTrace.ObserveEvent(errEvent)
 		// 连接级寿命限制错误：针对连接而非单个请求，这条连接上的后续
 		// response.create 一律失败，而 Ping 探活仍会成功；归还池会持续毒害
 		// 后续请求（含续链亲和定向回来的），必须标记销毁 (issue #346)。
@@ -561,6 +564,7 @@ func (r *WsResponse) handleMessage(payload []byte, callback func(data []byte) bo
 
 	// 标准化完成事件类型
 	payload = normalizeCompletionEvent(payload)
+	r.cookieTrace.ObserveEvent(payload)
 
 	// 终态先记录绑定与完成状态，再交给下游。
 	eventType := gjson.GetBytes(payload, "type").String()

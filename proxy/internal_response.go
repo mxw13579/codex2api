@@ -128,6 +128,7 @@ func (h *Handler) executeInternalResponseWithAttribution(ctx context.Context, bo
 	c.Request = req
 	c.Set("prompt_intelligence_internal", true)
 	applyInternalResponseAttribution(c, req, attribution)
+	attachUpstreamTrace(c, h.store)
 	h.Responses(c)
 	return recorder.Code, recorder.Body.Bytes()
 }

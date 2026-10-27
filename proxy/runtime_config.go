@@ -70,6 +70,8 @@ type RuntimeSettings struct {
 	CodexMinCLIVersion    string
 	CodexUserAgentConfig  string
 	CodexTelemetryEnabled bool
+	// CodexUpstreamCookieLogEnabled opts into sensitive usage-log diagnostics.
+	CodexUpstreamCookieLogEnabled bool
 	// CodexTelemetryTimingDebug 打开模拟遥测的临时计时探针（仅打日志，默认关闭）。
 	CodexTelemetryTimingDebug bool
 	// CodexUnifiedClientIdentityEnabled 让网关自发的 Codex 维护请求（用量探针、重置券、
@@ -186,6 +188,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexMinCLIVersion:               defaultCodexMinCLIVersion,
 		CodexUserAgentConfig:             DefaultCodexUserAgentConfigJSON(),
 		CodexTelemetryEnabled:            false,
+		CodexUpstreamCookieLogEnabled:    false,
 		CodexTelemetryTimingDebug:        false,
 		StreamFlushPolicy:                defaultStreamFlushPolicy,
 		StreamFlushIntervalMS:            defaultStreamFlushIntervalMS,
@@ -354,6 +357,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexMinCLIVersion = settings.CodexMinCLIVersion
 		next.CodexUserAgentConfig = settings.CodexUserAgentConfig
 		next.CodexTelemetryEnabled = settings.CodexTelemetryEnabled
+		next.CodexUpstreamCookieLogEnabled = settings.CodexUpstreamCookieLogEnabled
 		next.CodexTelemetryTimingDebug = settings.CodexTelemetryTimingDebug
 		next.CodexUnifiedClientIdentityEnabled = settings.CodexUnifiedClientIdentityEnabled
 		next.CodexImagesMainModel = settings.CodexImagesMainModel
