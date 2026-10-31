@@ -2496,7 +2496,7 @@ type SystemSettings struct {
 	CodexWSBusyOverflowEnabled      bool // busy session 溢出到同账号兄弟连接，默认 false（issue #413）
 	CodexWSBusyPatienceSec          int  // 触发溢出前的短等待（秒），默认 2（issue #413）
 	CodexWSStatelessSlots           int  // 每账号空白上游 WS 槽位预算，默认 8，范围 0-32
-	CodexWSDownstreamKeepaliveSlots int  // 每账号空闲聊天续链连接的独立保留上限，默认 8，范围 0-32
+	CodexWSDownstreamKeepaliveSlots int  // 每账号空闲聊天续链连接的独立保留上限，默认 8，范围 0-128
 	// GithubToken 用于 api.github.com 请求的 Personal Access Token（提升限流配额，
 	// 只发给 api.github.com，绝不发给镜像/其他主机；空表示未配置，issue #522）。
 	GithubToken string

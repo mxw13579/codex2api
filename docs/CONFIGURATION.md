@@ -380,7 +380,7 @@ Codex 的 `/v1/responses`（HTTP / WebSocket）托管 `web_search` / `web_search
 | `CodexForceWebsocket` | bool | false | - | 强制 Codex 上游走 WebSocket 长连接（复用连接池），更接近官方 CLI 体验；关闭时走原有 HTTP 请求 |
 | `CodexWSKeepaliveEnabled` | bool | false | - | 启用上游 WS 空闲连接保活（后台仅发 Ping，不发起新请求、不消耗账号额度） |
 | `CodexWSKeepaliveIntervalSec` | int | 60 | 10-600 | WS 保活 Ping 间隔（秒），仅在 `CodexWSKeepaliveEnabled` 开启时生效 |
-| `CodexWSDownstreamKeepaliveSlots` | int | 8 | 0-32 | 每账号在推理输出结束后保留的空闲聊天上游连接数，超额按 LRU 回收 |
+| `CodexWSDownstreamKeepaliveSlots` | int | 8 | 0-128 | 每账号在推理输出结束后保留的空闲聊天上游连接数，超额按 LRU 回收 |
 | `CodexWSStatelessSlots` | int | 8 | 0-32 | 每账号空白上游连接预算及无状态池扫描窗口 |
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
@@ -490,7 +490,7 @@ Claude / Grok / Antigravity 等中继型账号不经 Resin，始终按第 2、3 
 
 ### WebSocket 连接池与 1009 降级
 
-- 管理后台 **设置 → WebSocket（Codex 上游）→ 聊天续链连接保留数**（`codex_ws_downstream_keepalive_slots`）限制每账号在 Codex 输出完毕、等待用户继续输入时保留的空闲聊天上游连接数，默认 8、范围 0～32，所有 Key 共用，保存后热更新。设为 0 时聊天输出收尾即关闭上游连接，后续通过仍有效的上下文恢复。拨号及推理中的连接不占空闲保留额度；普通会话、无状态客户端、overflow、一次性连接与后台执行道的聊天输出收尾后，均按相同规则保留。
+- 管理后台 **设置 → WebSocket（Codex 上游）→ 聊天续链连接保留数**（`codex_ws_downstream_keepalive_slots`）限制每账号在 Codex 输出完毕、等待用户继续输入时保留的空闲聊天上游连接数，默认 8、范围 0～128，所有 Key 共用，保存后热更新。设为 0 时聊天输出收尾即关闭上游连接，后续通过仍有效的上下文恢复。拨号及推理中的连接不占空闲保留额度；普通会话、无状态客户端、overflow、一次性连接与后台执行道的聊天输出收尾后，均按相同规则保留。放宽上限不会自动提高已有配置，也不会主动建连或提高请求并发；更多空闲连接会增加内存、文件描述符和巡检开销，建议逐步调整并观察资源与复用情况。
 - 原 `codex_ws_stateless_slots`（空白预热连接保留数）独立限制每账号未承载用户聊天上下文的空白连接，并控制无状态连接池扫描窗口，默认 8、范围 0～32。没有聊天输入、指令、工具定义、模板或续链 ID 的明确预热请求使用空白预算。首次在空白连接上开始聊天前，连接退出空白预算，进入推理状态，输出结束后才进入聊天空闲保留池；两个保留池不互相占位。设为 0 时不扫描通用池、不保留空白连接，预热请求仍可临时建连并在收尾后关闭。两项之和是正常空闲保留量，不是全部实体连接的硬上限；推理连接另外由原账号/Key 请求并发约束。
 - 连接预算独立于 `DynamicConcurrencyLimit`。API Key 和账号的请求并发继续沿用原配置、队列与计数方式。例如 4 个 Key 各限并发 3、账号限并发 3，仍最多同时处理 3 个请求；若希望保留 12 个独立聊天会话的上游连接，可将“聊天续链连接保留数”设为 12 或 16，不会自动修改现有配置。
 - 空白拨号仍按原预算原子预留；聊天拨号、在途以及摘池后的收尾只登记实体 socket 生命周期，直到实际关闭后幂等解除登记。聊天推理可以在空闲保留池已满时正常开始，不会因这个设置返回 503；原来的 Key/账号请求并发和 busy 等待规则继续生效。

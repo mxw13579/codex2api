@@ -4673,7 +4673,7 @@
     "codexWSStatelessSlots": "空白预热连接保留数",
     "codexWSStatelessSlotsDesc": "每个账号最多保留多少条提前建立、还没有聊天内容的上游连接。设为 0 时不保留，请求结束后关闭。开始聊天后，连接按“聊天续链连接保留数”保留。默认 8，范围 0～32，保存后生效。",
     "codexWSDownstreamKeepaliveSlots": "聊天续链连接保留数",
-    "codexWSDownstreamKeepaliveSlotsDesc": "每个账号在回复结束后，最多保留多少条等待用户继续输入的聊天连接，所有 API Key 共用。超过数量时关闭最久未使用的一条，不影响正在生成的回复。设为 0 时回复结束就关闭。闲置 30 分钟也会关闭，下次输入可通过默认保存 45 分钟的上下文重新连接。默认 8，范围 0～32，保存后生效。",
+    "codexWSDownstreamKeepaliveSlotsDesc": "每个账号在回复结束后，最多保留多少条等待用户继续输入的聊天连接，所有 API Key 共用。超过数量时关闭最久未使用的一条，不影响正在生成的回复。设为 0 时回复结束就关闭。闲置 30 分钟也会关闭，下次输入可通过默认保存 45 分钟的上下文重新连接。默认 8，范围 0～128，保存后生效。",
     "codexWSSilentMaxRetries": "WS 静默最大重试次数",
     "codexWSSilentMaxRetriesDesc": "首包前上游错误最多静默换号重试的次数，范围 0–10，默认 2。",
     "schedulerMode": "调度模式",

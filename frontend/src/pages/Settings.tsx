@@ -4370,7 +4370,7 @@ export default function Settings() {
                     >
                       <DraftNumberInput
                         min={0}
-                        max={32}
+                        max={128}
                         value={settingsForm.codex_ws_downstream_keepalive_slots}
                         emptyValue={8}
                         onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_downstream_keepalive_slots: value }))}

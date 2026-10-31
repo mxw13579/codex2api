@@ -2,7 +2,7 @@ package database
 
 const (
 	DefaultCodexWSDownstreamKeepaliveSlots = 8
-	MaxCodexWSDownstreamKeepaliveSlots     = 32
+	MaxCodexWSDownstreamKeepaliveSlots     = 128
 )
 
 // NormalizeCodexWSDownstreamKeepaliveSlots 归一化空闲聊天连接保留上限，0 表示不保留。
