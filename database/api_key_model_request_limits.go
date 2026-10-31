@@ -207,6 +207,12 @@ func modelRequestUsage(rule APIKeyModelRequestLimit, used int64, start, end time
 // Persisted limits are authoritative, including when an old authentication
 // cache entry still describes a formerly unrestricted key.
 func (db *DB) ConsumeAPIKeyModelRequest(ctx context.Context, keyID int64, requestID, effectiveModel string, rules []APIKeyModelRequestLimit, now time.Time) (*APIKeyModelRequestExhaustion, error) {
+	return db.consumeAPIKeyModelRequest(ctx, keyID, requestID, effectiveModel, rules, now, nil)
+}
+
+// receipt is private to ReserveAPIKeyModelRequest until the transaction returns.
+// The legacy consumer passes nil and keeps its existing conservative semantics.
+func (db *DB) consumeAPIKeyModelRequest(ctx context.Context, keyID int64, requestID, effectiveModel string, rules []APIKeyModelRequestLimit, now time.Time, receipt *apiKeyModelRequestReceiptState) (*APIKeyModelRequestExhaustion, error) {
 	if keyID <= 0 || requestID == "" || len(requestID) > 200 {
 		return nil, errors.New("invalid model request quota key or request identity")
 	}
@@ -270,6 +276,11 @@ func (db *DB) ConsumeAPIKeyModelRequest(ctx context.Context, keyID int64, reques
 			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO api_key_model_request_ledger (api_key_id,rule_id,request_id,window_start,created_at) VALUES ($1,$2,$3,$4,$5)`, keyID, item.rule.ID, requestID, item.start.Unix(), now.Unix()); err != nil {
 				return err
+			}
+			if receipt != nil {
+				receipt.rows = append(receipt.rows, apiKeyModelRequestReceiptRow{
+					ruleID: item.rule.ID, windowStart: item.start.Unix(), resetAt: item.end.Unix(), createdAt: now.Unix(),
+				})
 			}
 		}
 		return nil
