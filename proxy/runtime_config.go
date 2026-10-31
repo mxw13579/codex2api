@@ -131,6 +131,10 @@ type RuntimeSettings struct {
 	// 该窗口内的 response.failed 只能以 SSE failed 帧下发，真实错误码/静默换号/
 	// 超窗压缩重试均不可用。
 	CodexPreflightSSEPassthrough bool
+	// Independent, default-off experiment. CODEX_SAFE_PREFLIGHT_RETRY=true opts in
+	// at process configuration; not persisted or coupled to legacy passthrough.
+	// Only eligible ordinary Codex OAuth HTTP streams enter the new path.
+	CodexSafePreflightRetry bool
 	// FirstTokenExcludesWsAcquire 落库的 first_token_ms 是否扣除本次 attempt 的
 	// WS 取连耗时（默认 false，保持含取连的原口径；原始值 = first_token_ms + ws_acquire_ms）。
 	FirstTokenExcludesWsAcquire bool
@@ -189,6 +193,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexUserAgentConfig:             DefaultCodexUserAgentConfigJSON(),
 		CodexTelemetryEnabled:            false,
 		CodexUpstreamCookieLogEnabled:    false,
+		CodexSafePreflightRetry:          defaultCodexSafePreflightRetry(),
 		CodexTelemetryTimingDebug:        false,
 		StreamFlushPolicy:                defaultStreamFlushPolicy,
 		StreamFlushIntervalMS:            defaultStreamFlushIntervalMS,
@@ -216,6 +221,13 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		AutoResetCreditsBeforeExpiryMin:  60,
 		UTLSShutdownTimeoutMin:           database.NormalizeUTLSShutdownTimeoutMinutes(0),
 	}
+}
+
+// Invalid or absent values fail closed. This option does not change transport
+// selection, retry budgets, filters or the legacy persisted compatibility flag.
+func defaultCodexSafePreflightRetry() bool {
+	value := strings.TrimSpace(os.Getenv("CODEX_SAFE_PREFLIGHT_RETRY"))
+	return value == "1" || strings.EqualFold(value, "true")
 }
 
 // defaultRequestIsolationMode 从环境变量解析默认隔离模式；缺省为按每请求隔离。

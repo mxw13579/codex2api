@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -602,6 +603,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if account.IsCodexAgentIdentity() {
 		wantWebsocket = false
 	}
+	if state := safePreflightFromContext(ctx); state != nil &&
+		(wantWebsocket || responsesLite || !safePreflightRequestBody(requestBody) || pipelineFromContext(ctx) != nil) {
+		return nil, errSafePreflightLocal
+	}
 	var telemetryAttempt *codexTelemetryAttempt
 	if !detectorProbe {
 		telemetryAttempt = beginCodexTelemetry(codexTelemetryRequest{
@@ -736,6 +741,18 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
+	if state := safePreflightFromContext(ctx); state != nil {
+		// Validate BEFORE resolving/creating a client, including account-bound
+		// routes. Invalid configuration must never use the legacy direct fallback.
+		explicitProxy := proxyURL
+		if bound, ok := AccountBoundEgress(ctx); ok {
+			explicitProxy = bound
+		}
+		if _, err := safePreflightExplicitProxy(explicitProxy); err != nil ||
+			!safePreflightRoute(ctx, account, explicitProxy) {
+			return nil, errSafePreflightLocal
+		}
+	}
 	egress := ResolveCodexRequestEgress(ctx, account, endpoint, proxyURL, false)
 	endpoint = egress.URL
 	client := egress.Client()
@@ -757,7 +774,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		requestBody = nil
 		outboundBody = nil
 	}
-	send := func() (*http.Response, error) {
+	send := func() (sendResponse *http.Response, sendErr error) {
 		var reader io.Reader = bytes.NewReader(outboundBody)
 		var input *os.File
 		if pipelineFile != nil {
@@ -803,15 +820,69 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		egress.ApplyHeaders(req.Header)
 		logCodexFingerprintDebug("http", account, egress.DialProxyURL, req.Header)
 
-		if err := ConsumeAPIKeyModelRequestQuota(ctx, requestModel); err != nil {
-			return nil, err
+		state := safePreflightFromContext(ctx)
+		if state != nil {
+			if err := state.guard(req, outboundBody, requestModel, account, egress, client, false); err != nil {
+				return nil, err
+			}
+		}
+		reservation, err := reserveAPIKeyModelRequestQuota(ctx, requestModel)
+		if err != nil {
+			return nil, err // preserve the dedicated API-key quota response
+		}
+		if reservation != nil {
+			defer func() {
+				// Settle before this invocation returns, while wasSent still
+				// belongs to this attempt. Never attach a refund to body.Close.
+				// The guarded Proxy callback may prove no dial; any other Do
+				// failure/cancellation keeps the consumed send marker and charge.
+				if err := reservation.finish(ctx, state.wasSent()); err != nil {
+					if sendResponse != nil && sendResponse.Body != nil {
+						_ = sendResponse.Body.Close()
+					}
+					sendResponse, sendErr = nil, err
+				}
+			}()
 		}
 		if pipeline := pipelineFromContext(ctx); pipeline != nil {
 			pipeline.Release()
 			log.Printf("[image-pipeline] job=%d stage=waiting_upstream request_bytes=%d", pipeline.jobID, req.ContentLength)
 		}
-		resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
+		sendClient := client
+		var closeIdle func()
+		if state != nil {
+			proxy, err := safePreflightExplicitProxy(egress.DialProxyURL)
+			if err != nil {
+				return nil, err
+			}
+			sendClient, closeIdle, err = safePreflightClient(client, req, proxy)
+			if err != nil {
+				return nil, err
+			}
+			// Final admission AFTER quota (which may have blocked). The original
+			// downstream cancellation, retry-start window and one-shot permit all
+			// apply; this is not a deadline on the selected response generation.
+			if err := state.guard(req, outboundBody, requestModel, account, egress, sendClient, true); err != nil {
+				closeIdle()
+				return nil, err
+			}
+		}
+		resp, err := doTracedUpstreamRequest(sendClient, req, account, proxyURL)
+		if closeIdle != nil {
+			if resp != nil && resp.Body != nil {
+				resp.Body = &safePreflightResponseBody{ReadCloser: resp.Body, closeIdle: closeIdle}
+			} else {
+				closeIdle()
+			}
+		}
 		if err != nil {
+			if state != nil {
+				if errors.Is(err, errSafePreflightLocal) {
+					return nil, errSafePreflightLocal
+				}
+				// net/url errors can contain the proxy URL; keep local diagnostics fixed.
+				return nil, ErrUpstream(0, "Upstream request failed", errSafePreflightSSERead)
+			}
 			if shouldRecyclePooledClient(err) {
 				recycleRequestClient(ctx, account, proxyURL)
 			}

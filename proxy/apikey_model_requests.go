@@ -28,6 +28,10 @@ type apiKeyModelRequestQuota struct {
 	rules     []database.APIKeyModelRequestLimit
 	mu        sync.Mutex
 	admitted  bool
+	// Safe-preflight attempts hold this capability, not mu, across network IO.
+	// Poison is monotonic for the entire incoming logical request.
+	active   *apiKeyModelRequestReservation
+	poisoned bool
 }
 
 type apiKeyModelRequestQuotaError struct {
@@ -100,6 +104,10 @@ func ConsumeAPIKeyModelRequestQuota(ctx context.Context, model string) error {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.poisoned || state.active != nil {
+		state.poisoned = true
+		return safePreflightQuotaStorageFailure(ctx)
+	}
 	if state.db == nil {
 		return &apiKeyModelRequestQuotaError{http.StatusServiceUnavailable,
 			api.NewAPIError(api.ErrCodeServiceUnavailable, "Model request quota storage is unavailable", api.ErrorTypeServer)}
@@ -125,6 +133,112 @@ func ConsumeAPIKeyModelRequestQuota(ctx context.Context, model string) error {
 		keepalive.Activate()
 	}
 	return nil
+}
+
+// apiKeyModelRequestReservation spans only one executor invocation. Its fields
+// and the quota's active/admitted/poisoned state share quota.mu; that mutex is
+// NEVER held across the send or response-body lifetime.
+type apiKeyModelRequestReservation struct {
+	quota       *apiKeyModelRequestQuota
+	receipt     *database.APIKeyModelRequestReceipt
+	wasAdmitted bool
+	finished    bool
+	err         error
+}
+
+func safePreflightQuotaStorageFailure(ctx context.Context) error {
+	if safe := safePreflightFromContext(ctx); safe != nil {
+		safe.localError()
+	}
+	// Fixed diagnostics only: not the DB error, SQL, key, model or receipt.
+	log.Print("[safe-preflight] model request quota storage failure; dispatch stopped")
+	return &apiKeyModelRequestQuotaError{http.StatusServiceUnavailable,
+		api.NewAPIError(api.ErrCodeServiceUnavailable, "Model request quota storage is unavailable; please retry later", api.ErrorTypeServer)}
+}
+
+// Legacy callers keep the exported Consume API and its conservative charge.
+// Only the safe executor obtains a release capability, BEFORE possible sending.
+func reserveAPIKeyModelRequestQuota(ctx context.Context, model string) (*apiKeyModelRequestReservation, error) {
+	if safePreflightFromContext(ctx) == nil {
+		return nil, ConsumeAPIKeyModelRequestQuota(ctx, model)
+	}
+	state, _ := ctx.Value(apiKeyModelRequestContextKey{}).(*apiKeyModelRequestQuota)
+	if state == nil || state.keyID <= 0 || (state.db == nil && len(state.rules) == 0) {
+		return nil, nil
+	}
+	state.mu.Lock()
+	if state.poisoned || state.active != nil || state.db == nil {
+		state.poisoned = true
+		state.mu.Unlock()
+		return nil, safePreflightQuotaStorageFailure(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		state.mu.Unlock()
+		return nil, err
+	}
+	quotaCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	receipt, hit, err := state.db.ReserveAPIKeyModelRequest(quotaCtx, state.keyID, state.requestID, strings.TrimSpace(model), state.rules, time.Now())
+	// The charge transaction and its context end before any network operation.
+	cancel()
+	if err != nil {
+		state.poisoned = true
+		state.mu.Unlock()
+		return nil, safePreflightQuotaStorageFailure(ctx)
+	}
+	if hit != nil {
+		state.mu.Unlock()
+		return nil, &apiKeyModelRequestQuotaError{http.StatusTooManyRequests,
+			api.NewAPIErrorWithDetails(api.ErrCodeRateLimitReached,
+				fmt.Sprintf("API key weekly model request limit reached for %q (%d/%d)", hit.Model, hit.Used, hit.Limit),
+				api.ErrorTypeRateLimit, hit.APIKeyModelRequestUsage)}
+	}
+	reservation := &apiKeyModelRequestReservation{quota: state, receipt: receipt, wasAdmitted: state.admitted}
+	state.active, state.admitted = reservation, true
+	state.mu.Unlock()
+	if keepalive := continuousRetryKeepaliveForContext(ctx); keepalive != nil {
+		keepalive.Activate()
+	}
+	return reservation, nil
+}
+
+// sent is an immutable observation made by THIS executor before it returns,
+// never a later body.Close read of resettable request-level attempt state.
+// Only a proven no-send releases; arbitrary errors and 499 do not authorize it.
+func (r *apiKeyModelRequestReservation) finish(ctx context.Context, sent bool) error {
+	if r == nil {
+		return nil
+	}
+	state := r.quota
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if r.finished {
+		return r.err
+	}
+	r.finished = true
+	if state.active != r {
+		state.poisoned = true
+		r.err = safePreflightQuotaStorageFailure(ctx)
+		return r.err
+	}
+	var err error
+	if sent {
+		err = r.receipt.Retain()
+	} else {
+		// Cancellation cannot strand a proven local no-send reservation. This
+		// independent cleanup is bounded, synchronous, and joined by executor.
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err = r.receipt.ReleaseUnsent(cleanupCtx)
+		cancel()
+		if err == nil {
+			state.admitted = r.wasAdmitted
+		}
+	}
+	state.active = nil
+	if err != nil || state.poisoned {
+		state.poisoned = true
+		r.err = safePreflightQuotaStorageFailure(ctx)
+	}
+	return r.err
 }
 
 // Keep retry heartbeats from committing HTTP 200 before the first quota
