@@ -5837,6 +5837,8 @@
       },
       "allowLive": "Allow ChatGPT Live",
       "allowLiveHint": "Allows /v1/live and Codex realtime/calls and uses long-lived concurrency.",
+      "externalScheduler": "External scheduler mode",
+      "externalSchedulerHint": "An external scheduler picks accounts: every request must name one in the X-Codex2API-Account-ID header, and the gateway runs it only there, with no failover, no retries, and no cooldown or concurrency rejections. Supports /v1/responses (HTTP/SSE), /v1/chat/completions and /v1/messages for now; other execution endpoints are refused.",
       "rpm": "Requests per minute",
       "rpmSuffix": "/min",
       "rpd": "Requests per day",

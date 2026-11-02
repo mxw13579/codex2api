@@ -5836,6 +5836,8 @@
       },
       "allowLive": "允许 ChatGPT Live",
       "allowLiveHint": "允许调用 /v1/live 与 Codex realtime/calls，占用长会话并发。",
+      "externalScheduler": "外部调度模式",
+      "externalSchedulerHint": "由外部调度器选号：每个请求必须用 X-Codex2API-Account-ID 请求头指定账号，网关只在该账号上执行，不换号、不重试，也不因冷却或并发拒绝。目前支持 /v1/responses（HTTP/SSE）、/v1/chat/completions 和 /v1/messages，其余执行端点会被拒绝。",
       "rpm": "每分钟请求",
       "rpmSuffix": "/min",
       "rpd": "每天请求",

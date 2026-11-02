@@ -76,6 +76,11 @@ func overflowCompactSummaryInputBytes() int {
 // limits.auto_compact_overflow 任一开启即生效。内部摘要调用通过显式上下文标记
 // 阻断递归，不能再依赖“没有 Key 身份”这一偶然副作用。
 func autoCompactOverflowEnabled(c *gin.Context) bool {
+	// The summary call is scheduled internally; a pinned request must not leave
+	// its account, so the context overflow error goes to the external scheduler.
+	if _, pinned := pinnedAccountIDFromContext(c); pinned {
+		return false
+	}
 	if c != nil {
 		if disabled, exists := c.Get(contextDisableOverflowAutoCompact); exists {
 			if value, ok := disabled.(bool); ok && value {

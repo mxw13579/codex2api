@@ -1900,6 +1900,10 @@ type APIKeyLimits struct {
 	// 与上面的 Cost/Token 限额不同，它只统计该 Key 打到对应 scope 的用量，超额后默认
 	// 把该 scope 的账号从候选池剔除（自动落到其它分组），详见 APIKeyScopeLimit。
 	ScopeLimits []APIKeyScopeLimit `json:"scope_limits,omitempty"`
+	// ExternalScheduler 为 true 时，该 Key 由外部调度器管理（issue #831）：每个执行请求
+	// 必须用 X-Codex2API-Account-ID 指定账号，网关只在该账号上执行，不做内部选号、
+	// 换号或重试，也不以冷却 / 并发 / 自动暂停等内部调度判断拒绝请求。默认关闭。
+	ExternalScheduler bool `json:"external_scheduler,omitempty"`
 }
 
 // 图片工具策略取值。
@@ -1980,6 +1984,7 @@ func (l APIKeyLimits) IsZero() bool {
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
 		!l.AllowLive &&
+		!l.ExternalScheduler &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
 		l.ResolveUpstreamChannel() == UpstreamChannelAuto
 }

@@ -126,6 +126,21 @@ func TestAPIKeyLimitsIsZeroCoversNoAffinityGroups(t *testing.T) {
 	}
 }
 
+// A dropped flag would turn an external scheduler key back into an internally
+// scheduled one, both when persisting and in the slim runtime auth cache.
+func TestAPIKeyLimitsIsZeroCoversExternalScheduler(t *testing.T) {
+	limits := APIKeyLimits{ExternalScheduler: true}
+	if limits.IsZero() {
+		t.Fatal("external_scheduler must keep API key limits out of the empty-limits short circuit")
+	}
+	if encoded := encodeAPIKeyLimits(limits); encoded == "{}" {
+		t.Fatalf("encoded limits = %q, want external_scheduler persisted", encoded)
+	}
+	if row := (&APIKeyRow{Enabled: true, Limits: limits}); !row.HasAccessConstraints() {
+		t.Fatal("external scheduler keys must not use the slim runtime auth cache, which drops limits")
+	}
+}
+
 func TestAPIKeyScopeExhaustionDescribeKeepsTinyBudgetsReadable(t *testing.T) {
 	hit := APIKeyScopeExhaustion{Window: "1d", Metric: "cost", Used: 0.0003875, Limit: 0.00005}
 	msg := hit.Describe(`group "111"`)

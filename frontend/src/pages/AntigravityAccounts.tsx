@@ -91,6 +91,11 @@ import {
   isLargePoolSortDisabled,
   resolveDisabledAccountSorts,
 } from "../lib/accountListSort";
+import {
+  readAntigravityAccountSort,
+  writeAntigravityAccountSort,
+  type AntigravityAccountSortKey,
+} from "../lib/antigravityAccountSort";
 import { accountLabel, isAntigravityAPIKeyAccount } from "../lib/antigravityQuota";
 import { cn } from "@/lib/utils";
 import { getErrorMessage } from "../utils/error";
@@ -112,7 +117,7 @@ import { AntigravityProviderPanel } from "./antigravity/AntigravityStatePanel";
 
 type StatusFilter = "all" | "active" | "rate_limited" | "abnormal" | "disabled" | "locked";
 type AuthFilter = "all" | "oauth" | "api_key";
-type SortKey = "updated_at" | "usage" | "today" | "requests" | "created_at" | "group";
+type SortKey = AntigravityAccountSortKey;
 type SortDir = "asc" | "desc";
 type BatchOperation = "sync" | "test" | "delete" | "update" | "reset" | "clean" | "quota-clear";
 
@@ -124,6 +129,7 @@ const SORT_DEFAULT_DIR: Record<SortKey, SortDir> = {
   requests: "desc",
   created_at: "desc",
   group: "asc",
+  id: "desc",
 };
 
 // 列配置 v2:项目与权限合并成"订阅与权限"一列并新增今日/请求列,换新 key 避免旧配置错位。
@@ -200,8 +206,14 @@ function AntigravityAccounts({
   const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
-  const [sortKey, setSortKey] = useState<SortKey>(DEFAULT_SORT);
-  const [sortDir, setSortDir] = useState<SortDir>(SORT_DEFAULT_DIR[DEFAULT_SORT]);
+  // 排序按标签页记住（sessionStorage），与 Codex 账号页一致：切换菜单再回来不丢，新标签页恢复默认。
+  const [initialSort] = useState(readAntigravityAccountSort);
+  const [sortKey, setSortKey] = useState<SortKey>(initialSort?.key ?? DEFAULT_SORT);
+  const [sortDir, setSortDir] = useState<SortDir>(initialSort?.dir ?? SORT_DEFAULT_DIR[DEFAULT_SORT]);
+  useEffect(() => {
+    const isDefault = sortKey === DEFAULT_SORT && sortDir === SORT_DEFAULT_DIR[DEFAULT_SORT];
+    writeAntigravityAccountSort(isDefault ? null : { key: sortKey, dir: sortDir });
+  }, [sortKey, sortDir]);
   const [showFilters, setShowFilters] = useState(false);
   const [pageStats, setPageStats] = useState<Record<string, AccountPageStatsItem>>({});
   const [healthBars, setHealthBars] = useState<Record<string, AccountHealthBucket[]>>({});
@@ -1091,6 +1103,7 @@ function AntigravityAccounts({
     { value: "today", label: t("antigravity.sortToday") },
     { value: "requests", label: t("antigravity.sortRequests") },
     { value: "created_at", label: t("accounts.importTime") },
+    { value: "id", label: t("accounts.idColumn") },
     { value: "group", label: t("antigravity.sortGroup") },
   ];
   const sortLabel = sortOptions.find((option) => option.value === sortKey)?.label ?? sortKey;
@@ -1399,6 +1412,7 @@ function AntigravityAccounts({
                 title={t("accounts.columnSettings")}
                 resetTitle={t("accounts.columnReset")}
                 labels={{
+                  id: t("accounts.idColumn"),
                   tier: t("antigravity.columnTier"),
                   quota: t("antigravity.columnQuota"),
                   proxy: t("accounts.proxyColumn"),
@@ -1672,6 +1686,7 @@ function AntigravityAccounts({
                         />
                       </TableHead>
                       <TableHead className="w-12 text-[13px] font-semibold">{t("accounts.sequence")}</TableHead>
+                      {visibleColumns.id ? renderSortHead("id", t("accounts.idColumn")) : null}
                       <TableHead className="text-[13px] font-semibold">{t("antigravity.columnAccount")}</TableHead>
                       {visibleColumns.tier ? (
                         <TableHead className="text-[13px] font-semibold">{t("antigravity.columnTier")}</TableHead>

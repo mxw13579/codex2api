@@ -458,6 +458,10 @@ func accountFilterForResponsesWebSocket(model string) auth.AccountFilter {
 }
 
 func accountFilterForModel(model string) auth.AccountFilter {
+	return accountFilterForModelWithGate(model, enforceModelRateLimits)
+}
+
+func accountFilterForModelWithGate(model string, gate modelRateLimitGate) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
 		if account == nil {
@@ -469,7 +473,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 		if account.IsRelayStyle() {
 			return false
 		}
-		if model != "" && account.IsModelRateLimited(model) {
+		if gate.blocks(account, model) {
 			return false
 		}
 		if !account.SupportsCodexModel(model) {
@@ -495,6 +499,10 @@ func requestUpstreamChannel(c *gin.Context) string {
 // 保留既有端点能力约束很重要：compact / Messages / Chat 等路径可能显式排除
 // 某类账号，渠道选择不能把这些硬门覆盖掉。
 func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel string, filter auth.AccountFilter) auth.AccountFilter {
+	return h.applyUpstreamChannelFilterWithGate(c, effectiveModel, filter, enforceModelRateLimits)
+}
+
+func (h *Handler) applyUpstreamChannelFilterWithGate(c *gin.Context, effectiveModel string, filter auth.AccountFilter, gate modelRateLimitGate) auth.AccountFilter {
 	combine := func(channelFilter auth.AccountFilter) auth.AccountFilter {
 		return func(account *auth.Account) bool {
 			return channelFilter(account) && (filter == nil || filter(account))
@@ -502,11 +510,11 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 	}
 	switch requestUpstreamChannel(c) {
 	case database.UpstreamChannelGrok:
-		return combine(grokChannelAccountFilter(effectiveModel))
+		return combine(grokChannelAccountFilterWithGate(effectiveModel, gate))
 	case database.UpstreamChannelAntigravity:
-		return combine(antigravityChannelAccountFilter(effectiveModel))
+		return combine(antigravityChannelAccountFilterWithGate(effectiveModel, gate))
 	case database.UpstreamChannelClaude:
-		return combine(claudeChannelAccountFilter(effectiveModel))
+		return combine(claudeChannelAccountFilterWithGate(effectiveModel, gate))
 	case database.UpstreamChannelCodex:
 		return func(account *auth.Account) bool {
 			if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() || account.IsClaudeOAuth() {
@@ -519,10 +527,14 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 }
 
 func claudeChannelAccountFilter(model string) auth.AccountFilter {
+	return claudeChannelAccountFilterWithGate(model, enforceModelRateLimits)
+}
+
+func claudeChannelAccountFilterWithGate(model string, gate modelRateLimitGate) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
 		return account != nil && account.IsClaudeOAuth() &&
-			!account.IsModelRateLimited(model) && claudeAccountSupportsModel(account, model)
+			!gate.blocks(account, model) && claudeAccountSupportsModel(account, model)
 	}
 }
 
@@ -538,6 +550,10 @@ func excludeClaudeAccountsFilter(filter auth.AccountFilter) auth.AccountFilter {
 // mapping 先行。账号写了模型列表时，只调度列表里的模型；列表为空时用可见目录，
 // 还没同步目录时用默认模型列表。
 func grokChannelAccountFilter(model string) auth.AccountFilter {
+	return grokChannelAccountFilterWithGate(model, enforceModelRateLimits)
+}
+
+func grokChannelAccountFilterWithGate(model string, gate modelRateLimitGate) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
 		if account == nil || !account.IsGrokAPI() {
@@ -547,7 +563,7 @@ func grokChannelAccountFilter(model string) auth.AccountFilter {
 		if mappedModel, ok := resolveAccountModelMapping(account, model); ok && mappedModel != "" {
 			routedModel = mappedModel
 		}
-		if routedModel != "" && account.IsModelRateLimited(routedModel) {
+		if gate.blocks(account, routedModel) {
 			return false
 		}
 		return grokAccountSupportsVisibleModel(account, routedModel)
@@ -555,6 +571,10 @@ func grokChannelAccountFilter(model string) auth.AccountFilter {
 }
 
 func antigravityChannelAccountFilter(model string) auth.AccountFilter {
+	return antigravityChannelAccountFilterWithGate(model, enforceModelRateLimits)
+}
+
+func antigravityChannelAccountFilterWithGate(model string, gate modelRateLimitGate) auth.AccountFilter {
 	model = strings.TrimSpace(model)
 	return func(account *auth.Account) bool {
 		if account == nil || !account.IsAntigravityAPI() || !account.AntigravityDispatchEnabled() {
@@ -564,7 +584,7 @@ func antigravityChannelAccountFilter(model string) auth.AccountFilter {
 		if !supported {
 			return false
 		}
-		if antigravityAccountModelRateLimited(account, model, wireModel) {
+		if gate.blocksAntigravity(account, model, wireModel) {
 			return false
 		}
 		return true
@@ -576,7 +596,11 @@ func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.
 }
 
 func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
-	return accountFilterForResponsesModelCandidates([]string{originalModel, effectiveModel}, effectiveModel, allowCodexAccounts)
+	return accountFilterForResponsesModelWithGate(originalModel, effectiveModel, allowCodexAccounts, enforceModelRateLimits)
+}
+
+func accountFilterForResponsesModelWithGate(originalModel string, effectiveModel string, allowCodexAccounts bool, gate modelRateLimitGate) auth.AccountFilter {
+	return accountFilterForResponsesModelCandidates([]string{originalModel, effectiveModel}, effectiveModel, allowCodexAccounts, gate)
 }
 
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
@@ -589,11 +613,15 @@ func accountFilterForCompactResponsesModelWithOriginal(originalModel string, eff
 }
 
 func accountFilterForInlineCompactionModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	return accountFilterForInlineCompactionModelWithGate(originalModel, effectiveModel, allowCodexAccounts, enforceModelRateLimits)
+}
+
+func accountFilterForInlineCompactionModelWithGate(originalModel string, effectiveModel string, allowCodexAccounts bool, gate modelRateLimitGate) auth.AccountFilter {
 	candidates := compactMappingCandidates(originalModel, effectiveModel)
 	resolveMapping := func(account *auth.Account) (string, bool) {
 		return resolveAccountCompactModelMappingForCandidates(account, candidates)
 	}
-	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, resolveMapping)
+	inner := accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, resolveMapping, gate)
 	return func(account *auth.Account) bool {
 		if account == nil || account.IsAntigravityAPI() || account.IsClaudeOAuth() || !inner(account) {
 			return false
@@ -610,15 +638,15 @@ func accountFilterForInlineCompactionModelWithOriginal(originalModel string, eff
 	}
 }
 
-func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool, gate modelRateLimitGate) auth.AccountFilter {
 	return accountFilterForResponsesModelResolver(effectiveModel, allowCodexAccounts, func(account *auth.Account) (string, bool) {
 		return resolveAccountModelMappingForCandidates(account, modelCandidates...)
-	})
+	}, gate)
 }
 
-func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAccounts bool, resolveMapping func(*auth.Account) (string, bool)) auth.AccountFilter {
+func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAccounts bool, resolveMapping func(*auth.Account) (string, bool), gate modelRateLimitGate) auth.AccountFilter {
 	effectiveModel = strings.TrimSpace(effectiveModel)
-	codexFilter := accountFilterForModel(effectiveModel)
+	codexFilter := accountFilterForModelWithGate(effectiveModel, gate)
 	return func(account *auth.Account) bool {
 		if account == nil {
 			return false
@@ -628,7 +656,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 				return false
 			}
 			wireModel, supported := antigravityResolvePublicModelForAccount(account, effectiveModel)
-			return supported && !antigravityAccountModelRateLimited(account, effectiveModel, wireModel)
+			return supported && !gate.blocksAntigravity(account, effectiveModel, wireModel)
 		}
 		if account.IsRelayStyle() {
 			routedModel := effectiveModel
@@ -636,8 +664,7 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 				routedModel = mappedModel
 			}
 			supported := relayAccountSupportsModel(account, routedModel)
-			rateLimited := routedModel != "" && account.IsModelRateLimited(routedModel)
-			return supported && !rateLimited
+			return supported && !gate.blocks(account, routedModel)
 		}
 		if !allowCodexAccounts {
 			return false
@@ -3474,6 +3501,10 @@ func (h *Handler) authMiddlewareWithQuotaRead(allowQuotaRead bool) gin.HandlerFu
 		c.Set(contextAPIKeyName, strings.TrimSpace(apiKeyRow.Name))
 		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
 		c.Set(contextAPIKeyRow, apiKeyRow)
+		if rejectExternalSchedulerIngress(c, apiKeyRow) {
+			c.Abort()
+			return
+		}
 		h.attachAPIKeyModelRequestQuota(c, false)
 		c.Set("apiKey", key)
 		if h.enforceRequiredNewAPIIdentityAtIngress(c) {
@@ -4164,13 +4195,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
-	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	pin := pinnedAccountDispatchForRequest(c)
+	continuousRetryPolicy := pin.continuousRetryPolicy(continuousRetryPolicyForCall(nil))
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 	safePreflightSettings.ContinuousRetryPolicy = continuousRetryPolicy
-	safePreflightPrepared := safePreflightOriginalBody && h.safePreflightPrepared(c, rawBody, isStream, safePreflightSettings)
+	// External schedulers own retries and admission; never activate the local
+	// safe-preflight path for a request pinned by one.
+	safePreflightPrepared := pin == nil && safePreflightOriginalBody && h.safePreflightPrepared(c, rawBody, isStream, safePreflightSettings)
 	turnContinuation := codexTurnContinuationToken(c.Request.Header, rawBody) != ""
 	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
 	turnContinuationPinned := turnContinuation && turnHasBinding
@@ -4249,21 +4283,30 @@ func (h *Handler) Responses(c *gin.Context) {
 		defer releaseAPIKeyConcurrency()
 	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	// A pinned request keeps only capability checks; cooldowns and pool
+	// routing belong to the external scheduler.
+	rateLimitGate := modelRateLimitGateFor(pin)
 	var accountFilter auth.AccountFilter
 	if nativeRemoteCompactionV2 {
-		accountFilter = accountFilterForInlineCompactionModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+		accountFilter = accountFilterForInlineCompactionModelWithGate(logModel, effectiveModel, allowCodexAccounts, rateLimitGate)
 	} else {
-		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
+		accountFilter = accountFilterForResponsesModelWithGate(logModel, effectiveModel, allowCodexAccounts, rateLimitGate)
 	}
-	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
+	if pin == nil {
+		accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
+	}
 	if continuationUnavailable {
 		accountFilter = responsesContinuationRelayFilter(accountFilter)
 	}
 	accountFilter = nativeWSReplayAccountFilter(accountFilter, searchReplay)
-	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = h.applyUpstreamChannelFilterWithGate(c, effectiveModel, accountFilter, rateLimitGate)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
-	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
-	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	if pin != nil {
+		accountFilter = daybreakAccountFilter(c, accountFilter)
+	} else {
+		accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+		accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	}
 	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
 	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
@@ -4284,8 +4327,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	activateContinuousRetryKeepalive(c.Request.Context())
 
 	// 3. 带重试的上游请求
-	maxRetries := h.getMaxRetries()
-	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	maxRetries := pin.retryLimit(h.getMaxRetries())
+	maxRateLimitRetries := pin.retryLimit(h.getMaxRateLimitRetries())
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
@@ -4350,7 +4393,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback && safePreflight.pinnedAccount() != 0 {
+		if !retainedHTTPFallback && pin != nil {
+			// stickyProxyURL stays empty: the account's own proxy policy picks the route.
+			affinityGuard = auth.SessionAffinityGuard{}
+			account = pin.next(c, h.store, accountFilter, retryExclusions)
+		} else if !retainedHTTPFallback && safePreflight.pinnedAccount() != 0 {
 			// Keep the original affinity guard; acquire a new ordinary lease.
 			account = h.store.TakePreferredAccountWithDispatch(safePreflight.pinnedAccount(), apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			if account != nil {
@@ -4373,6 +4420,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 		if account == nil {
+			if pin != nil {
+				pin.writeFailure(c, continuousRetryProtocolResponses, isStream)
+				return
+			}
 			if safePreflight != nil {
 				status := lastStatusCode
 				if status == 0 {
@@ -4494,10 +4545,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			resetOpenAIResponsesBody()
 		}
 		h.AcquireAPIKeyScopeConcurrency(c, account)
-		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
+		attemptMaxRateLimitRetries := pin.retryLimit(h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		// Pinned requests never read session affinity, so they do not write it.
+		if pin == nil && !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
 			if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 				h.store.Release(account)
 				return
@@ -4706,6 +4758,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
 				rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 				resp.Body.Close()
+				markPinnedUpstreamResponse(c, resp)
 				if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 					h.store.Release(account)
 					return
@@ -5544,6 +5597,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
+			markPinnedUpstreamResponse(c, resp)
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 				h.store.Release(account)
 				return
@@ -6524,6 +6578,13 @@ func (h *Handler) Responses(c *gin.Context) {
 
 // ResponsesCompact 处理 /v1/responses/compact 请求（非流式压缩接口，透传到上游 /responses/compact）
 func (h *Handler) ResponsesCompact(c *gin.Context) {
+	// /v1/responses can hand body-signal compaction over to this handler, which
+	// has no pinned-account path yet. Refuse instead of scheduling internally.
+	if _, pinned := pinnedAccountIDFromContext(c); pinned {
+		writeExternalSchedulerIngressError(c, "", http.StatusForbidden, "external_scheduler_endpoint_unsupported",
+			"Remote compaction does not support pinned accounts yet, so external scheduler API keys cannot use it")
+		return
+	}
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -7483,7 +7544,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
-	continuousRetryPolicy := continuousRetryPolicyForCall(nil)
+	pin := pinnedAccountDispatchForRequest(c)
+	continuousRetryPolicy := pin.continuousRetryPolicy(continuousRetryPolicyForCall(nil))
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
@@ -7514,11 +7576,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	// /v1/chat/completions 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发（issue #181）。
-	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
-	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	// A pinned request keeps only capability checks; cooldowns and pool
+	// routing belong to the external scheduler.
+	rateLimitGate := modelRateLimitGateFor(pin)
+	accountFilter := accountFilterForResponsesModelWithGate(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)), rateLimitGate)
+	if pin == nil {
+		accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
+	}
+	accountFilter = h.applyUpstreamChannelFilterWithGate(c, effectiveModel, accountFilter, rateLimitGate)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
-	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	if pin != nil {
+		accountFilter = daybreakAccountFilter(c, accountFilter)
+	} else {
+		accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	}
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	stopRetryDeadline := installContinuousRetryHTTPDeadline(c, continuousRetryPolicy, continuousRetryProtocolChat)
@@ -7528,13 +7599,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	activateContinuousRetryKeepalive(c.Request.Context())
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
-	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	if pin == nil {
+		accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
+	}
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
 
 	// 3. 带重试的上游请求
-	maxRetries := h.getMaxRetries()
-	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	maxRetries := pin.retryLimit(h.getMaxRetries())
+	maxRateLimitRetries := pin.retryLimit(h.getMaxRateLimitRetries())
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
@@ -7564,11 +7637,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback {
+		if !retainedHTTPFallback && pin != nil {
+			// stickyProxyURL stays empty: the account's own proxy policy picks the route.
+			affinityGuard = auth.SessionAffinityGuard{}
+			account = pin.next(c, h.store, accountFilter, retryExclusions)
+		} else if !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 		}
 		if account == nil {
+			if pin != nil {
+				pin.writeFailure(c, continuousRetryProtocolChat, isStream)
+				return
+			}
 			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolChat) {
 				return
 			}
@@ -7616,10 +7697,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
-		attemptMaxRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
+		attemptMaxRateLimitRetries := pin.retryLimit(h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
-		if !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
+		// Pinned requests never read session affinity, so they do not write it.
+		if pin == nil && !retainedHTTPFallback && !continuousRetryBuffersAttempts(continuousRetryPolicy) {
 			if !bindContinuousRetrySessionAffinityWithGuard(c.Request.Context(), h.store, affinityKey, account, proxyURL, affinityGuard) {
 				h.store.Release(account)
 				return
@@ -7834,6 +7916,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
+			markPinnedUpstreamResponse(c, resp)
 			if continuousRetryCommitExpired(c, continuousRetryProtocolChat) {
 				h.store.Release(account)
 				return

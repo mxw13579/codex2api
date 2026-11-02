@@ -49,7 +49,7 @@ import {
 } from "./AntigravityStatePanel";
 
 export const ANTIGRAVITY_TABLE_COLUMNS = [
-  "tier", "quota", "proxy", "status", "today", "requests", "updatedAt",
+  "id", "tier", "quota", "proxy", "status", "today", "requests", "updatedAt",
 ] as const;
 
 export type AntigravityTableColumn = (typeof ANTIGRAVITY_TABLE_COLUMNS)[number];
@@ -457,6 +457,9 @@ export const AntigravityAccountRow = memo(function AntigravityAccountRow(props: 
       <TableCell className="font-mono text-[13px] text-muted-foreground" title={`ID ${account.id}`}>
         {props.sequence}
       </TableCell>
+      {columns.id ? (
+        <TableCell className="font-mono text-[13px] tabular-nums text-muted-foreground">{account.id}</TableCell>
+      ) : null}
       <TableCell className="min-w-[220px]">
         <AccountIdentity
           account={account}
@@ -541,6 +544,9 @@ export const AntigravityAccountCard = memo(function AntigravityAccountCard(props
           />
         </div>
         <span className="shrink-0 font-mono text-[11px] text-muted-foreground">#{props.sequence}</span>
+        {props.columns.id ? (
+          <span className="shrink-0 font-mono text-[11px] text-muted-foreground">ID {account.id}</span>
+        ) : null}
       </div>
       <div className="mt-3 grid grid-cols-1 gap-3 border-t border-border pt-3 text-xs">
         <StatusCell account={account} healthBuckets={props.healthBuckets} />

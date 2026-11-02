@@ -36,4 +36,5 @@ test("large pools disable usage-log sorts from the API or pool size", () => {
   assert.equal(isLargePoolSortDisabled("today", ["requests", "today"]), true);
   assert.equal(isLargePoolSortDisabled("usage", ["requests", "today"]), false);
   assert.equal(isLargePoolSortDisabled("group", ["requests", "today"]), false);
+  assert.equal(isLargePoolSortDisabled("id", ["requests", "today"]), false);
 });

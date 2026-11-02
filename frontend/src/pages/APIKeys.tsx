@@ -141,6 +141,7 @@ interface LimitsFormState {
   tokenLimitDailyUnit: TokenLimitUnit;
   imageGenerationPolicy: ImageGenerationPolicy;
   allowLive: boolean;
+  externalScheduler: boolean;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
   modelRequestLimits: ModelRequestLimitFormState[];
@@ -262,6 +263,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit30dUnit: "token",
   imageGenerationPolicy: "allow",
   allowLive: false,
+  externalScheduler: false,
   upstreamChannel: "auto",
   scopeLimits: [],
   modelRequestLimits: [],
@@ -2286,7 +2288,9 @@ export default function APIKeys() {
               />
             </FormField>
             {supportsChatGPTLive(createForm.limits.upstreamChannel) ? (
-              <AllowLiveField
+              <LimitSwitchField
+                label={t("apiKeys.limits.allowLive")}
+                hint={t("apiKeys.limits.allowLiveHint")}
                 checked={createForm.limits.allowLive}
                 onCheckedChange={(allowLive) =>
                   updateCreateForm({
@@ -2295,6 +2299,16 @@ export default function APIKeys() {
                 }
               />
             ) : null}
+            <LimitSwitchField
+              label={t("apiKeys.limits.externalScheduler")}
+              hint={t("apiKeys.limits.externalSchedulerHint")}
+              checked={createForm.limits.externalScheduler}
+              onCheckedChange={(externalScheduler) =>
+                updateCreateForm({
+                  limits: { ...createForm.limits, externalScheduler },
+                })
+              }
+            />
 
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
@@ -2477,7 +2491,9 @@ export default function APIKeys() {
                     />
                   </FormField>
                   {supportsChatGPTLive(editForm.limits.upstreamChannel) ? (
-                    <AllowLiveField
+                    <LimitSwitchField
+                      label={t("apiKeys.limits.allowLive")}
+                      hint={t("apiKeys.limits.allowLiveHint")}
                       checked={editForm.limits.allowLive}
                       onCheckedChange={(allowLive) =>
                         updateEditForm({
@@ -2486,6 +2502,16 @@ export default function APIKeys() {
                       }
                     />
                   ) : null}
+                  <LimitSwitchField
+                    label={t("apiKeys.limits.externalScheduler")}
+                    hint={t("apiKeys.limits.externalSchedulerHint")}
+                    checked={editForm.limits.externalScheduler}
+                    onCheckedChange={(externalScheduler) =>
+                      updateEditForm({
+                        limits: { ...editForm.limits, externalScheduler },
+                      })
+                    }
+                  />
 
                   <div className="grid gap-4 sm:grid-cols-2">
                     <FormField
@@ -2750,6 +2776,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimitDailyUnit: tokenDaily.unit,
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     allowLive: Boolean(limits.allow_live),
+    externalScheduler: Boolean(limits.external_scheduler),
     upstreamChannel:
       limits.upstream_channel === "codex" ||
       limits.upstream_channel === "grok" ||
@@ -2890,25 +2917,24 @@ function applyUpstreamChannel(
   };
 }
 
-function AllowLiveField({
+function LimitSwitchField({
+  label,
+  hint,
   checked,
   onCheckedChange,
 }: {
+  label: string;
+  hint: string;
   checked: boolean;
   onCheckedChange: (checked: boolean) => void;
 }) {
-  const { t } = useTranslation();
   return (
     <div className="space-y-1.5 rounded-md border border-border/60 px-3 py-2">
       <div className="flex items-center justify-between gap-3">
-        <label className="text-xs font-medium text-foreground">
-          {t("apiKeys.limits.allowLive")}
-        </label>
+        <label className="text-xs font-medium text-foreground">{label}</label>
         <Switch checked={checked} onCheckedChange={onCheckedChange} />
       </div>
-      <p className="text-[10px] text-muted-foreground">
-        {t("apiKeys.limits.allowLiveHint")}
-      </p>
+      <p className="text-[10px] text-muted-foreground">{hint}</p>
     </div>
   );
 }
@@ -2995,6 +3021,7 @@ function limitsFormToPayload(form: LimitsFormState, t: Translator): APIKeyLimits
     disable_image_generation:
       form.imageGenerationPolicy === "block" || undefined,
     allow_live: supportsChatGPTLive(form.upstreamChannel) && form.allowLive,
+    external_scheduler: form.externalScheduler || undefined,
     upstream_channel:
       form.upstreamChannel === "auto" ? undefined : form.upstreamChannel,
     model_request_limits: modelRequestLimitsToPayload(form.modelRequestLimits, t),

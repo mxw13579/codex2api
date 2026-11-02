@@ -3952,6 +3952,8 @@ export interface APIKeyLimits {
   upstream_channel?: UpstreamChannel
   /** 允许该 Key 使用 ChatGPT Live（/v1/live）。新建自动/Codex 渠道 Key 默认开启。 */
   allow_live?: boolean
+  /** 外部调度模式（issue #831）：请求用 X-Codex2API-Account-ID 指定账号，网关不选号、不换号、不重试。 */
+  external_scheduler?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */
   scope_limits?: APIKeyScopeLimit[]
   /** Fixed weekly request budgets shared by models matching each rule. */
