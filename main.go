@@ -57,6 +57,9 @@ func main() {
 		log.Fatalf("加载核心环境配置失败 (请检查 .env 文件): %v", err)
 	}
 	proxy.ConfigureDownstreamKeepaliveFromEnv()
+	if err := startPprofServer(pprofAddrFromEnv()); err != nil {
+		log.Fatalf("pprof 配置无效: %v", err)
+	}
 	log.Printf("物理层配置加载成功: port=%d, database=%s, cache=%s, tz=%s", cfg.Port, cfg.Database.Label(), cfg.Cache.Label(), time.Local)
 
 	// 2. 初始化数据库
@@ -381,6 +384,11 @@ func main() {
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	adminHandler.StartQualityTests(backgroundCtx)
 	defer cancelBackground()
+	usageRetention, err := usageLogRetentionPolicyFromEnv()
+	if err != nil {
+		log.Fatalf("usage_logs 保留配置无效: %v", err)
+	}
+	startUsageLogRetention(backgroundCtx, db, usageRetention)
 	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {
 		log.Fatalf("启动响应缓存设置同步失败")
 	}

@@ -63,6 +63,10 @@
 
 - [统一 attestation 平台规则与 Live 会话](CODEX_ATTESTATION.md)
 
+### 10. 号池部署与代码交接
+
+- [当前发布状态、未上线改动、操作边界与后续工作](POOL_DEPLOYMENT_HANDOFF.md)
+
 ## 快速开始
 
 1. **新用户**: 先阅读主 README.md，然后参考 [DEPLOYMENT.md](DEPLOYMENT.md) 进行部署

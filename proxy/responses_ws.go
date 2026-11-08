@@ -743,6 +743,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
 		// 中转账号自己的 Responses WebSocket 不套用这条 Codex 体积学习。
 		relayUpstreamWS := account.OpenAIResponsesUsesUpstreamWebsocket() && !responsesBodyRequestsImageGeneration(rawBody) && !naturalImageIntent
+		// 加速档走 HTTP 上游（客户端仍是 WS），保证每个请求的 routing hint 与自身档位一致。
+		if useWebsocket && !relayUpstreamWS && !account.IsRelayStyle() && fastTierRequiresHTTP(extractServiceTier(codexBody)) {
+			useWebsocket = false
+		}
 		if useWebsocket && globalWSSizeRouter.PreferHTTP(len(codexBody)) && !relayUpstreamWS {
 			useWebsocket = false
 			if attempt == 0 {

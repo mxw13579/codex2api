@@ -629,6 +629,9 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 			log.Printf("释放 usage_logs 索引构建锁失败: %v", err)
 		}
 	}()
+	if err := ensureUsageLogsBigintID(ctx, conn); err != nil {
+		log.Printf("usage_logs.id 升级 BIGINT 失败（下次启动重试）: %v", err)
+	}
 	for _, index := range []struct{ name, definition string }{
 		{"idx_usage_logs_account_generation_created_at", "(account_id, credential_generation, created_at)"},
 		{"idx_usage_logs_request_id", "(request_id) WHERE request_id <> ''"},
@@ -638,6 +641,65 @@ func (db *DB) ensureUsageLogsGenerationIndex(parent context.Context) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// usageLogsBigintMaxRows 是自动把 usage_logs.id 升级为 BIGINT 的行数上限。ALTER COLUMN TYPE
+// 会持 ACCESS EXCLUSIVE 锁重写整表，大表在线执行会阻塞全部日志写入，只能留给维护窗口。
+const usageLogsBigintMaxRows = 100000
+
+// ensureUsageLogsBigintID 把旧版 SERIAL(INT4) 主键和序列升级为 BIGINT：高并发下每天两千万行，
+// INT4 约百日耗尽，之后所有日志写入失败。只对小表自动执行；大表打印手动步骤后跳过。
+func ensureUsageLogsBigintID(ctx context.Context, conn *sql.Conn) error {
+	var colType, seqType string
+	err := conn.QueryRowContext(ctx, `SELECT c.data_type, COALESCE(s.data_type, '')
+		FROM information_schema.columns c
+		LEFT JOIN information_schema.sequences s
+		  ON s.sequence_schema = c.table_schema AND s.sequence_name = 'usage_logs_id_seq'
+		WHERE c.table_schema = current_schema() AND c.table_name = 'usage_logs' AND c.column_name = 'id'`).Scan(&colType, &seqType)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if colType == "bigint" && (seqType == "" || seqType == "bigint") {
+		return nil
+	}
+	var rows int64
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM (SELECT 1 FROM usage_logs LIMIT $1) t`,
+		usageLogsBigintMaxRows+1).Scan(&rows); err != nil {
+		return err
+	}
+	if rows > usageLogsBigintMaxRows {
+		log.Printf("usage_logs.id 仍为 %s 且超过 %d 行，在线改类型会锁表重写，已跳过。请在维护窗口执行："+
+			"ALTER TABLE usage_logs ALTER COLUMN id TYPE BIGINT; ALTER SEQUENCE usage_logs_id_seq AS BIGINT;",
+			colType, usageLogsBigintMaxRows)
+		return nil
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// 拿不到锁就放弃本次，不排在写入前面阻塞日志落库。
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
+		return err
+	}
+	if colType != "bigint" {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE usage_logs ALTER COLUMN id TYPE BIGINT`); err != nil {
+			return err
+		}
+	}
+	if seqType != "" && seqType != "bigint" {
+		if _, err := tx.ExecContext(ctx, `ALTER SEQUENCE usage_logs_id_seq AS BIGINT`); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	log.Printf("usage_logs.id 已升级为 BIGINT（原 %s，%d 行）", colType, rows)
 	return nil
 }
 
@@ -1225,7 +1287,7 @@ func (db *DB) migrate(ctx context.Context) error {
 
 
 	CREATE TABLE IF NOT EXISTS usage_logs (
-		id             SERIAL PRIMARY KEY,
+		id             BIGSERIAL PRIMARY KEY,
 		account_id     INT DEFAULT 0,
 		endpoint       VARCHAR(100) DEFAULT '',
 		model          VARCHAR(100) DEFAULT '',

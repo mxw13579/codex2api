@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"hash/fnv"
+	"log"
 	"math"
 	"sort"
 	"strconv"
@@ -153,6 +154,11 @@ type SelectionOptions struct {
 	Provider string // 例如 database.UpstreamChannelAntigravity；空表示不指定/通用
 	Model    string // public model
 	Policy   DispatchPolicy
+	// AffinityOverflowWait > 0 时，会话绑定账号并发满先排队等绑定账号最多这么久，
+	// 等不到才借用其它账号。借号必然让该请求的上游 prompt cache 未命中。
+	AffinityOverflowWait time.Duration
+	// noAffinityOverflow 仅供上面的等待路径内部使用：绑定账号满时返回 nil，不借号。
+	noAffinityOverflow bool
 }
 
 // schedulerModeRoundRobin 是加权避险唯一生效的调度模式；remaining_quota / fill_first
@@ -340,6 +346,26 @@ func (s *Store) selectAntigravityBalancedAccount(key string, apiKeyID int64, exc
 // 供 proxy 在已知请求渠道 / public model 时调用，使 Antigravity 首绑与 Fresh 重选走加权
 // 避险。非 Antigravity 渠道或未开启时与 NextForSessionWithDispatchGuard 行为完全一致。
 func (s *Store) NextForSessionWithDispatchGuardForProvider(opts SelectionOptions, key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string, SessionAffinityGuard) {
+	acc, proxyURL, guard := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, opts)
+	wait := opts.AffinityOverflowWait
+	if acc == nil || guard.preserveAccountID == 0 || wait <= 0 {
+		return acc, proxyURL, guard
+	}
+	// 绑定账号只是瞬时满：先归还借到的槽位，短暂排队等绑定账号，保住上游缓存。
+	boundID, borrowedID := guard.preserveAccountID, acc.DBID
+	s.Release(acc)
+	waitOpts := opts
+	waitOpts.AffinityOverflowWait = 0
+	waitOpts.noAffinityOverflow = true
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), wait)
+	got, gotProxy, gotGuard, _ := s.waitForSessionAvailableWithFilter(ctx, key, wait, apiKeyID, exclude, filter, false, waitOpts)
+	cancel()
+	if got != nil {
+		log.Printf("会话粘性等待命中: 绑定账号=%d 等待=%s 选中账号=%d", boundID, time.Since(started).Round(time.Millisecond), got.DBID)
+		return got, gotProxy, gotGuard
+	}
+	log.Printf("会话粘性等待超时: 绑定账号=%d 等待=%s，改为借号(原借用账号=%d)", boundID, time.Since(started).Round(time.Millisecond), borrowedID)
 	return s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, opts)
 }
 

@@ -7825,6 +7825,9 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
+				if opts.noAffinityOverflow {
+					return nil, "", SessionAffinityGuard{}
+				}
 				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}
@@ -7864,6 +7867,9 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 				return nil, "", SessionAffinityGuard{}
 			}
 			if capacityFull {
+				if opts.noAffinityOverflow {
+					return nil, "", SessionAffinityGuard{}
+				}
 				fallback := s.nextAccountForFreshAffinityWithDispatch(key, apiKeyID, exclude, filter, opts)
 				if fallback == nil {
 					return nil, "", SessionAffinityGuard{}

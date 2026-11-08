@@ -91,6 +91,17 @@ var (
 			LongInputPricePerMToken:     4.0,
 			LongOutputPricePerMToken:    15.0,
 			LongCacheReadPricePerMToken: 0.2,
+			UltrafastMultiplier:         6.0,
+		}},
+		// gpt-6.1-terra：$1/$5、缓存读取 $0.05、缓存写入 $1.25，无长上下文加价；
+		// Ultrafast 档按 standard 价 6× 计费。独立规范键，不能落入 Astra 兜底。
+		{model: "gpt-6.1-terra", pricing: ModelPricing{
+			InputPricePerMToken:        1.0,
+			OutputPricePerMToken:       5.0,
+			CacheReadPricePerMToken:    0.05,
+			CacheWrite5mPricePerMToken: 1.25,
+			CacheWrite1hPricePerMToken: 1.25,
+			UltrafastMultiplier:        6.0,
 		}},
 		{model: "gpt-6-luna", pricing: ModelPricing{
 			InputPricePerMToken:         0.1,
@@ -544,6 +555,8 @@ func normalizeCodexBillingModel(model string) (string, bool) {
 		return "gpt-6-sol", true
 	case strings.HasPrefix(compact, "gpt-6.1-sol") || strings.HasPrefix(compact, "gpt6.1-sol"):
 		return "gpt-6.1-sol", true
+	case strings.HasPrefix(compact, "gpt-6.1-terra") || strings.HasPrefix(compact, "gpt6.1-terra"):
+		return "gpt-6.1-terra", true
 	case strings.HasPrefix(compact, "gpt-6-luna") || strings.HasPrefix(compact, "gpt6-luna"):
 		return "gpt-6-luna", true
 	// 未知 gpt-6 变体按 astra 兜底，避免掉进 $1/$2 的默认价严重低估。

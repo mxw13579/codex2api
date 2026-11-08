@@ -181,16 +181,21 @@ def compose_config(state, root):
                              "networks": state["networks"], "volumes": state["volumes"]})
 
 
+# 入口连接上限显式写入前端与后端：fullconn 默认只取前端 maxconn 的 10%，
+# 不写明时统计页显示 2000，容易被误判为后端只能承载 2000 条连接。
+PROXY_MAXCONN = 20000
+
+
 def haproxy_config(state, active=None):
     active = active or state["active"]
-    lines = ["global", "    maxconn 20000", "    stats socket /run/haproxy/admin.sock mode 600 level admin",
+    lines = ["global", f"    maxconn {PROXY_MAXCONN}", "    stats socket /run/haproxy/admin.sock mode 600 level admin",
              "defaults", "    mode http", "    timeout connect 5s", "    timeout client 1h",
              "    timeout server 1h", "    timeout tunnel 24h", "    timeout http-request 60s",
              "    timeout http-keep-alive 60s", "    retries 0", "    option http-server-close",
              "resolvers docker", "    nameserver dns 127.0.0.11:53", "    resolve_retries 3",
              "    timeout resolve 1s", "    timeout retry 1s", "    hold valid 5s", "    hold nx 1s",
-             "frontend public", "    bind :8080", "    default_backend app",
-             "    option forwardfor", "backend app", "    option httpchk GET /health",
+             "frontend public", "    bind :8080", f"    maxconn {PROXY_MAXCONN}", "    default_backend app",
+             "    option forwardfor", "backend app", f"    fullconn {PROXY_MAXCONN}", "    option httpchk GET /health",
              "    http-check expect status 200"]
     for slot in SLOTS:
         disabled = "" if slot == active else " disabled"

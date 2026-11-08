@@ -299,6 +299,14 @@ class SnapshotTests(IsolatedReleaseTest):
         self.assertFalse(server_lines[0].endswith(" disabled"))
         self.assertTrue(server_lines[1].endswith(" disabled"))
 
+    def test_proxy_connection_limits_are_explicit_on_frontend_and_backend(self):
+        lines = [line.strip() for line in release.haproxy_config(self.app.state).splitlines()]
+        limit = f"maxconn {release.PROXY_MAXCONN}"
+        frontend, backend = lines.index("frontend public"), lines.index("backend app")
+        self.assertIn(limit, lines[:lines.index("defaults")])
+        self.assertIn(limit, lines[frontend:backend])
+        self.assertIn(f"fullconn {release.PROXY_MAXCONN}", lines[backend:])
+
     def test_internal_port_uses_documented_port_fallback_when_codex_port_is_absent(self):
         source = source_inspect()
         source["Config"]["Env"] = [

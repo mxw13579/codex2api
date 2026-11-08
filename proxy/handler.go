@@ -150,9 +150,10 @@ func selectionOptionsForRequestWithProvider(c *gin.Context, model string, policy
 		provider = requestUpstreamChannel(c)
 	}
 	return auth.SelectionOptions{
-		Provider: provider,
-		Model:    strings.TrimSpace(model),
-		Policy:   policy,
+		Provider:             provider,
+		Model:                strings.TrimSpace(model),
+		Policy:               policy,
+		AffinityOverflowWait: affinityOverflowWaitForRequest(c),
 	}
 }
 
@@ -4568,6 +4569,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
+		// 加速档走 HTTP，保证每个请求的 routing hint 与自身档位一致。
+		if useWebsocket && fastTierRequiresHTTP(extractServiceTier(codexBody)) {
+			useWebsocket = false
+		}
 		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。
 		if useWebsocket && globalWSSizeRouter.PreferHTTP(len(codexBody)) {
 			useWebsocket = false
@@ -5860,6 +5865,43 @@ func (h *Handler) Responses(c *gin.Context) {
 				preflightPassthrough = false
 				contEnabled = false // request snapshot excludes hidden rounds
 			}
+			// 透传开启且配置了缓冲窗口：窗口内按透传关闭处理，到期由定时器写出前置帧。
+			// 定时器与 forward 共用 downstreamMu；读循环结束后置 closed，定时器不再写。
+			var preflightDeferTimer *time.Timer
+			preflightDeferClosed := false
+			preflightDeferWindow := time.Duration(0)
+			if preflightPassthrough {
+				if window := preflightPassthroughDeferWindow(); window > 0 {
+					preflightDeferWindow = window
+					preflightPassthrough = false
+				}
+			}
+			flushDeferredPreflight := func() {
+				downstreamMu.Lock()
+				defer downstreamMu.Unlock()
+				if preflightDeferClosed || clientGone || writeErr != nil || contentTokenSeen || gotTerminal ||
+					abortedForHTTPError || len(preContentErrorCandidate) > 0 || pendingFirstTokenEvents.Len() == 0 {
+					return
+				}
+				if c.Request.Context().Err() != nil {
+					clientGone = true
+					return
+				}
+				before := streamWriter.deliveredBytes()
+				err := streamWriter.WriteBytes(pendingFirstTokenEvents.Bytes())
+				pendingFirstTokenEvents.Reset()
+				if err == nil {
+					err = streamWriter.Flush()
+				}
+				if err != nil {
+					writeErr = err
+					clientGone = true
+					return
+				}
+				if streamWriter.deliveredBytes() > before {
+					wroteAnyBody = true
+				}
+			}
 			var rawPreflightFrame safePreflightSSEFrame
 			stagedTurnState := false
 			emptyIncomplete := &emptyIncompleteTracker{}
@@ -6023,6 +6065,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 进不了首包前静默换号/超窗压缩分支。必须写出时改写降载码。
 					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough) ||
 						(!contentTokenSeen && !replayUnsafe && !gotTerminal && isRetryableUpstreamErrorFrame(eventType, data, continuousRetryPolicy))
+					if shouldDefer && preflightDeferWindow > 0 && preflightDeferTimer == nil && !preflightDeferClosed && isCodexPreflightSSEEvent(eventType) {
+						preflightDeferTimer = time.AfterFunc(preflightDeferWindow, flushDeferredPreflight)
+					}
 					if safePreflight != nil {
 						// Only this complete genuine frame may bypass pending lifecycle.
 						// It is HTTP delivery, NOT content or billed output.
@@ -6197,6 +6242,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			} else {
 				readErr = readSSEStreamWithContinuousRetryKeepalive(readCtx, resp.Body, forwardWithEvent)
 			}
+			downstreamMu.Lock()
+			preflightDeferClosed = true
+			if preflightDeferTimer != nil {
+				preflightDeferTimer.Stop()
+			}
+			downstreamMu.Unlock()
 			// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 			// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
 			if writeErr == nil && wroteAnyBody {
@@ -7717,6 +7768,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
+			useWebsocket = false
+		}
+		// 加速档走 HTTP，保证每个请求的 routing hint 与自身档位一致。
+		if useWebsocket && fastTierRequiresHTTP(extractServiceTier(codexBody)) {
 			useWebsocket = false
 		}
 		// 体积达到已学习的 1009 阈值时直接首发 HTTP,跳过 WS 必败等待(issue #404)。

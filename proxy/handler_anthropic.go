@@ -846,6 +846,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			attemptEffectiveModel = logicalRequestModel
 		}
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		// 加速档走 HTTP，保证每个请求的 routing hint 与自身档位一致。
+		if useWebsocket && fastTierRequiresHTTP(serviceTier) {
+			useWebsocket = false
+		}
 		if account.OpenAIResponsesUsesUpstreamWebsocket() && !rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = true
 		}
