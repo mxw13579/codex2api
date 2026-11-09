@@ -1482,12 +1482,18 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 		c.Header("Cache-Control", "no-store")
 		c.Header("Pragma", "no-cache")
 
-		// 成功认证，记录审计日志
-		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
-			security.SecurityAuditLog("ADMIN_ACCESS", fmt.Sprintf("path=%s ip=%s method=%s", c.Request.URL.Path, c.ClientIP(), c.Request.Method))
+		// Record authenticated mutations and sensitive reads, including online updates.
+		mutation := c.Request.Method != http.MethodGet && c.Request.Method != http.MethodHead && c.Request.Method != http.MethodOptions
+		audit := security.IsSensitiveEndpoint(c.Request.URL.Path) || mutation
+		if audit {
+			security.SecurityAuditLog("ADMIN_ACCESS", security.RequestAuditDetails(c))
 		}
 
 		c.Next()
+
+		if mutation {
+			security.SecurityAuditLog("ADMIN_RESULT", fmt.Sprintf("status=%d %s", c.Writer.Status(), security.RequestAuditDetails(c)))
+		}
 	}
 }
 

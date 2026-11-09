@@ -786,10 +786,12 @@ func loggerMiddleware() gin.HandlerFunc {
 			tagStr = " " + strings.Join(tags, " ")
 		}
 
+		clientIP := security.SanitizeLog(c.ClientIP())
+		peerIP := security.SanitizeLog(c.RemoteIP())
 		if emailStr != "" {
-			log.Printf("%s %s %d %v%s [%s] [%s]", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr, emailStr, proxyStr)
+			log.Printf("%s %s %d %v%s ip=%s peer=%s [%s] [%s]", c.Request.Method, security.SanitizeLog(c.Request.URL.Path), statusCode, latency, tagStr, clientIP, peerIP, emailStr, proxyStr)
 		} else {
-			log.Printf("%s %s %d %v%s", c.Request.Method, c.Request.URL.Path, statusCode, latency, tagStr)
+			log.Printf("%s %s %d %v%s ip=%s peer=%s", c.Request.Method, security.SanitizeLog(c.Request.URL.Path), statusCode, latency, tagStr, clientIP, peerIP)
 		}
 	}
 }

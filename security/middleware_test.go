@@ -198,6 +198,7 @@ func TestIsSensitiveEndpoint(t *testing.T) {
 		{"/api/admin/accounts", true},
 		{"/api/admin/keys", true},
 		{"/api/admin/settings", true},
+		{"/api/admin/system/update", true},
 		{"/api/admin/proxies", true},
 		{"/api/admin/stats", false},
 		{"/health", false},

@@ -142,6 +142,9 @@ func TestLoggerMiddlewareRedactsSensitiveContext(t *testing.T) {
 	})
 
 	r := gin.New()
+	if err := configureTrustedProxies(r, []string{"172.18.0.0/16", "10.20.30.2"}); err != nil {
+		t.Fatal(err)
+	}
 	r.Use(loggerMiddleware())
 	r.GET("/probe", func(c *gin.Context) {
 		c.Set("x-account-email", "alice@example.com")
@@ -154,6 +157,8 @@ func TestLoggerMiddlewareRedactsSensitiveContext(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/probe", nil)
+	req.RemoteAddr = "172.18.0.2:12345"
+	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.20.30.2")
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusAccepted {
@@ -166,7 +171,7 @@ func TestLoggerMiddlewareRedactsSensitiveContext(t *testing.T) {
 			t.Fatalf("log output leaked %q: %s", forbidden, got)
 		}
 	}
-	for _, expected := range []string{"GET /probe 202", "gpt-5.5", "effort=medium", "fast"} {
+	for _, expected := range []string{"GET /probe 202", "gpt-5.5", "effort=medium", "fast", "ip=198.51.100.7", "peer=172.18.0.2"} {
 		if !strings.Contains(got, expected) {
 			t.Fatalf("log output missing %q: %s", expected, got)
 		}

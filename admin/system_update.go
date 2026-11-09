@@ -24,6 +24,7 @@ import (
 
 	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -213,6 +214,8 @@ func (u *systemUpdater) unavailableInfo() *systemUpdateInfo {
 func (h *Handler) PerformSystemUpdate(c *gin.Context) {
 	result, err := h.systemUpdater().PerformUpdate(c.Request.Context())
 	if err == nil {
+		security.SecurityAuditLog("SYSTEM_UPDATE_APPLIED", fmt.Sprintf("current_version=%q latest_version=%q restarting=%t %s",
+			result.CurrentVersion, result.LatestVersion, result.Restarting, security.RequestAuditDetails(c)))
 		c.JSON(http.StatusOK, result)
 		return
 	}

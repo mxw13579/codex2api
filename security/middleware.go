@@ -300,6 +300,7 @@ func IsSensitiveEndpoint(path string) bool {
 		"/api/admin/accounts",
 		"/api/admin/keys",
 		"/api/admin/settings",
+		"/api/admin/system/update",
 		"/api/admin/proxies",
 		"/api/admin/prompt-filter/review/keys",
 	}
