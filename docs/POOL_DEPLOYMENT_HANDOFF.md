@@ -1,6 +1,17 @@
 # 号池部署与代码交接（2026-11-08）
 
-## 2026-11-09 发布补记（优先于下文历史快照）
+## 2026-11-09 1.0.16 发布补记（最新）
+
+- 用户明确授权后，从提交 `17968c9989187339e922022183e826f341a88eef` 的干净 Git 归档构建 `muze/codex2api:1.0.16`，通过现有蓝绿工具发布到 **blue**；实际 `/health` 为 **`1.0.16-17968c99`**。
+- 镜像 ID：`sha256:a2af2c57269caba38d4cee913ed8175a0b7c02551a1bf16a59fdf4652fa8bbfc`。本地回滚版本为 green 的 `1.0.15`。
+- 10:05 UTC 切换新流量，保留 green 既有连接；10:10 UTC 确认连接与排队均为零且没有活动异步任务后，执行 `release.sh drain --drain-timeout 0` 成功停止 green。未强断 SSE/WS；最终排空退出码为 0。
+- 新增限制：只有 `ultrafast` 要求明确 ProMax，Team/Pro/ProLite/Plus/Free/未知套餐不合格；fast/priority/默认档沿用原调度，不排除 ProMax。无须新环境开关或数据库迁移。详见 `ULTRAFAST_PROMAX_ROUTING_PLAN.md`。
+- 发布前完成数据库备份、归档可读性检查、活动程序和私有 rollout 状态备份；无 schema 差异。PostgreSQL、Redis、HAProxy 未重启；旧服务器只查询镜像标签，没有修改或升级。
+- 发布前运行蓝绿离线测试通过；此前全量 Go 测试、最终 proxy/wsrelay 全包及针对性回归通过。构建包含前端与 Linux 后端构建。切换期 14 次健康采样均 200，切换后 60 次均 200 且为新版；两个站点经现有 Nginx 的 health 均为新版。Responses/Chat/Messages 的冲突档位探针均返回本地 400，没有发起模型请求。
+- 最近 3 分钟的一次用量聚合采样：41 条 ultrafast 请求均对应当前识别为 ProMax 的账号，HTTP 200；上游实际档位字段均回报 `default`。这是有界样本，不是完整请求追踪，也不证明上游兑现了 ultrafast。业务采样仍有 499 等状态，不能据健康采样宣称所有业务零错误。
+- 本次未延期、删除或重跑智能检测。上次 1.0.15 延后记录复查为一条 `normal`、一条 `interrupted`，均已不在运行/排队；不能声称上次两条均正常完成。此前保留的旧 blue 已在此次替换前自然排空并通过 release 工具停止。
+
+## 2026-11-09 1.0.15 发布补记（历史）
 
 - 新池 blue 曾通过管理后台在线更新变成上游 `v3.1.4`，但镜像标签仍是 `1.0.12`。线上版本必须同时核实 `/health` 与镜像信息。
 - 已从提交 `47b1ba9e030736cc70084885ad4bff33eddff3d0` 构建 `1.0.15` 并通过现有蓝绿工具切到 green；`/health` 返回 `1.0.15-47b1ba9e`。blue 的已有长连接仍保留自然排空，不得为了结束发布强制删除。
@@ -120,16 +131,16 @@ backup/               数据库备份与配置备份
 - 不覆盖中转独立流路径和 WS 客户端入站路径；已写工具身份、正文等不可随意重放。
 - handler 测试覆盖 HTTP 模拟上游，尚需真实 WS 上游的测试、取消/边界大小/缓冲溢出和写失败覆盖。定时器与现有 writer 的生命周期需进一步审查。
 
-## 5. 待办：fast→Pro，ultrafast→Pro Max
+## 5. 已上线：ultrafast 仅 ProMax，fast/默认不变
 
-用户最近询问是否能按档位分配套餐；**只分析过，没有实现、没有部署**。
+`1.0.16` 已实现并通过蓝绿部署完成，见最新发布补记与 `ULTRAFAST_PROMAX_ROUTING_PLAN.md`。
 
-- 当前 fast/ultrafast 选账号没有套餐硬门禁，仅改变传输路径。
-- 原始 plan_type 可以区分 pro、prolite、promax。通用 `auth.NormalizePlanType()` 会把后两者折叠为 pro，不能直接用它实施 Pro Max 限定。
-- API Key 的 `PlanAllow` 按原始套餐精确过滤，可用两个 Key 人工隔离；同一个入口按 service_tier 自动分流需新增过滤。
-- 建议：ultrafast 严格只选具备权限的 Pro Max；fast 的普通 Pro 优先/是否允许 Pro Max 兜底须明确规则。
-- 首次选号、重试、排队、粘性复用都要受门禁约束。带 previous_response_id/turn-state 时不能为换套餐直接换号；无法安全续聊需明确错误。
-- 不擅自降级、不把请求档位当作上游实际档位，不修改旧服务器 new-api 渠道。
+- 原始套餐只认可 `promax`、`pro_max`、`pro-max` 的大小写/两端空白归一形式，不使用会折叠成 Pro 的通用归一函数。
+- 同一 Key 内叠加套餐资格过滤，保持原有分组、模型、额度和状态条件；不要求拆 Key，不建立互斥账号池。
+- 重试、粘性、preferred、pinned 与发送前检查覆盖 ultrafast 限制；Key 范围内无 ProMax 时明确拒绝，不降档。
+- 无法安全恢复的续链明确失败，Payload 不得静默降档或绕过套餐门禁。
+- fast/priority/默认档不新增套餐条件，ProMax 仍可参与。
+- 上游实际档位需要独立观测，套餐选号合格不代表上游已经兑现 ultrafast。
 
 ## 6. 调度和缓存调查的边界
 

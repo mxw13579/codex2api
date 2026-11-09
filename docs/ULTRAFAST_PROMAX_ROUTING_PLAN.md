@@ -1,6 +1,6 @@
 # Ultrafast 账号资格限制：简化方案
 
-状态：已完成本地实现与测试；已获授权进行新号池蓝绿发布，实际部署结果以 `docs/POOL_DEPLOYMENT_HANDOFF.md` 的最新发布补记为准。
+状态：已完成本地实现与测试，并通过新号池蓝绿发布上线 `1.0.16-17968c99`（2026-11-09）；blue 活动，旧 green 已自然排空停止。最新部署情况见 `docs/POOL_DEPLOYMENT_HANDOFF.md`。
 
 实现集中在 `proxy/ultrafast_routing.go`，复用原有选号过滤；各入口接入，执行器在 Payload 之后及实际发送前兜底，不新增配置开关或数据库迁移。
 
