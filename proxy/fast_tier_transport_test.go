@@ -66,7 +66,7 @@ func TestFastTierRequestsBypassUpstreamWebsocket(t *testing.T) {
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 8})
 	t.Cleanup(store.Stop)
-	store.AddAccount(&auth.Account{DBID: 914501, AccessToken: "test-token", Status: auth.StatusReady})
+	store.AddAccount(&auth.Account{DBID: 914501, AccessToken: "test-token", PlanType: "promax", Status: auth.StatusReady})
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
 
 	endpoints := []struct {
@@ -80,6 +80,12 @@ func TestFastTierRequestsBypassUpstreamWebsocket(t *testing.T) {
 		{"chat", "/v1/chat/completions", func(tier string) string {
 			return `{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hi"}],"stream":true` + tier + `}`
 		}, handler.ChatCompletions},
+		{"messages", "/v1/messages", func(tier string) string {
+			if strings.Contains(tier, `"priority"`) || strings.Contains(tier, `"fast"`) {
+				tier = `,"speed":"fast"`
+			}
+			return `{"model":"gpt-5.6-sol","max_tokens":100,"messages":[{"role":"user","content":"hi"}],"stream":true` + tier + `}`
+		}, handler.Messages},
 	}
 	cases := []struct {
 		tier, wantTransport, wantHint string

@@ -550,17 +550,34 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	var encryptedAttempt *encryptedContentAttempt
 	requestBody, encryptedAttempt = prepareEncryptedContentAttempt(ctx, account, requestBody, sessionID, headers)
 	defer func() { encryptedAttempt.observeResponse(upstreamResponse, requestBody) }()
-
+	// Direct/internal callers may not have installed ingress state. Preserve
+	// their explicit ultrafast intent before any Payload rule can rewrite it.
+	var ultra bool
+	var tierErr *Error
+	requestBody, ultra, tierErr = normalizeUltrafastBody(requestBody)
+	if tierErr != nil {
+		return nil, tierErr
+	}
+	if ultra {
+		ctx = context.WithValue(ctx, ultrafastRequestKey{}, true)
+	}
 	// Payload 规则改写：在 WS/HTTP 分叉前统一应用，两条上游路径共享改写结果。
 	// 生图请求跳过——其 instructions/工具由网关自行构造，改写会破坏桥接协议。
 	detectorProbe := isCodexDetectorRequest(ctx)
 	if !responsesBodyRequestsImageGeneration(requestBody) && !detectorProbe {
 		RecordObservedInstructions(requestBody, headers)
 		requestBody = ApplyPayloadRulesToBody(requestBody, gjson.GetBytes(requestBody, "model").String(), headers, PayloadRuleIdentityFromContext(ctx))
+		requestBody, _, tierErr = normalizeUltrafastBody(requestBody)
+		if tierErr != nil {
+			return nil, tierErr
+		}
 		// 规则改写发生在各 handler 的 service_tier 净化之后，规则注入的 flex/auto 等
 		// 上游不接受的层级会原样发出并触发 400，这里补一次净化兜底。用量日志的
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
+	}
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+		return nil, err
 	}
 	var daybreakErr error
 	requestBody, daybreakErr = guardDaybreakUpstream(ctx, account, requestBody)
@@ -600,7 +617,14 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 	// Agent Identity 账号强制走 HTTP：其鉴权是每请求动态签名的 AgentAssertion 头，
 	// 长连接 WS 的一次握手鉴权模型不适配，v1 统一走 HTTP。
-	if account.IsCodexAgentIdentity() {
+	if fastTierRequiresHTTP(extractServiceTier(requestBody)) && strings.TrimSpace(gjson.GetBytes(requestBody, "previous_response_id").String()) != "" {
+		// A handler must restore WS history before switching to HTTP. This
+		// also catches Payload changes racing its transport-tier preview.
+		return nil, serviceTierConflict("Accelerated HTTP requests require complete continuation input; previous_response_id cannot be silently discarded")
+	}
+	if account.IsCodexAgentIdentity() || fastTierRequiresHTTP(extractServiceTier(requestBody)) {
+		// Payload rules run after handler transport selection. Re-evaluate the
+		// final tier so an injected accelerated tier cannot use a stale WS hint.
 		wantWebsocket = false
 	}
 	if state := safePreflightFromContext(ctx); state != nil &&
@@ -658,6 +682,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 			account.Mu().RLock()
 			traceProxy = account.ProxyURL
 			account.Mu().RUnlock()
+		}
+		if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+			return nil, err
 		}
 		recordTrace := beginUpstreamTrace(ctx, account, traceProxy, true)
 		resp, err := WebsocketExecuteFunc(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
@@ -760,6 +787,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	var pipelineFile *os.File
 	var routingHeaders http.Header
 	requestModel := strings.Clone(gjson.GetBytes(requestBody, "model").String())
+	finalServiceTier := extractServiceTier(requestBody) // survives image-pipeline spooling
 	if pipeline := pipelineFromContext(ctx); pipeline != nil {
 		var err error
 		pipelineFile, err = pipeline.spool(outboundBody)
@@ -826,6 +854,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 				return nil, err
 			}
 		}
+		if err := guardUltrafastTier(ctx, account, finalServiceTier); err != nil {
+			return nil, err
+		}
 		reservation, err := reserveAPIKeyModelRequestQuota(ctx, requestModel)
 		if err != nil {
 			return nil, err // preserve the dedicated API-key quota response
@@ -866,6 +897,12 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 				closeIdle()
 				return nil, err
 			}
+		}
+		if err := guardUltrafastTier(ctx, account, finalServiceTier); err != nil {
+			if closeIdle != nil {
+				closeIdle()
+			}
+			return nil, err
 		}
 		resp, err := doTracedUpstreamRequest(sendClient, req, account, proxyURL)
 		if closeIdle != nil {
@@ -913,6 +950,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 }
 
 func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header) (upstreamResponse *http.Response, upstreamErr error) {
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1143,6 +1183,9 @@ func isCodexAccessRestrictedResponse(resp *http.Response) bool {
 // 上游自己的 compact 端点，从而让没有官方 Codex OAuth 账号、仅接入中转的用户也能
 // 触发上下文自动压缩（参见 issue #174）。compact 始终为非流式。
 func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, proxyOverride string, headers http.Header) (upstreamResponse *http.Response, upstreamErr error) {
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1190,6 +1233,9 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 
 // ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
 func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (upstreamResponse *http.Response, upstreamErr error) {
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+		return nil, err
+	}
 	if account == nil || account.IsRelayStyle() {
 		return nil, ErrNoAvailableAccount()
 	}
@@ -1271,7 +1317,13 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	egress.ApplyHeaders(req.Header)
 	logCodexFingerprintDebug("compact", account, egress.DialProxyURL, req.Header)
 
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
+		return nil, err
+	}
 	if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(requestBody, "model").String()); err != nil {
+		return nil, err
+	}
+	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
 		return nil, err
 	}
 	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)

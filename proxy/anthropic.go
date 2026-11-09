@@ -470,7 +470,11 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 		"summary": summary,
 	}
 
-	if shouldUseCodexPriorityForAnthropicSpeed(req.Speed) {
+	// Codex ultrafast is explicit and must survive Messages translation even
+	// when speed=fast is also present. Other tiers retain their existing rules.
+	if isUltrafastTier(extractServiceTier(rawJSON)) {
+		out["service_tier"] = "ultrafast"
+	} else if shouldUseCodexPriorityForAnthropicSpeed(req.Speed) {
 		if upstreamTier, ok := upstreamServiceTier("priority"); ok {
 			out["service_tier"] = upstreamTier
 		}

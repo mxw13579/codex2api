@@ -4081,6 +4081,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Check the original envelope before any continuation/tool stripping.
 	safePreflightOriginalBody := safePreflightSettings.CodexSafePreflightRetry && safePreflightRequestBody(rawBody)
 	h.capturePromptRequestIngress(c, rawBody)
+	var tierErr *Error
+	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	if tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	bodyReadDone := time.Now()
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
@@ -4283,6 +4289,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
+	if tierErr := h.ultrafastPoolError(c); tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
 	// A pinned request keeps only capability checks; cooldowns and pool
 	// routing belong to the external scheduler.
@@ -4293,6 +4303,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	} else {
 		accountFilter = accountFilterForResponsesModelWithGate(logModel, effectiveModel, allowCodexAccounts, rateLimitGate)
 	}
+	accountFilter = ultrafastAccountFilter(c.Request.Context(), accountFilter)
 	if pin == nil {
 		accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	}
@@ -4678,6 +4689,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
+				if tierErr := serviceTierError(reqErr); tierErr != nil {
+					stopTTFTGuard()
+					h.store.Release(account)
+					sendServiceTierError(c, tierErr)
+					return
+				}
 				if apiKeyModelRequestError(reqErr) != nil {
 					stopTTFTGuard()
 					h.store.Release(account)
@@ -5471,6 +5488,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 		if reqErr != nil {
+			if tierErr := serviceTierError(reqErr); tierErr != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				sendServiceTierError(c, tierErr)
+				return
+			}
 			if quotaErr := apiKeyModelRequestError(reqErr); quotaErr != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)
@@ -6653,6 +6676,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	var tierErr *Error
+	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	if tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	cacheRequestCompactionMeta(c, requestCompactionMetaForHTTP(c, rawBody))
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
@@ -6766,7 +6795,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
+	if tierErr := h.ultrafastPoolError(c); tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter = ultrafastAccountFilter(c.Request.Context(), accountFilter)
 	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	if continuationUnavailable {
@@ -6918,6 +6952,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
+				if tierErr := serviceTierError(reqErr); tierErr != nil {
+					h.store.Release(account)
+					sendServiceTierError(c, tierErr)
+					return
+				}
 				if apiKeyModelRequestError(reqErr) != nil {
 					h.store.Release(account)
 					sendAPIKeyModelRequestQuotaError(c, reqErr)
@@ -7169,6 +7208,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if tierErr := serviceTierError(reqErr); tierErr != nil {
+				h.store.Release(account)
+				sendServiceTierError(c, tierErr)
+				return
+			}
 			if apiKeyModelRequestError(reqErr) != nil {
 				h.store.Release(account)
 				sendAPIKeyModelRequestQuotaError(c, reqErr)
@@ -7538,6 +7582,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	var tierErr *Error
+	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	if tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rememberDaybreakRequest(c, rawBody)
@@ -7630,7 +7680,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// A pinned request keeps only capability checks; cooldowns and pool
 	// routing belong to the external scheduler.
 	rateLimitGate := modelRateLimitGateFor(pin)
+	if tierErr := h.ultrafastPoolError(c); tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	accountFilter := accountFilterForResponsesModelWithGate(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)), rateLimitGate)
+	accountFilter = ultrafastAccountFilter(c.Request.Context(), accountFilter)
 	if pin == nil {
 		accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	}
@@ -7876,6 +7931,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if tierErr := serviceTierError(reqErr); tierErr != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				sendServiceTierError(c, tierErr)
+				return
+			}
 			if apiKeyModelRequestError(reqErr) != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)

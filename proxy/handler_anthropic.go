@@ -497,7 +497,9 @@ func (h *Handler) resolveMessagesRoutingBodyForRequest(c *gin.Context, rawBody [
 	} else {
 		stub, _ = sjson.SetBytes(stub, "reasoning.effort", resolveReasoningEffort(nil, mapped))
 	}
-	if shouldUseCodexPriorityForAnthropicSpeed(gjson.GetBytes(rawBody, "speed").String()) {
+	if isUltrafastTier(extractServiceTier(rawBody)) {
+		stub, _ = sjson.SetBytes(stub, "service_tier", "ultrafast")
+	} else if shouldUseCodexPriorityForAnthropicSpeed(gjson.GetBytes(rawBody, "speed").String()) {
 		if upstreamTier, ok := upstreamServiceTier("priority"); ok {
 			stub, _ = sjson.SetBytes(stub, "service_tier", upstreamTier)
 		}
@@ -581,6 +583,12 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 套用会跨渠道吞掉合法字段——例如 service_tier 默认不放行，Codex 账号的
 	// priority/fast 档位会被静默删掉，连带用量归因一起丢。没有 Claude 账号的部署
 	// 因此拿到的是与改动前逐字节一致的入站体。
+	var tierErr *Error
+	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	if tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	claudeSecurityConfig := h.store.ClaudeSecurityConfig()
 	canonicalBody := rawBody
 	nativeClaudeRoute := h.nativeClaudeRouteForRequest(c, gjson.GetBytes(rawBody, "model").String())
@@ -670,6 +678,10 @@ func (h *Handler) Messages(c *gin.Context) {
 	// A pinned request keeps only capability checks; cooldowns and pool
 	// routing belong to the external scheduler.
 	rateLimitGate := modelRateLimitGateFor(pin)
+	if tierErr := h.ultrafastPoolError(c); tierErr != nil {
+		sendServiceTierError(c, tierErr)
+		return
+	}
 	accountFilter := accountFilterForResponsesModelWithGate(effectiveModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)), rateLimitGate)
 	if foldAntigravityLogical {
 		fixedTierFilter := accountFilter
@@ -685,6 +697,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			return fixedTierFilter(account)
 		}
 	}
+	accountFilter = ultrafastAccountFilter(c.Request.Context(), accountFilter)
 	if pin == nil {
 		accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	}
@@ -1030,6 +1043,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			if tierErr := serviceTierError(reqErr); tierErr != nil {
+				ttftGuard.Stop()
+				h.store.Release(account)
+				sendServiceTierError(c, tierErr)
+				return
+			}
 			if apiKeyModelRequestError(reqErr) != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)

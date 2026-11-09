@@ -342,6 +342,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSErrorForContext(c, conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
+	var tierErr *Error
+	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	if tierErr != nil {
+		return writeResponsesWSErrorForContext(c, conn, serviceTierAPIError(tierErr))
+	}
 	// WebSocket turn metadata is frame-local. Cache a complete zero-or-set
 	// snapshot before any body rewrite so a later frame can never inherit the
 	// prior frame's compaction badges.
@@ -499,7 +504,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		defer releaseAPIKeyConcurrency()
 	}
 
+	if tierErr := h.ultrafastPoolError(c); tierErr != nil {
+		return writeResponsesWSErrorForContext(c, conn, serviceTierAPIError(tierErr))
+	}
 	accountFilter := accountFilterForResponsesWebSocket(effectiveModel)
+	accountFilter = ultrafastAccountFilter(c.Request.Context(), accountFilter)
 	accountFilter = h.withRequestModelCooldownFilter(c, c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
@@ -568,6 +577,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	searchContinuation := isCodexSearchResponseID(gjson.GetBytes(codexBody, "previous_response_id").String())
 	continuationPinned := turnContinuation && turnHasBinding && !searchContinuation
 	continuationDegraded := false
+	continuationContextLost := false
 	if err := waitNativeWSCommit(c.Request.Context(), lookupOwner, gjson.GetBytes(codexBody, "previous_response_id").String()); err != nil {
 		return writeResponsesWSErrorForContext(c, conn, nativeResponsesWSContextError(responsesWSContextUnavailable(http.StatusServiceUnavailable, "context_commit_pending")))
 	}
@@ -578,10 +588,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	accountFilter = nativeWSReplayAccountFilter(accountFilter, turnReplay)
 	degradeContinuation := func(reason string, attempt int) *api.APIError {
 		expanded, lost, contextErr := degradeResponsesWSContinuationWithSource(codexBody, lookupOwner, turnReplay)
+		if lost && requestedUltrafast(c.Request.Context()) {
+			return responsesWSContextUnavailable(http.StatusConflict, "ultrafast_requires_complete_context")
+		}
 		if contextErr != nil {
 			return contextErr
 		}
 		continuationDegraded = true
+		continuationContextLost = continuationContextLost || lost
 		continuationPinned = false
 		codexBody = expanded
 		turnReplay = newResponsesWSReplaySourceFromRecovery(responsesInputRaw(expanded), turnReplay)
@@ -744,7 +758,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		// 中转账号自己的 Responses WebSocket 不套用这条 Codex 体积学习。
 		relayUpstreamWS := account.OpenAIResponsesUsesUpstreamWebsocket() && !responsesBodyRequestsImageGeneration(rawBody) && !naturalImageIntent
 		// 加速档走 HTTP 上游（客户端仍是 WS），保证每个请求的 routing hint 与自身档位一致。
-		if useWebsocket && !relayUpstreamWS && !account.IsRelayStyle() && fastTierRequiresHTTP(extractServiceTier(codexBody)) {
+		// Decide accelerated transport before continuation expansion. Applying
+		// this only in ExecuteRequest would strip a WS previous_response_id
+		// without first restoring its history when Payload injects ultrafast.
+		transportTier := extractServiceTier(codexBody)
+		if !account.IsRelayStyle() {
+			transportTier = EffectiveRequestedServiceTier(codexBody, effectiveModel, downstreamHeaders, attemptIdentity)
+		}
+		if useWebsocket && !relayUpstreamWS && !account.IsRelayStyle() && fastTierRequiresHTTP(transportTier) {
 			useWebsocket = false
 		}
 		if useWebsocket && globalWSSizeRouter.PreferHTTP(len(codexBody)) && !relayUpstreamWS {
@@ -776,6 +797,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			var contextErr *api.APIError
 			var lost bool
 			upstreamBody, lost, contextErr = degradeResponsesWSContinuationWithSource(codexBody, lookupOwner, turnReplay)
+			if lost && (requestedUltrafast(c.Request.Context()) || isUltrafastTier(transportTier)) {
+				contextErr = responsesWSContextUnavailable(http.StatusConflict, "ultrafast_requires_complete_context")
+			}
 			if contextErr != nil {
 				ttftGuard.Stop()
 				upstreamCancel()
@@ -786,14 +810,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			attemptReplay = newResponsesWSReplaySourceFromRecovery(responsesInputRaw(upstreamBody), turnReplay)
 			attemptReplay.setAccount(account)
 			if lost {
+				continuationContextLost = true
 				attemptReplay = nil
 			}
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, effectiveModel, downstreamHeaders, attemptIdentity)
+		if continuationContextLost && (requestedUltrafast(c.Request.Context()) || isUltrafastTier(serviceTier)) {
+			ttftGuard.Stop()
+			upstreamCancel()
+			h.store.Release(account)
+			return writeResponsesWSRecoveryErrorForContext(c, conn, responsesWSContextUnavailable(http.StatusConflict, "ultrafast_requires_complete_context"))
+		}
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
+		if continuationContextLost {
+			// Preserve failed recovery even if a later Payload rule changes
+			// after the transport preview or on a subsequent retry/account.
+			upstreamCtx = context.WithValue(upstreamCtx, ultrafastContextLostKey{}, true)
+		}
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
 		guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
@@ -815,6 +851,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 
 		if reqErr != nil {
+			if tierErr := serviceTierError(reqErr); tierErr != nil {
+				ttftGuard.Stop()
+				upstreamCancel()
+				h.store.Release(account)
+				return writeResponsesWSErrorForContext(c, conn, serviceTierAPIError(tierErr))
+			}
 			var capacityErr *UpstreamWSConnectionCapacityError
 			if errors.As(reqErr, &capacityErr) {
 				ttftGuard.Stop()

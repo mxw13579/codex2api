@@ -50,7 +50,7 @@ func TestUltrafastRequestAndUsageTiers(t *testing.T) {
 	}
 }
 
-func TestUltrafastExecutorHTTPAndWebSocket(t *testing.T) {
+func TestUltrafastExecutorForcesHTTP(t *testing.T) {
 	previousResin, previousWS := resinCfg.Load(), WebsocketExecuteFunc
 	t.Cleanup(func() { resinCfg.Store(previousResin); WebsocketExecuteFunc = previousWS })
 	var httpTier, httpHint, wsTier string
@@ -67,14 +67,14 @@ func TestUltrafastExecutorHTTPAndWebSocket(t *testing.T) {
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	}
 	for _, ws := range []bool{false, true} {
-		resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 621, AccessToken: "test"}, []byte(`{"model":"gpt-5.6-sol","input":"hello","service_tier":"ultrafast"}`), "session", "", "local", nil, http.Header{}, ws)
+		resp, err := ExecuteRequest(context.Background(), &auth.Account{DBID: 621, AccessToken: "test", PlanType: "promax"}, []byte(`{"model":"gpt-5.6-sol","input":"hello","service_tier":"ultrafast"}`), "session", "", "local", nil, http.Header{}, ws)
 		if err != nil {
 			t.Fatal(err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
-	if httpTier != "ultrafast" || wsTier != "ultrafast" || httpHint != "model=gpt-5.6-sol;tier=ultrafast" {
+	if httpTier != "ultrafast" || wsTier != "" || httpHint != "model=gpt-5.6-sol;tier=ultrafast" {
 		t.Fatalf("upstream tiers: HTTP=%q WS=%q hint=%q", httpTier, wsTier, httpHint)
 	}
 }
