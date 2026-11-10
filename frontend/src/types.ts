@@ -2283,6 +2283,9 @@ export interface SystemSettings {
   max_rate_limit_retries: number
   retry_interval_ms: number
   transport_retry_policy: string
+  bad_request_retry_enabled: boolean
+  bad_request_retry_max_retries: number
+  bad_request_retry_switch_account: boolean
   continuous_retry_enabled: boolean
   continuous_retry_catch_all: boolean
   continuous_retry_categories: string[]

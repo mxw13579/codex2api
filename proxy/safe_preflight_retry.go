@@ -645,6 +645,10 @@ func (b *safePreflightResponseBody) Close() error {
 	b.closeIdle()
 	return err
 }
+func (b *safePreflightResponseBody) upstreamErrorMetadata() upstreamErrorLogMetadata {
+	return upstreamErrorMetadataFromBody(b.ReadCloser)
+}
+
 func (b *safePreflightResponseBody) observeUpstreamCookieEvent(data []byte) {
 	if o, ok := b.ReadCloser.(upstreamCookieEventObserver); ok {
 		o.observeUpstreamCookieEvent(data)

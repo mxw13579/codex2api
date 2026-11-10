@@ -22,6 +22,15 @@ import {
 } from '../lib/claudeAccountOptions'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
 import {
+  DEFAULT_BAD_REQUEST_RETRY_SETTINGS,
+  buildBadRequestRetryEnabledPatch,
+  buildBadRequestRetryMaxRetriesPatch,
+  buildBadRequestRetrySwitchAccountPatch,
+  createBadRequestRetrySaveQueue,
+  omitBadRequestRetrySettings,
+  type BadRequestRetrySettings,
+} from '../lib/badRequestRetrySettings'
+import {
   buildContinuousRetryCatchAllPatch,
   buildContinuousRetryEnabledPatch,
   createContinuousRetrySaveQueue,
@@ -2641,6 +2650,9 @@ export default function Settings() {
     const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
       ...cacheNormalized,
+      bad_request_retry_enabled: cacheNormalized.bad_request_retry_enabled ?? false,
+      bad_request_retry_max_retries: cacheNormalized.bad_request_retry_max_retries ?? 1,
+      bad_request_retry_switch_account: cacheNormalized.bad_request_retry_switch_account ?? false,
       codex_transient_429_cooldown_enabled: cacheNormalized.codex_transient_429_cooldown_enabled ?? false,
       codex_images_main_model: cacheNormalized.codex_images_main_model ?? '',
       codex_upstream_cookie_log_enabled: cacheNormalized.codex_upstream_cookie_log_enabled ?? false,
@@ -2750,6 +2762,7 @@ export default function Settings() {
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
     transport_retry_policy: 'rotate',
+    ...DEFAULT_BAD_REQUEST_RETRY_SETTINGS,
     continuous_retry_enabled: false,
     continuous_retry_catch_all: false,
     continuous_retry_categories: ['transport', 'http_429', 'http_5xx', 'stream_error'],
@@ -2879,6 +2892,8 @@ export default function Settings() {
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSaveStatusTimerRef = useRef<number | null>(null)
+  const badRequestRetrySaveQueueRef = useRef(createBadRequestRetrySaveQueue())
+  const [badRequestRetryMaxRetriesDraft, setBadRequestRetryMaxRetriesDraft] = useState(String(settingsForm.bad_request_retry_max_retries))
   const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
   // 邀请引导开关走独立端点(system_settings.invite_guide_config),不进主设置
@@ -2911,6 +2926,10 @@ export default function Settings() {
   useEffect(() => {
     settingsFormRef.current = settingsForm
   }, [settingsForm])
+
+  useEffect(() => {
+    setBadRequestRetryMaxRetriesDraft(String(settingsForm.bad_request_retry_max_retries))
+  }, [settingsForm.bad_request_retry_max_retries])
 
   useEffect(() => {
     setContinuousRetryStatusCodesDraft(continuousRetryStatusCodesText)
@@ -3036,6 +3055,17 @@ export default function Settings() {
       finishAutoSaveRequest('error')
     }
   }, [commitSettingsForm, finishAutoSaveRequest, showToast, t])
+
+  const autoSaveBadRequestRetryPatch = useCallback((patch: Partial<BadRequestRetrySettings>) => {
+    return badRequestRetrySaveQueueRef.current(async () => {
+      await autoSaveSettingsPatch(patch)
+      // Also reset a rejected budget draft if the committed value did not change.
+      // Saving a switch must not discard an in-progress budget edit.
+      if (patch.bad_request_retry_max_retries !== undefined) {
+        setBadRequestRetryMaxRetriesDraft(String(settingsFormRef.current.bad_request_retry_max_retries))
+      }
+    })
+  }, [autoSaveSettingsPatch])
 
   const autoSaveContinuousRetryPatch = useCallback((patch: Partial<SystemSettings>) => {
     return continuousRetrySaveQueueRef.current(() => autoSaveSettingsPatch(patch))
@@ -3196,7 +3226,7 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-	      const payload: Partial<SystemSettings> = buildWritableSettingsPayload(normalized)
+      const payload: Partial<SystemSettings> = omitBadRequestRetrySettings(buildWritableSettingsPayload(normalized))
       // 自定义 Prompt 规则由规则页单独保存，避免普通设置提交覆盖并发发布结果。
       delete payload.prompt_filter_custom_patterns
       const updated = await api.updateSettings(payload)
@@ -5875,6 +5905,46 @@ export default function Settings() {
                     </SettingField>
                   </div>
                 </SettingsCard>
+
+                  <SettingsCard
+                    title="Bad Request 独立重试"
+                    description={'仅匹配上游 HTTP 400 且正文仅为 {"detail":"Bad Request"}；不包含明确参数错误或安全错误。默认关闭，保留现有行为。'}
+                    icon={<RefreshCw className="size-4" />}
+                  >
+                    <div className="space-y-4">
+                      <SettingField label="启用 Bad Request 重试" description="使用独立的额外重试预算，不修改普通、429 或持续重试配置。" layout="switch">
+                        <Switch
+                          aria-label="启用 Bad Request 重试"
+                          checked={settingsForm.bad_request_retry_enabled}
+                          onCheckedChange={(checked) => void autoSaveBadRequestRetryPatch(buildBadRequestRetryEnabledPatch(checked))}
+                        />
+                      </SettingField>
+                      <SettingField label="额外重试次数" description="范围 0–10，默认 1；不含首次请求，0 表示不重试。" suffix="次">
+                        <Input
+                          aria-label="Bad Request 额外重试次数"
+                          type="number"
+                          min={0}
+                          max={10}
+                          step={1}
+                          disabled={!settingsForm.bad_request_retry_enabled}
+                          value={badRequestRetryMaxRetriesDraft}
+                          onChange={(event) => setBadRequestRetryMaxRetriesDraft(event.target.value)}
+                          onBlur={(event) => void autoSaveBadRequestRetryPatch(buildBadRequestRetryMaxRetriesPatch(event.target.value))}
+                        />
+                      </SettingField>
+                      <SettingField label="重试时切换账号" description="关闭（默认）：同号重试；开启：在允许的范围内换号。不会自动开启重试。" layout="switch">
+                        <Switch
+                          aria-label="Bad Request 重试时切换账号"
+                          disabled={!settingsForm.bad_request_retry_enabled}
+                          checked={settingsForm.bad_request_retry_switch_account}
+                          onCheckedChange={(checked) => void autoSaveBadRequestRetryPatch(buildBadRequestRetrySwitchAccountPatch(checked))}
+                        />
+                      </SettingField>
+                      <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-400">
+                        保留真实错误日志；重试不代表已找到根因。固定账号请求与无法安全重放的续链不会绕过约束。
+                      </p>
+                    </div>
+                  </SettingsCard>
 
                   <SettingsCard
                     title={t('settings.continuousRetryTitle')}

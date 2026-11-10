@@ -99,6 +99,7 @@ type RuntimeSettings struct {
 	CodexWSSilentRetry     bool                           // 首包前 Codex WS 上游错误静默换号重试（默认 true）
 	CodexWSSilentRetries   int                            // Codex WS 静默换号最大重试次数（默认 2）
 	ContinuousRetryPolicy  database.ContinuousRetryPolicy // 上游错误持续重试选择器（默认关闭）
+	BadRequestRetryPolicy  database.BadRequestRetryPolicy // 精确 Bad Request 的独立额外预算（默认关闭）
 	CodexWSSizeRouter      bool                           // 1009 自学习体积路由：超大请求直接首发 HTTP（默认 true）
 	CodexWSBusyMaxWaitSec  int                            // busy session/容量等待的累计上限秒数（默认 30，issue #413）
 	CodexWSBusyOverflow    bool                           // busy session 溢出到同账号兄弟连接（默认 false）
@@ -205,6 +206,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSHideErrors:                defaultCodexWSHideErrors,
 		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
 		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
+		BadRequestRetryPolicy:            database.DefaultBadRequestRetryPolicy(),
 		ContinuousRetryPolicy:            database.DefaultContinuousRetryPolicy(),
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
 		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
@@ -355,6 +357,7 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	}
 	settings.AutoResetCreditsBeforeExpiryMin = database.NormalizeAutoResetCreditsBeforeExpiryMinutes(settings.AutoResetCreditsBeforeExpiryMin)
 	settings.UTLSShutdownTimeoutMin = database.NormalizeUTLSShutdownTimeoutMinutes(settings.UTLSShutdownTimeoutMin)
+	settings.BadRequestRetryPolicy = database.NormalizeBadRequestRetryPolicy(settings.BadRequestRetryPolicy)
 	settings.ContinuousRetryPolicy = database.NormalizeContinuousRetryPolicy(settings.ContinuousRetryPolicy)
 	return codexRuntimeClientVersionProjections(settings)
 }
@@ -385,6 +388,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
+		next.BadRequestRetryPolicy = database.ParseBadRequestRetryPolicy(settings.BadRequestRetryPolicy)
 		next.ContinuousRetryPolicy = database.ParseContinuousRetryPolicy(settings.ContinuousRetryPolicy)
 		if strings.TrimSpace(settings.ContinuousRetryPolicy) == "" {
 			next.ContinuousRetryPolicy = database.DefaultContinuousRetryPolicy()

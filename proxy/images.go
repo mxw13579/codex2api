@@ -73,8 +73,8 @@ const (
 
 	maxGPTImage2Pixels = 8294400
 
-	// maxImageAttempts caps ordinary finite image retries. A failure selected by
-	// continuous retry bypasses it until the client disconnects.
+	// maxImageAttempts caps ordinary finite image retries, excluding dispatched
+	// dedicated Bad Request retries. Continuous selection also bypasses this cap.
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
@@ -1186,6 +1186,7 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 }
 
 func (h *Handler) ImagesGenerations(c *gin.Context) {
+	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
 	releaseImage, admitted := admitDirectImageExecution(c)
 	if !admitted {
 		return
@@ -1266,10 +1267,11 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, nil, tool)
-	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_generation", stream)
+	h.forwardImagesRequestWithBadRequestRetry(c, "/v1/images/generations", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_generation", stream, badRequestRetry)
 }
 
 func (h *Handler) ImagesEdits(c *gin.Context) {
+	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
 	releaseImage, admitted := admitDirectImageExecution(c)
 	if !admitted {
 		return
@@ -1277,11 +1279,11 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 	defer releaseImage()
 	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
 	if strings.HasPrefix(contentType, "application/json") {
-		h.imagesEditsFromJSON(c)
+		h.imagesEditsFromJSONWithBadRequestRetry(c, badRequestRetry)
 		return
 	}
 	if strings.HasPrefix(contentType, "multipart/form-data") || contentType == "" {
-		h.imagesEditsFromMultipart(c)
+		h.imagesEditsFromMultipartWithBadRequestRetry(c, badRequestRetry)
 		return
 	}
 
@@ -1291,6 +1293,10 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 }
 
 func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
+	h.imagesEditsFromMultipartWithBadRequestRetry(c, newBadRequestRetryState(h.store.GetBadRequestRetryPolicy()))
+}
+
+func (h *Handler) imagesEditsFromMultipartWithBadRequestRetry(c *gin.Context, badRequestRetry *badRequestRetryState) {
 	if err := h.captureSignedMultipartIngress(c); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
@@ -1390,7 +1396,7 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequestWithBadRequestRetry(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream, badRequestRetry)
 }
 
 // captureSignedMultipartIngress preserves the exact wire body for NewAPI HMAC
@@ -1437,6 +1443,10 @@ func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string)
 }
 
 func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
+	h.imagesEditsFromJSONWithBadRequestRetry(c, newBadRequestRetryState(h.store.GetBadRequestRetryPolicy()))
+}
+
+func (h *Handler) imagesEditsFromJSONWithBadRequestRetry(c *gin.Context, badRequestRetry *badRequestRetryState) {
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
@@ -1546,7 +1556,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
+	h.forwardImagesRequestWithBadRequestRetry(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream, badRequestRetry)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -1591,6 +1601,8 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 // 两层都要过 scope 预算闸门（issue #439），否则回退层会绕过预算限制。
 // 无指纹分流同样要覆盖两层：否则生图流量既能落到分流组账号上，无指纹的生图请求
 // 又不会被关进分流组，两个方向都跟配置意图相反。
+// Images only use identity for group routing, not session binding: both selections
+// below pass an empty affinity key, and same-account retries must not create one.
 func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[int64]bool, model string, identity requestSessionIdentity) (*auth.Account, string) {
 	ctx := context.Background()
 	if c != nil && c.Request != nil {
@@ -1608,6 +1620,13 @@ func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[i
 
 // forwardImagesRequest 执行 Images 请求的账号调度、上游重试、响应聚合和下游输出。
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+	// Preserve callers that already supply a prepared body (including admin).
+	h.forwardImagesRequestWithBadRequestRetry(c, inboundEndpoint, requestModel, logModel, logEffectiveModel, responsesBody, responseFormat, streamPrefix, stream, newBadRequestRetryState(h.store.GetBadRequestRetryPolicy()))
+}
+
+// HTTP entrypoints pass the policy captured before JSON/multipart body reads;
+// never resnapshot here after a slow upload or request-body transformation.
+func (h *Handler) forwardImagesRequestWithBadRequestRetry(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool, badRequestRetry *badRequestRetryState) {
 	if strings.TrimSpace(logModel) == "" {
 		logModel = requestModel
 	}
@@ -1637,6 +1656,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	badRequestRetryPending := false
+	badRequestAttempts := 0
 	continuousRetryActive := false
 	var sameAccountRetryID int64
 	sameAccountEmptyRetried := make(map[int64]bool)
@@ -1667,7 +1688,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 
 	for attempt := 0; ; attempt++ {
-		if attempt >= maxImageAttempts && !continuousRetryActive {
+		if attempt-badRequestAttempts >= maxImageAttempts && !continuousRetryActive && !badRequestRetryPending {
 			break
 		}
 		if err := c.Request.Context().Err(); err != nil {
@@ -1676,9 +1697,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		selectAccount := func(exclude map[int64]bool) (*auth.Account, string) {
 			return h.nextImageAccount(c, apiKeyID, exclude, requestModel, sessionIdentity)
 		}
-		var account *auth.Account
-		var stickyProxyURL string
-		if sameAccountRetryID > 0 {
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		strictFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(c.Request.Context(), requestModel, imageCapableAccountFilter))
+		strictFilter = h.applyScopeBudgetFilter(c, strictFilter)
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, strictFilter, dispatchPolicyForModel(requestModel))
+		if !sameBadRequestAccount && sameAccountRetryID > 0 {
 			preferredID := sameAccountRetryID
 			sameAccountRetryID = 0
 			preferredFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(c.Request.Context(), requestModel, imageCapableAccountFilter))
@@ -1688,19 +1715,32 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				stickyProxyURL = account.GetProxyURL()
 			}
 		}
-		if account == nil && continuousRetryActive {
+		if !sameBadRequestAccount && account == nil && retryingBadRequest {
+			// A dedicated retry gets one normal selection, never the legacy
+			// preferred-account fallback or a continuous pool polling loop.
+			account, stickyProxyURL = selectAccount(retryExclusions.ForSelection())
+		} else if !sameBadRequestAccount && account == nil && continuousRetryActive {
 			account, stickyProxyURL = nextContinuousRetryAccount(c.Request.Context(), retryExclusions, selectAccount, h.store.Release)
-		} else if account == nil {
+		} else if !sameBadRequestAccount && account == nil {
 			account, stickyProxyURL = nextBoundedRetryAccountWithContext(c.Request.Context(), h.store.Release, retryExclusions, selectAccount)
 		}
-		if account != nil && c.Request.Context().Err() != nil {
-			h.store.Release(account)
+		if (account != nil || retryingBadRequest) && c.Request.Context().Err() != nil {
+			if account != nil {
+				h.store.Release(account)
+			}
 			if continuousRetryDeadlineExceeded(c.Request.Context()) {
 				continuousRetryCommitExpired(c, continuousRetryProtocolResponses)
 			}
 			return
 		}
 		if account == nil {
+			if retryingBadRequest && badRequestRetry.failedSelection(lastStatusCode, lastBody) {
+				if stream && writeCommittedResponsesRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+					return
+				}
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				return
+			}
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 				return
 			}
@@ -1761,6 +1801,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
+		// Only dispatched dedicated attempts reduce the ordinary count, never
+		// retry decisions for which no eligible account was selected.
+		if retryingBadRequest {
+			badRequestAttempts++
+		}
+		ordinaryAttempt := attempt - badRequestAttempts // zero-based; logs retain the total attempt
 		resp, reqErr := executeHTTPWithContinuousRetryKeepalive(c.Request.Context(), func() (*http.Response, error) {
 			if replay != nil {
 				return executePipelineImage(c.Request.Context(), replay, gjson.GetBytes(responsesBody, "model").String(), func(body []byte) (*http.Response, error) {
@@ -1790,7 +1836,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			}
 			continuousSelected := continuousRetryLimitForRequestError(reqErr, 0, continuousRetryPolicy) == -1
 			retryLimit := continuousRetryLimitForRequestError(reqErr, maxRetries, continuousRetryPolicy)
-			shouldRetry := retryAllowedByEndpointCap(attempt, maxImageAttempts, continuousSelected) && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
+			shouldRetry := retryAllowedByEndpointCap(ordinaryAttempt, maxImageAttempts, continuousSelected) && shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
 			if shouldRetry {
 				rememberContinuousRetryRequestFailure(c.Request.Context(), reqErr)
 				retryExclusions.MarkRequestFailure(account.ID(), reqErr, maxRetries, continuousRetryPolicy)
@@ -1820,19 +1866,23 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+			errBody, readErr := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+			badRequestDecision := badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL,
+				pinnedAccountDispatchForRequest(c) == nil && !c.Writer.Written())
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 				h.store.Release(account)
 				return
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !badRequestDecision.matched {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
-			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
+			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody, resp)
 			if resp.StatusCode == http.StatusBadRequest {
 				// 400 拒绝的是驱动主模型而非生图模型:不能按 (账号, 生图模型) 冷却——那会把
 				// 唯一能生图的账号整体拉黑 30 分钟;换下一个候选驱动在同一账号上重试。
@@ -1867,10 +1917,15 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				Transport: upstreamPromptPolicyTransport(stream, false), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			markImageModelUnavailableFromHTTP(h.store, account, requestModel, resp.StatusCode, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-			continuousSelected := continuousRetryHTTPSelected(continuousRetryPolicy, resp.StatusCode, errBody)
-			shouldRetry := retryAllowedByEndpointCap(attempt, maxImageAttempts, continuousSelected) && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			continuousSelected := false
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				markImageModelUnavailableFromHTTP(h.store, account, requestModel, resp.StatusCode, errBody)
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+				continuousSelected = continuousRetryHTTPSelected(continuousRetryPolicy, resp.StatusCode, errBody)
+				shouldRetry = retryAllowedByEndpointCap(ordinaryAttempt, maxImageAttempts, continuousSelected) && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+			}
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
 				Endpoint:               inboundEndpoint,
@@ -1891,10 +1946,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				clearNewAPIUpstreamCyberPolicyDecision(c)
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+				badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 				continuousRetryActive = continuousRetryActive || continuousSelected
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
-				if retryLimit == -1 && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
+				if (badRequestDecision.matched || retryLimit == -1) && !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
 				continue
@@ -1953,7 +2010,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				accountID := account.ID()
 				resp.Body.Close()
 				h.store.Release(account)
-				willRetry := c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
+				willRetry := c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, ordinaryAttempt, maxImageAttempts, continuousRetryPolicy)
 				preferSameAccount := willRetry && imageErrorPrefersSameAccountRetry(readErr) && !sameAccountEmptyRetried[accountID]
 				if preferSameAccount {
 					sameAccountEmptyRetried[accountID] = true
@@ -2019,7 +2076,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Connected/keepalive comments do not commit model output. A retry is
 			// still transparent until the first partial/completed image event.
 			downstreamWrote := streamAttempt.downstreamWrote(wroteImageOutput)
-			willRetry := !localReplayFailure && !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts, continuousRetryPolicy)
+			willRetry := !localReplayFailure && !downstreamWrote && !isImageStreamWriteError(readErr) && c.Request.Context().Err() == nil && shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, ordinaryAttempt, maxImageAttempts, continuousRetryPolicy)
 			preferSameAccount := willRetry && imageErrorPrefersSameAccountRetry(readErr) && !sameAccountEmptyRetried[accountID]
 			if preferSameAccount {
 				sameAccountEmptyRetried[accountID] = true
@@ -2120,6 +2177,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			Model:            logModel,
 			EffectiveModel:   logEffectiveModel,
 			StatusCode:       statusCode,
+			AttemptIndex:     attempt + 1,
 			DurationMs:       int(time.Since(start).Milliseconds()),
 			FirstTokenMs:     firstTokenMs,
 			InboundEndpoint:  inboundEndpoint,

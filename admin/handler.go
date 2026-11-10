@@ -9379,6 +9379,9 @@ type settingsResponse struct {
 	RetryIntervalMS                   int      `json:"retry_interval_ms"`
 	TransportRetryPolicy              string   `json:"transport_retry_policy"`
 	CodexTransient429CooldownEnabled  bool     `json:"codex_transient_429_cooldown_enabled"`
+	BadRequestRetryEnabled            bool     `json:"bad_request_retry_enabled"`
+	BadRequestRetryMaxRetries         int      `json:"bad_request_retry_max_retries"`
+	BadRequestRetrySwitchAccount      bool     `json:"bad_request_retry_switch_account"`
 	ContinuousRetryEnabled            bool     `json:"continuous_retry_enabled"`
 	ContinuousRetryCatchAll           bool     `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories         []string `json:"continuous_retry_categories"`
@@ -9564,6 +9567,9 @@ type updateSettingsReq struct {
 	RetryIntervalMS                     *int                             `json:"retry_interval_ms"`
 	TransportRetryPolicy                *string                          `json:"transport_retry_policy"`
 	CodexTransient429CooldownEnabled    *bool                            `json:"codex_transient_429_cooldown_enabled"`
+	BadRequestRetryEnabled              *bool                            `json:"bad_request_retry_enabled"`
+	BadRequestRetryMaxRetries           *int                             `json:"bad_request_retry_max_retries"`
+	BadRequestRetrySwitchAccount        *bool                            `json:"bad_request_retry_switch_account"`
 	ContinuousRetryEnabled              *bool                            `json:"continuous_retry_enabled"`
 	ContinuousRetryCatchAll             *bool                            `json:"continuous_retry_catch_all"`
 	ContinuousRetryCategories           *[]string                        `json:"continuous_retry_categories"`
@@ -10300,7 +10306,11 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	}
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
+	badRequestRetryPolicy := h.store.GetBadRequestRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
+		BadRequestRetryEnabled:              badRequestRetryPolicy.Enabled,
+		BadRequestRetryMaxRetries:           badRequestRetryPolicy.MaxRetries,
+		BadRequestRetrySwitchAccount:        badRequestRetryPolicy.SwitchAccount,
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
@@ -10598,6 +10608,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
 		return
 	}
+	if value := req.BadRequestRetryMaxRetries; value != nil && (*value < 0 || *value > database.MaxBadRequestRetryMaxRetries) {
+		writeError(c, http.StatusBadRequest, "bad_request_retry_max_retries 必须是 0 到 10 之间的整数（额外重试次数，0 表示不重试）")
+		return
+	}
 	if req.PromptFilterCustomPatternsExpected != nil && req.PromptFilterCustomPatterns == nil {
 		writeError(c, http.StatusBadRequest, "Prompt 自定义规则版本快照不能单独提交")
 		return
@@ -10886,6 +10900,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	runtimeCfg.UTLSShutdownTimeoutMin = persistedUTLSShutdownTimeoutMinutes
 	runtimeCfg.ModelsListReadMaxBytes = modelsListReadMaxBytes
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
+	badRequestRetryPolicy := h.store.GetBadRequestRetryPolicy()
+	badRequestRetryUpdate := database.BadRequestRetryPolicyUpdate{
+		Enabled:       req.BadRequestRetryEnabled,
+		MaxRetries:    req.BadRequestRetryMaxRetries,
+		SwitchAccount: req.BadRequestRetrySwitchAccount,
+	}
+	badRequestRetryChanged := req.BadRequestRetryEnabled != nil || req.BadRequestRetryMaxRetries != nil || req.BadRequestRetrySwitchAccount != nil
 	continuousRetryUpdate := database.ContinuousRetryPolicyUpdate{
 		Enabled:            req.ContinuousRetryEnabled,
 		CatchAll:           req.ContinuousRetryCatchAll,
@@ -11666,6 +11687,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 		// Cookie diagnostics are applied only after their dedicated DB update.
 		effectiveRuntimeCfg.CodexUpstreamCookieLogEnabled = current.CodexUpstreamCookieLogEnabled
+		// Independent policy updates publish only after their own DB commit.
+		effectiveRuntimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 		return effectiveRuntimeCfg
 	})
 
@@ -12062,6 +12085,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusInternalServerError, "保存 5h 窗口自动激活设置失败，设置未生效")
 			return
 		}
+		if badRequestRetryChanged {
+			writeError(c, http.StatusInternalServerError, "保存 Bad Request 重试策略失败，设置未生效")
+			return
+		}
 		if continuousRetryChanged {
 			writeError(c, http.StatusInternalServerError, "保存持续重试策略失败，设置未生效")
 			return
@@ -12124,6 +12151,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		if autoResetCreditsChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
@@ -12135,6 +12163,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				runtimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
@@ -12155,6 +12184,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				return current
 			})
 			log.Printf("设置已更新: models_list_read_max_bytes = %d", modelsListReadMaxBytes)
+		}
+		if badRequestRetryChanged {
+			committed, updateErr := h.db.UpdateBadRequestRetryPolicy(c.Request.Context(), badRequestRetryUpdate)
+			if updateErr != nil {
+				writeError(c, http.StatusInternalServerError, "保存 Bad Request 重试策略失败，设置未生效")
+				return
+			}
+			badRequestRetryPolicy = committed
+			h.store.SetBadRequestRetryPolicy(committed)
+			proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
+				current.BadRequestRetryPolicy = committed
+				return current
+			})
+			log.Printf("设置已更新: bad_request_retry enabled=%t max_retries=%d switch_account=%t", committed.Enabled, committed.MaxRetries, committed.SwitchAccount)
 		}
 	}
 
@@ -12248,6 +12291,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 
 	c.JSON(http.StatusOK, settingsResponse{
+		BadRequestRetryEnabled:              badRequestRetryPolicy.Enabled,
+		BadRequestRetryMaxRetries:           badRequestRetryPolicy.MaxRetries,
+		BadRequestRetrySwitchAccount:        badRequestRetryPolicy.SwitchAccount,
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,

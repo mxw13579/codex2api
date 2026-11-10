@@ -1633,6 +1633,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	-- Fence generationless cache records when upgrading an already-enabled policy.
 	UPDATE system_settings SET codex_transient_429_cooldown_generation = 1
 	WHERE codex_transient_429_cooldown_enabled = TRUE AND codex_transient_429_cooldown_generation = 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS bad_request_retry_policy TEXT DEFAULT '{"enabled":false,"max_retries":1,"switch_account":false}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS continuous_retry_policy TEXT DEFAULT '{"enabled":false,"catch_all":false,"categories":["transport","http_429","http_5xx","stream_error"],"status_codes":[],"error_codes":[],"max_duration_seconds":600}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
@@ -2486,6 +2487,7 @@ type SystemSettings struct {
 	MaxRetries                         int
 	MaxRateLimitRetries                int
 	ContinuousRetryPolicy              string // JSON: database.ContinuousRetryPolicy
+	BadRequestRetryPolicy              string // JSON: database.BadRequestRetryPolicy
 	CodexTransient429CooldownEnabled   bool   // Default false; narrow policy update only.
 	AllowRemoteMigration               bool
 	ModelMapping                       string // JSON: {"anthropic_model": "codex_model", ...}
@@ -2984,6 +2986,12 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	if strings.TrimSpace(s.PayloadRules) == "" {
 		s.PayloadRules = "{}"
 	}
+	var badRequestRetryRaw sql.NullString
+	if policyErr := db.conn.QueryRowContext(ctx, `SELECT COALESCE(bad_request_retry_policy, '') FROM system_settings WHERE id = 1`).Scan(&badRequestRetryRaw); policyErr == nil {
+		s.BadRequestRetryPolicy = EncodeBadRequestRetryPolicy(ParseBadRequestRetryPolicy(badRequestRetryRaw.String))
+	} else if !errors.Is(policyErr, sql.ErrNoRows) {
+		return nil, policyErr
+	}
 	var continuousRetryRaw sql.NullString
 	if policyErr := db.conn.QueryRowContext(ctx, `SELECT COALESCE(continuous_retry_policy, '') FROM system_settings WHERE id = 1`).Scan(&continuousRetryRaw); policyErr == nil {
 		s.ContinuousRetryPolicy = continuousRetryRaw.String
@@ -3112,6 +3120,8 @@ func NormalizeCodexFingerprintDefaultMode(mode string) string {
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）。
 // codex_synced_cli_version 与 model_pricing_* 由各自的窄更新独立维护；冲突更新时
 // 保留数据库当前值，避免管理员保存其他设置时回滚后台同步刚写入的数据。
+// bad_request_retry_policy is written only by UpdateBadRequestRetryPolicy;
+// stale full-settings snapshots must not replace this independent policy.
 // continuous_retry_policy、codex_transient_429_cooldown_enabled 及其 generation 不在本方法中写入，
 // 分别使用 UpdateContinuousRetryPolicy 和 UpdateCodexTransient429CooldownPolicy，
 // 避免无关设置的陈旧快照覆盖新值；首次插入也使用数据库默认值。

@@ -4083,6 +4083,7 @@ type Store struct {
 	retryIntervalMS       atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
 	transportRetryPolicy  atomic.Value // 传输错误重试策略: rotate / sticky
 	continuousRetryPolicy atomic.Value // database.ContinuousRetryPolicy（默认关闭）
+	badRequestRetryPolicy atomic.Value // database.BadRequestRetryPolicy（默认关闭）
 	githubToken           atomic.Value // GitHub API token，仅发给 api.github.com（issue #522）
 	githubProxyURL        atomic.Value // GitHub 域名专用出站代理，空回落全局/环境代理（issue #522）
 
@@ -4934,6 +4935,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		continuousPolicy = database.DefaultContinuousRetryPolicy()
 	}
 	s.continuousRetryPolicy.Store(continuousPolicy)
+	s.SetBadRequestRetryPolicy(database.ParseBadRequestRetryPolicy(settings.BadRequestRetryPolicy))
 	s.codexFingerprintDefaultMode.Store(NormalizeCodexFingerprintMode(settings.CodexFingerprintDefaultMode))
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
@@ -8988,6 +8990,23 @@ func (s *Store) GetTransportRetryPolicy() string {
 		return v
 	}
 	return "rotate"
+}
+
+// SetBadRequestRetryPolicy publishes a normalized configuration value only.
+func (s *Store) SetBadRequestRetryPolicy(policy database.BadRequestRetryPolicy) {
+	if s != nil {
+		s.badRequestRetryPolicy.Store(database.NormalizeBadRequestRetryPolicy(policy))
+	}
+}
+
+// GetBadRequestRetryPolicy returns a value copy, defaulting to disabled.
+func (s *Store) GetBadRequestRetryPolicy() database.BadRequestRetryPolicy {
+	if s != nil {
+		if policy, ok := s.badRequestRetryPolicy.Load().(database.BadRequestRetryPolicy); ok {
+			return policy
+		}
+	}
+	return database.DefaultBadRequestRetryPolicy()
 }
 
 // SetContinuousRetryPolicy 热更新上游错误持续重试策略。

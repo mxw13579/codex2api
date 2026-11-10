@@ -155,9 +155,9 @@ func diagnosticRequestSummary(req *http.Request, plaintext [][]byte) upstreamReq
 	return summarizeUpstreamRequest(data)
 }
 
-func wrapUpstreamHTTPDiagnostic(req *http.Request, resp *http.Response, account *auth.Account, plaintext ...[]byte) {
+func wrapUpstreamHTTPDiagnostic(req *http.Request, resp *http.Response, account *auth.Account, plaintext ...[]byte) *upstreamDiagnosticBody {
 	if req == nil || resp == nil || resp.StatusCode < 400 || resp.Body == nil || security.FileLogsDisabled() {
-		return
+		return nil
 	}
 	d := upstreamHTTPDiagnostic{
 		Time:              time.Now().UTC().Format(time.RFC3339Nano),
@@ -179,7 +179,9 @@ func wrapUpstreamHTTPDiagnostic(req *http.Request, resp *http.Response, account 
 			d.ContentType = "other"
 		}
 	}
-	resp.Body = &upstreamDiagnosticBody{ReadCloser: resp.Body, ctx: req.Context(), diagnostic: d, emit: emitUpstreamHTTPDiagnostic}
+	body := &upstreamDiagnosticBody{ReadCloser: resp.Body, ctx: req.Context(), diagnostic: d, emit: emitUpstreamHTTPDiagnostic}
+	resp.Body = body
+	return body
 }
 
 func emitUpstreamHTTPDiagnostic(d upstreamHTTPDiagnostic) {
@@ -194,6 +196,19 @@ type upstreamDiagnosticBody struct {
 	diagnostic upstreamHTTPDiagnostic
 	emitted    bool
 	emit       func(upstreamHTTPDiagnostic)
+}
+
+// upstreamErrorMetadata is response-owned, immutable correlation. Do not look
+// up a.current here: retries or WS turns may advance before the body is logged.
+func (b *upstreamDiagnosticBody) upstreamErrorMetadata() upstreamErrorLogMetadata {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return upstreamErrorLogMetadata{
+		accountID:         b.diagnostic.AccountID,
+		requestID:         b.diagnostic.RequestID,
+		upstreamRequestID: b.diagnostic.UpstreamRequestID,
+		cfRay:             b.diagnostic.CFRay,
+	}
 }
 
 // 不进行额外的响应读取：仅观察业务实际读取的字节，保留原 n/err 和 Close 语义。

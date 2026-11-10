@@ -3994,6 +3994,7 @@ func firstGJSONInt(body []byte, paths ...string) int64 {
 
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
+	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
 	safePreflightSettings := CurrentRuntimeSettings()
 	var safePreflight *safePreflightState
 	defer func() {
@@ -4046,7 +4047,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	bodySignalCompact := compactionMeta.ProtocolTriggered
 	nativeRemoteCompactionV2 := bodySignalCompact && gjson.GetBytes(rawBody, "stream").Bool()
 	if bodySignalCompact && !nativeRemoteCompactionV2 {
-		h.ResponsesCompact(c)
+		h.responsesCompactWithBadRequestRetry(c, badRequestRetry)
 		return
 	}
 
@@ -4290,6 +4291,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastBody []byte
 	var lastRetryAfter string
 	retryExclusions := newRetryAccountExclusions()
+	badRequestRetryPending := false
 	var wsHTTPFallback websocketHTTPFallbackState
 	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	invalidEncryptedContentRetried := false
@@ -4316,11 +4318,32 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Pinning narrows, never replaces, normal model/channel/scope admission.
 	baseAccountFilter := accountFilter
 	accountFilter = func(a *auth.Account) bool {
+		if badRequestRetry.ForceHTTP() && a.OpenAIResponsesUsesUpstreamWebsocket() {
+			return false
+		}
 		pin := safePreflight.pinnedAccount()
 		if safePreflight != nil && (a.IsRelayStyle() || a.IsCodexAgentIdentity() || pin != 0 && a.ID() != pin) {
 			return false
 		}
 		return baseAccountFilter == nil || baseAccountFilter(a)
+	}
+	decideBadRequest := func(resp *http.Response, body []byte, readErr error, account *auth.Account, proxyURL string, useWebsocket bool) badRequestRetryDecision {
+		if pin != nil || useWebsocket || account.OpenAIResponsesUsesUpstreamWebsocket() {
+			return badRequestRetryDecision{}
+		}
+		hasPrevious := gjson.GetBytes(rawBody, "previous_response_id").String() != ""
+		completeHistory := !hasPrevious || (!bodyPreparation.InputReplayConflict && bodyPreparation.CacheLookup.Kind == responseCacheLookupHit && expandedInputRaw != "") || (searchReplay != nil && expandedInputRaw != "")
+		canRetry := !c.Writer.Written() && !continuationUnavailable && completeHistory && safePreflight.canStart(c.Request.Context()) && !safePreflight.retryUnsafe() &&
+			(!badRequestRetry.policy.SwitchAccount || (!turnContinuationPinned && safePreflight.pinnedAccount() == 0))
+		d := badRequestRetry.decide(c.Request.Context(), resp.StatusCode, body, readErr, account, proxyURL, canRetry)
+		if d.retry && d.rotate && hasPrevious {
+			// Only reuse the complete, owner-scoped history already recovered for
+			// this attempt. Never strip an opaque continuation to make it retryable.
+			rawBody, _ = sjson.SetRawBytes(rawBody, "input", []byte(expandedInputRaw))
+			rawBody, _ = sjson.DeleteBytes(rawBody, "previous_response_id")
+			resetOpenAIResponsesBody()
+		}
+		return d
 	}
 	var affinityGuard auth.SessionAffinityGuard
 	var selectionErr error
@@ -4344,21 +4367,33 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 		}
-		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+		if (wsHTTPFallback.ForceHTTP() || badRequestRetry.ForceHTTP()) && c.Request.Context().Err() != nil {
 			return
 		}
-		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback && pin != nil {
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+		retainedHTTPFallback := false
+		// A same-account re-lease still borrows under the original overflow guard.
+		if !sameBadRequestAccount {
+			account, stickyProxyURL, retainedHTTPFallback = wsHTTPFallback.Take()
+		}
+		if !sameBadRequestAccount && !retainedHTTPFallback && pin != nil {
 			// stickyProxyURL stays empty: the account's own proxy policy picks the route.
 			affinityGuard = auth.SessionAffinityGuard{}
 			account = pin.next(c, h.store, accountFilter, retryExclusions)
-		} else if !retainedHTTPFallback && safePreflight.pinnedAccount() != 0 {
+		} else if !sameBadRequestAccount && !retainedHTTPFallback && safePreflight.pinnedAccount() != 0 {
 			// Keep the original affinity guard; acquire a new ordinary lease.
 			account = h.store.TakePreferredAccountWithDispatch(safePreflight.pinnedAccount(), apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			}
-		} else if !retainedHTTPFallback {
+		} else if !sameBadRequestAccount && !retainedHTTPFallback && retryingBadRequest {
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
 				account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
@@ -4373,6 +4408,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			} else {
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
+		}
+		if retryingBadRequest && c.Request.Context().Err() != nil {
+			if account != nil {
+				h.store.Release(account)
+			}
+			return
 		}
 		if account == nil {
 			if pin != nil {
@@ -4397,7 +4438,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				safePreflight.prepareFailure(c, status)
 			}
-			if writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
+			if !retryingBadRequest && writeSchedulerQueueError(c, selectionErr, continuousRetryProtocolResponses) {
 				return
 			}
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
@@ -4517,7 +4558,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		attemptLogEffectiveModel := logEffectiveModel
 		// relay/Grok 账号默认走 HTTP，这里排除全局强制 WS，避免日志把它们错标成 via_websocket。
 		// 打开了上游 WebSocket 的 OpenAI Responses 中转账号在体积判断之后单独改回 WS。
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !badRequestRetry.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -4720,7 +4761,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 				}
 				retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
-				errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
+				errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
+				badRequestDecision := decideBadRequest(resp, errBody, readErr, account, proxyURL, useWebsocket)
 				rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 				resp.Body.Close()
 				markPinnedUpstreamResponse(c, resp)
@@ -4762,21 +4804,27 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+				if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" && !antigravityRefreshFailed && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				if badRequestDecision.unbind() {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				}
+				badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
-				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody, resp)
 				promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody, upstreamCyberPolicyAttempt{
 					Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: resp.StatusCode,
 					AccountID: account.ID(), AttemptIndex: attempt + 1,
 				}))
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				var decision codex429Decision
+				shouldRetry := badRequestDecision.retry
+				if !badRequestDecision.matched {
+					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+					shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				}
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:              account.ID(),
@@ -4807,6 +4855,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					lastBody = errBody
 					lastRetryAfter = retryAfter
 					retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+					retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+					badRequestRetryPending = badRequestDecision.retry
 					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 						return
 					}
@@ -5565,7 +5615,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
 			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
-			errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
+			errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
+			badRequestDecision := decideBadRequest(resp, errBody, readErr, account, proxyURL, useWebsocket)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			markPinnedUpstreamResponse(c, resp)
@@ -5613,19 +5664,26 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			healthKind := classifyHTTPFailure(resp.StatusCode, errBody)
+			if badRequestDecision.matched {
+				healthKind = ""
+			}
 			if safePreflight == nil && healthKind != "" {
 				h.store.ReportRequestFailure(account, healthKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !badRequestDecision.matched {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			if !accountReleasedForOverflow {
 				h.store.Release(account)
 			}
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if badRequestDecision.unbind() {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 
 			logHTTPFailure := func() {
 				log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
-				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody, resp)
 			}
 			if safePreflight == nil {
 				logHTTPFailure()
@@ -5634,8 +5692,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := safePreflight.canStart(c.Request.Context()) && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry = safePreflight.canStart(c.Request.Context()) && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			}
 			httpOutcome := streamOutcome{
 				logStatusCode: resp.StatusCode, failureKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
 				failureMessage: usageLogErrorMessage(resp.StatusCode, errBody), penalize: healthKind != "",
@@ -5692,6 +5754,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				lastBody = errBody
 				lastRetryAfter = retryAfter
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
@@ -6595,6 +6659,11 @@ func (h *Handler) Responses(c *gin.Context) {
 
 // ResponsesCompact 处理 /v1/responses/compact 请求（非流式压缩接口，透传到上游 /responses/compact）
 func (h *Handler) ResponsesCompact(c *gin.Context) {
+	h.responsesCompactWithBadRequestRetry(c, newBadRequestRetryState(h.store.GetBadRequestRetryPolicy()))
+}
+
+// Body-signal delegation from Responses keeps the original request snapshot.
+func (h *Handler) responsesCompactWithBadRequestRetry(c *gin.Context, badRequestRetry *badRequestRetryState) {
 	// /v1/responses can hand body-signal compaction over to this handler, which
 	// has no pinned-account path yet. Refuse instead of scheduling internally.
 	if _, pinned := pinnedAccountIDFromContext(c); pinned {
@@ -6775,6 +6844,29 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	badRequestRetryPending := false
+	baseAccountFilter := accountFilter
+	accountFilter = func(account *auth.Account) bool {
+		return (!badRequestRetry.ForceHTTP() || !account.OpenAIResponsesUsesUpstreamWebsocket()) && baseAccountFilter(account)
+	}
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	turnContinuationPinned := codexTurnContinuationToken(c.Request.Header, rawBody) != "" && turnHasBinding
+	decideBadRequest := func(resp *http.Response, body []byte, readErr error, account *auth.Account, proxyURL string) badRequestRetryDecision {
+		if account.OpenAIResponsesUsesUpstreamWebsocket() {
+			return badRequestRetryDecision{}
+		}
+		hasPrevious := gjson.GetBytes(rawBody, "previous_response_id").String() != ""
+		completeHistory := !hasPrevious || (!bodyPreparation.InputReplayConflict && bodyPreparation.CacheLookup.Kind == responseCacheLookupHit && bodyPreparation.ExpandedInputRaw != "")
+		canRetry := !c.Writer.Written() && !continuationUnavailable && completeHistory && (!badRequestRetry.policy.SwitchAccount || !turnContinuationPinned)
+		d := badRequestRetry.decide(c.Request.Context(), resp.StatusCode, body, readErr, account, proxyURL, canRetry)
+		if d.retry && d.rotate && hasPrevious {
+			// Rotation may replay recovered history, never a lossy cache miss.
+			rawBody, _ = sjson.SetRawBytes(rawBody, "input", []byte(bodyPreparation.ExpandedInputRaw))
+			rawBody, _ = sjson.DeleteBytes(rawBody, "previous_response_id")
+			openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+		}
+		return d
+	}
 	invalidEncryptedContentRetried := false
 	relayContinuationAttempted := false
 
@@ -6783,22 +6875,40 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Antigravity 账号，因此不带渠道：Antigravity 渠道 Key 在这里也不该对 Codex relay
 	// 候选套用加权避险。
 	selectionOpts := selectionOptionsForCandidatePool(c, effectiveModel, dispatchPolicy, true)
+	// Same-account retries must retain the original capacity-overflow guard.
+	var affinityGuard auth.SessionAffinityGuard
 	for attempt := 0; ; attempt++ {
-		var account *auth.Account
-		var stickyProxyURL string
-		var affinityGuard auth.SessionAffinityGuard
+		if badRequestRetry.ForceHTTP() && c.Request.Context().Err() != nil {
+			return
+		}
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
 		var selectionErr error
-		if attempt == 0 && compactionAffinity.Known {
+		if !sameBadRequestAccount && attempt == 0 && compactionAffinity.Known {
 			account = h.store.TakePreferredAccountWithDispatch(compactionAffinity.PreferredAccountID, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy)
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			}
 		}
-		if account == nil {
+		if !sameBadRequestAccount && account == nil {
 			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+		}
+		if retryingBadRequest && c.Request.Context().Err() != nil {
+			if account != nil {
+				h.store.Release(account)
+			}
+			return
 		}
 		if account == nil {
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
+				return
+			}
+			if retryingBadRequest && badRequestRetry.failedSelection(lastStatusCode, lastBody) {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
 			if compactionAffinity.Known && !retryExclusions.CanContinueTransientCycle() {
@@ -6933,7 +7043,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 
 			if resp.StatusCode != http.StatusOK {
-				errBody, _ := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+				errBody, readErr := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+				badRequestDecision := decideBadRequest(resp, errBody, readErr, account, proxyURL)
 				rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 				resp.Body.Close()
 				if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -6960,20 +7071,26 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+				if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				if badRequestDecision.unbind() {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				}
 				effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
-				retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
+				badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
 
-				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
+				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody, resp)
 				promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 					Transport: "http", StatusCode: resp.StatusCode, AccountID: account.ID(), AttemptIndex: attempt + 1,
 				}))
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+				var decision codex429Decision
+				shouldRetry := badRequestDecision.retry
+				if !badRequestDecision.matched {
+					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+					shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+				}
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:              account.ID(),
@@ -7001,6 +7118,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
 					retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+					retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+					badRequestRetryPending = badRequestDecision.retry
 					if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 						return
 					}
@@ -7189,7 +7308,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+			errBody, readErr := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+			badRequestDecision := decideBadRequest(resp, errBody, readErr, account, proxyURL)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -7216,21 +7336,29 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !badRequestDecision.matched {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			if badRequestDecision.unbind() {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
 			effectiveRateLimitRetries := h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries)
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries)
+			badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
 
-			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
+			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody, resp)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: "http", StatusCode: resp.StatusCode, AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -7258,6 +7386,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, effectiveRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}
@@ -7411,7 +7541,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				retryExclusions.MarkHTTPFailure(account.ID(), failStatus, errBody, maxRetries, effectiveRateLimitRetries, continuousPolicy)
 			}
 
-			logUpstreamError("/v1/responses/compact", failStatus, logModel, account.ID(), errBody)
+			logUpstreamError("/v1/responses/compact", failStatus, logModel, account.ID(), errBody, resp)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: "http", StatusCode: failStatus, AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
@@ -7512,6 +7642,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 // ChatCompletions 处理 OpenAI Chat Completions 请求，并在流式响应中发送协议保活。
 func (h *Handler) ChatCompletions(c *gin.Context) {
+	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -7653,6 +7784,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionIdentity.affinityID, apiKeyID)
+	_, turnHasBinding := h.store.SessionAffinityAccountID(affinityKey)
+	turnContinuationPinned := codexTurnContinuationToken(c.Request.Header, rawBody) != "" && turnHasBinding
 
 	// 3. 带重试的上游请求
 	maxRetries := pin.retryLimit(h.getMaxRetries())
@@ -7662,6 +7795,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	badRequestRetryPending := false
+	baseAccountFilter := accountFilter
+	accountFilter = func(account *auth.Account) bool {
+		return (!badRequestRetry.ForceHTTP() || !account.OpenAIResponsesUsesUpstreamWebsocket()) && baseAccountFilter(account)
+	}
 	var wsHTTPFallback websocketHTTPFallbackState
 	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	antigravityRefreshRetried := map[int64]bool{}
@@ -7682,19 +7820,46 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var selectionErr error
 	grokQualityAttempts := 0
 	for attempt := 0; ; attempt++ {
-		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+		if (wsHTTPFallback.ForceHTTP() || badRequestRetry.ForceHTTP()) && c.Request.Context().Err() != nil {
 			return
 		}
-		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback && pin != nil {
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+		retainedHTTPFallback := false
+		// A same-account re-lease still borrows under the original overflow guard.
+		if !sameBadRequestAccount {
+			account, stickyProxyURL, retainedHTTPFallback = wsHTTPFallback.Take()
+		}
+		if !sameBadRequestAccount && !retainedHTTPFallback && pin != nil {
 			// stickyProxyURL stays empty: the account's own proxy policy picks the route.
 			affinityGuard = auth.SessionAffinityGuard{}
 			account = pin.next(c, h.store, accountFilter, retryExclusions)
-		} else if !retainedHTTPFallback {
+		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
+			if retryingBadRequest {
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+			} else {
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
+			}
+		}
+		if retryingBadRequest && c.Request.Context().Err() != nil {
+			if account != nil {
+				h.store.Release(account)
+			}
+			return
 		}
 		if account == nil {
+			if retryingBadRequest && badRequestRetry.failedSelection(lastStatusCode, lastBody) {
+				if isStream && writeCommittedChatRetryError(c, usageLogErrorMessage(lastStatusCode, lastBody)) {
+					return
+				}
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+				return
+			}
 			if pin != nil {
 				pin.writeFailure(c, continuousRetryProtocolChat, isStream)
 				return
@@ -7762,7 +7927,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !badRequestRetry.ForceHTTP() && !isRelayAccount
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
@@ -7972,7 +8137,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, _ := readUpstreamErrorBody(readCtx, resp.Body)
+			errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
+			var badRequestDecision badRequestRetryDecision
+			if pin == nil && !useWebsocket && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+				canRetry := !c.Writer.Written() && (!badRequestRetry.policy.SwitchAccount || !turnContinuationPinned)
+				badRequestDecision = badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL, canRetry)
+			}
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			markPinnedUpstreamResponse(c, resp)
@@ -7993,22 +8163,30 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d, endpoint=/v1/chat/completions): %v", account.ID(), refreshErr)
 				}
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !badRequestDecision.matched {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if badRequestDecision.unbind() {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
-			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
+			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody, resp)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -8038,6 +8216,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}

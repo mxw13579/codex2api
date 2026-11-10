@@ -159,22 +159,46 @@ func noteUpstreamTurnState(ctx context.Context, state string) {
 }
 
 func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *auth.Account, proxyURL string, diagnosticBody ...[]byte) (*http.Response, error) {
+	requestID := cookieLogRequestID(req.Context()) // freeze before a later turn can reset the shared trace
 	record := beginUpstreamTrace(req.Context(), account, proxyURL, false)
 	resp, err := client.Do(req)
 	record(resp)
 	sentRequest := req
 	if resp != nil && resp.Request != nil {
 		sentRequest = resp.Request
-		if sentRequest != req {
-			// 重定向可能改变方法/正文，不能把首跳摘要当作最终出站请求。
+		if resp.StatusCode >= 400 && len(diagnosticBody) > 0 && !sameUpstreamDiagnosticRequest(req, sentRequest) {
+			// 真正重定向可能改变正文；HTTP/2 内部的浅拷贝不是重定向。
 			diagnosticBody = nil
 		}
 	}
 	if trace := NewUpstreamCookieTrace(req.Context(), account, "http", "", sentRequest.Header, resp); trace != nil && resp != nil && resp.Body != nil {
 		resp.Body = &upstreamCookieBody{ReadCloser: resp.Body, trace: trace}
 	}
-	wrapUpstreamHTTPDiagnostic(sentRequest, resp, account, diagnosticBody...)
+	if diagnostic := wrapUpstreamHTTPDiagnostic(sentRequest, resp, account, diagnosticBody...); diagnostic != nil {
+		// No caller can read this response yet. Bind correlation to this exact
+		// response, not the mutable current attempt consulted at log-write time.
+		diagnostic.diagnostic.RequestID = requestID
+	}
 	return resp, err
+}
+
+// sameUpstreamDiagnosticRequest accepts net/http's internal request copies,
+// including setupRewindBody on a reused HTTP/2 connection. The client records a
+// real redirect in Request.Response, even when it redirects to the same URL.
+// Keep checking wire metadata too; never attach the first-hop plaintext to a
+// changed destination, method, or encoding. This does not read either Body.
+func sameUpstreamDiagnosticRequest(original, sent *http.Request) bool {
+	if original == nil || sent == nil {
+		return false
+	}
+	if original == sent {
+		return true
+	}
+	return original.Response == sent.Response &&
+		original.URL != nil && sent.URL != nil && original.URL.String() == sent.URL.String() &&
+		original.Method == sent.Method && original.Host == sent.Host &&
+		original.ContentLength == sent.ContentLength &&
+		original.Header.Get("Content-Encoding") == sent.Header.Get("Content-Encoding")
 }
 
 func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput) {

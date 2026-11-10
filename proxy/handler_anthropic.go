@@ -547,6 +547,8 @@ func (h *Handler) translateAnthropicMessagesToCodexOnce(c *gin.Context, state *a
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
 func (h *Handler) Messages(c *gin.Context) {
+	// Freeze the retry policy before a slow upload can observe a hot reload.
+	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -741,6 +743,11 @@ func (h *Handler) Messages(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	badRequestRetryPending := false
+	baseAccountFilter := accountFilter
+	accountFilter = func(account *auth.Account) bool {
+		return (!badRequestRetry.ForceHTTP() || !account.OpenAIResponsesUsesUpstreamWebsocket()) && baseAccountFilter(account)
+	}
 	var wsHTTPFallback websocketHTTPFallbackState
 	defer wsHTTPFallback.ReleaseRetained(h.store.Release)
 	antigravityRefreshRetried := map[int64]bool{}
@@ -759,19 +766,48 @@ func (h *Handler) Messages(c *gin.Context) {
 	grokQualityAttempts := 0
 	var lastClaudePolicyErr *Error
 	for attempt := 0; ; attempt++ {
-		if wsHTTPFallback.ForceHTTP() && c.Request.Context().Err() != nil {
+		if (wsHTTPFallback.ForceHTTP() || badRequestRetry.ForceHTTP()) && c.Request.Context().Err() != nil {
 			return
 		}
-		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback && pin != nil {
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, accountFilter, selectionOpts.Policy)
+		retainedHTTPFallback := false
+		// A same-account re-lease still borrows under the original overflow guard.
+		if !sameBadRequestAccount {
+			account, stickyProxyURL, retainedHTTPFallback = wsHTTPFallback.Take()
+		}
+		if !sameBadRequestAccount && !retainedHTTPFallback && pin != nil {
 			// stickyProxyURL stays empty: the account's own proxy policy picks the route.
 			affinityGuard = auth.SessionAffinityGuard{}
 			account = pin.next(c, h.store, accountFilter, retryExclusions)
-		} else if !retainedHTTPFallback {
+		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
-			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
+			if retryingBadRequest {
+				// One ordinary selection, without the continuous pool wait/reset loop.
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+			} else {
+				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
+			}
+		}
+		if c.Request.Context().Err() != nil && retryingBadRequest {
+			if account != nil {
+				h.store.Release(account)
+			}
+			return
 		}
 		if account == nil {
+			if retryingBadRequest && badRequestRetry.failedSelection(lastStatusCode, lastBody) {
+				msg := usageLogErrorMessage(lastStatusCode, lastBody)
+				if isStream && writeCommittedAnthropicRetryError(c, ErrorTypeInvalidRequest, msg) {
+					return
+				}
+				sendAnthropicError(c, lastStatusCode, ErrorTypeInvalidRequest, msg)
+				return
+			}
 			if pin != nil {
 				pin.writeFailure(c, continuousRetryProtocolAnthropic, isStream)
 				return
@@ -858,7 +894,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			// only the Antigravity contract, including in a mixed account pool.
 			attemptEffectiveModel = logicalRequestModel
 		}
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !badRequestRetry.ForceHTTP() && !isRelayAccount
 		// 加速档走 HTTP，保证每个请求的 routing hint 与自身档位一致。
 		if useWebsocket && fastTierRequiresHTTP(serviceTier) {
 			useWebsocket = false
@@ -1162,7 +1198,11 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, readErr := readAllLimitedWithContinuousRetryKeepalive(readCtx, resp.Body, upstreamErrorBodyReadMaxBytes)
+			errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
+			var badRequestDecision badRequestRetryDecision
+			if !useWebsocket && pin == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+				badRequestDecision = badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL, !c.Writer.Written())
+			}
 			if readErr != nil {
 				errBody = []byte(`{"error":{"message":"Upstream error response exceeded the safe read limit","type":"api_error"}}`)
 			}
@@ -1208,28 +1248,36 @@ func (h *Handler) Messages(c *gin.Context) {
 					log.Printf("Antigravity OAuth refresh failed after upstream 401 (account=%d, endpoint=/v1/messages): %v", account.ID(), refreshErr)
 				}
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" && !antigravityNonPenalizingUpstreamFailure(account, resp.StatusCode, errBody) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			// Claude 的 429 credits_required 是模型级计费门槛:只冷却该模型,不按账号级限流处理
 			// (否则会连累该号的其它可用模型)。命中则跳过账号级用量/限流同步。
-			if account.IsClaudeOAuth() && HandleClaudeModelBillingRejection(h.store, account, attemptEffectiveModel, resp.StatusCode, errBody) {
-				log.Printf("Claude 模型 %s 需购买 usage credits(credits_required),已对该模型冷却 %s(不影响账号其它模型)", attemptEffectiveModel, claudeCreditsRequiredCooldown)
-			} else {
-				syncAnthropicUsageStateForAccount(h.store, account, resp)
+			if !badRequestDecision.matched {
+				if account.IsClaudeOAuth() && HandleClaudeModelBillingRejection(h.store, account, attemptEffectiveModel, resp.StatusCode, errBody) {
+					log.Printf("Claude 模型 %s 需购买 usage credits(credits_required),已对该模型冷却 %s(不影响账号其它模型)", attemptEffectiveModel, claudeCreditsRequiredCooldown)
+				} else {
+					syncAnthropicUsageStateForAccount(h.store, account, resp)
+				}
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			if badRequestDecision.unbind() {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			}
+			badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
-			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
+			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody, resp)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody, upstreamCyberPolicyAttempt{
 				Transport: upstreamPromptPolicyTransport(isStream, useWebsocket), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+				shouldRetry = shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -1259,6 +1307,8 @@ func (h *Handler) Messages(c *gin.Context) {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, attemptMaxRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return
 				}

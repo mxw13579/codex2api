@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,8 +92,50 @@ func (fl *fileLogger) close() {
 	}
 }
 
+type upstreamErrorLogMetadata struct {
+	accountID         int64
+	requestID         string
+	upstreamRequestID string
+	cfRay             string
+}
+
+func upstreamErrorMetadataFromBody(body io.ReadCloser) upstreamErrorLogMetadata {
+	if source, ok := body.(interface {
+		upstreamErrorMetadata() upstreamErrorLogMetadata
+	}); ok {
+		return source.upstreamErrorMetadata()
+	}
+	return upstreamErrorLogMetadata{}
+}
+
+// upstreamErrorLogCorrelation links the existing redacted response-body log to
+// usage_logs and upstream_errors.jsonl. Only validated IDs from this response
+// are emitted. An unknown body wrapper fails closed instead of consulting a
+// mutable request-wide attempt or copying arbitrary response headers.
+func upstreamErrorLogCorrelation(resp *http.Response, accountID int64) string {
+	if resp == nil {
+		return ""
+	}
+	metadata := upstreamErrorMetadataFromBody(resp.Body)
+	requestID := safeUpstreamTraceID(metadata.requestID)
+	upstreamID, cfRay := "", ""
+	if metadata.accountID == accountID {
+		upstreamID = safeUpstreamTraceID(metadata.upstreamRequestID)
+		cfRay = safeUpstreamTraceID(metadata.cfRay)
+	}
+	var out strings.Builder
+	for _, field := range []struct{ name, value string }{
+		{"Request-ID", requestID}, {"Upstream-Request-ID", upstreamID}, {"CF-Ray", cfRay},
+	} {
+		if field.value != "" {
+			fmt.Fprintf(&out, "%s: %s\n", field.name, field.value)
+		}
+	}
+	return out.String()
+}
+
 // writeEntry 写一条错误日志（自动脱敏敏感信息）
-func (fl *fileLogger) writeEntry(endpoint string, statusCode int, model string, accountID int64, body []byte) {
+func (fl *fileLogger) writeEntry(endpoint string, statusCode int, model string, accountID int64, body []byte, responses ...*http.Response) {
 	l := fl.init()
 	if l == nil {
 		return
@@ -102,18 +146,22 @@ func (fl *fileLogger) writeEntry(endpoint string, statusCode int, model string, 
 	safeModel := security.SanitizeLog(model)
 	bodyStr := upstreamErrorLogBody(body)
 
+	correlation := ""
+	if len(responses) > 0 {
+		correlation = upstreamErrorLogCorrelation(responses[0], accountID)
+	}
 	ts := time.Now().Format("2006/01/02 15:04:05")
-	l.Printf("========== %s ==========\nEndpoint: %s\nStatus: %d\nModel: %s\nAccount: %d\nResponse:\n%s\n",
-		ts, safeEndpoint, statusCode, safeModel, accountID, bodyStr)
+	l.Printf("========== %s ==========\nEndpoint: %s\nStatus: %d\nModel: %s\nAccount: %d\n%sResponse:\n%s\n",
+		ts, safeEndpoint, statusCode, safeModel, accountID, correlation, bodyStr)
 }
 
 // logUpstreamError 根据状态码分发到对应日志文件
-func logUpstreamError(endpoint string, statusCode int, model string, accountID int64, body []byte) {
+func logUpstreamError(endpoint string, statusCode int, model string, accountID int64, body []byte, responses ...*http.Response) {
 	switch {
 	case statusCode == 400:
-		badRequestLogger.writeEntry(endpoint, statusCode, model, accountID, body)
+		badRequestLogger.writeEntry(endpoint, statusCode, model, accountID, body, responses...)
 	case statusCode >= 500:
-		serverErrorLogger.writeEntry(endpoint, statusCode, model, accountID, body)
+		serverErrorLogger.writeEntry(endpoint, statusCode, model, accountID, body, responses...)
 	}
 }
 

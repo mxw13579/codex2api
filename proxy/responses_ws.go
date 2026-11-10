@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -570,6 +569,13 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastBody []byte
 	var lastRetryableUpstreamErr *api.APIError
 	retryExclusions := newRetryAccountExclusions()
+	badRequestPolicy := h.store.GetBadRequestRetryPolicy()
+	badRequestRetry := newBadRequestRetryState(badRequestPolicy)
+	badRequestRetryPending := false
+	baseAccountFilter := accountFilter
+	accountFilter = func(account *auth.Account) bool {
+		return (!badRequestRetry.ForceHTTP() || !account.OpenAIResponsesUsesUpstreamWebsocket()) && baseAccountFilter(account)
+	}
 	invalidEncryptedContentRetried := false
 	// 官方 Codex 每个 turn 都使用新的 ModelClientSession，并只在同一 turn 的
 	// 后续请求里回送 x-codex-turn-state。只有该信号和既有绑定同时存在时，才允许
@@ -636,8 +642,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if c.Request.Context().Err() != nil {
 			return errResponsesWSClientGone
 		}
-		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
-		if !retainedHTTPFallback {
+		retryingBadRequest := badRequestRetryPending
+		badRequestRetryPending = false
+		if retryingBadRequest {
+			h.ReleaseAPIKeyScopeConcurrency(c)
+		}
+		account, stickyProxyURL, sameBadRequestAccount := badRequestRetry.takeSameAccount(c.Request.Context(), h.store, apiKeyID, retryExclusions, accountFilter, dispatchPolicy)
+		retainedHTTPFallback := false
+		// A same-account re-lease still borrows under the original overflow guard.
+		if !sameBadRequestAccount {
+			account, stickyProxyURL, retainedHTTPFallback = wsHTTPFallback.Take()
+		}
+		if !sameBadRequestAccount && !retainedHTTPFallback && retryingBadRequest {
+			// Rotation was admitted only for self-contained, unpinned history.
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if !continuationPinned && hasPreviousResponse && !continuationDegraded && !searchContinuation {
 				// 绑定账号已被本次请求硬排除（上一轮 429/5xx 等）时不必再等它 30s：
@@ -664,11 +683,17 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
 		}
+		if account != nil && c.Request.Context().Err() != nil {
+			h.store.Release(account)
+			return errResponsesWSClientGone
+		}
 		if account == nil {
 			if c.Request.Context().Err() != nil {
 				return errResponsesWSClientGone
 			}
-			if selectionAPIError := schedulerSelectionAPIError(selectionErr); selectionAPIError != nil {
+			if retryingBadRequest && badRequestRetry.failedSelection(lastStatusCode, lastBody) {
+				apiErr = responsesWSClientUpstreamAPIError(responsesWSUpstreamAPIError(lastStatusCode, lastBody), hideUpstreamErrors)
+			} else if selectionAPIError := schedulerSelectionAPIError(selectionErr); selectionAPIError != nil {
 				apiErr = selectionAPIError
 			} else if compactionAffinity.Known {
 				apiErr = compactionUpstreamUnavailableAPIError()
@@ -748,7 +773,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
 		lastUpstreamCancel = upstreamCancel
 		ttftGuard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(currentFirstTokenTimeout(), bodySignalCompact), upstreamCancel)
-		useWebsocket := !wsHTTPFallback.ForceHTTP()
+		useWebsocket := !wsHTTPFallback.ForceHTTP() && !badRequestRetry.ForceHTTP()
 		// 生图请求改走 HTTP 上游（客户端仍是 WS）：WebSocket 上游传输大体积
 		// 图片数据会卡死（issue #220）；自然语言生图意图也需保留图片工具（issue #288）。
 		if useWebsocket && (responsesBodyRequestsImageGeneration(rawBody) || naturalImageIntent) {
@@ -780,6 +805,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死。
 		upstreamBody := codexBody
 		attemptReplay := turnReplay
+		completeHTTPHistory := !hasPreviousResponse || continuationDegraded
 		if account.IsOpenAIResponsesAPI() {
 			// A Responses relay supports its own native fields and continuation
 			// state. Do not feed it Codex's lossy compatibility preparation.
@@ -812,6 +838,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if lost {
 				continuationContextLost = true
 				attemptReplay = nil
+			} else {
+				completeHTTPHistory = true
 			}
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
@@ -975,7 +1003,21 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBodyBytes))
+			errBody, readErr := readUpstreamErrorBody(c.Request.Context(), resp.Body)
+			var badRequestDecision badRequestRetryDecision
+			if !useWebsocket && pinnedAccountDispatchForRequest(c) == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+				// No turn output has been committed on this HTTP-error path. Do not
+				// degrade a continuation merely to enable rotation for this policy.
+				canRetry := !continuationContextLost && (!badRequestPolicy.SwitchAccount ||
+					(!continuationPinned && completeHTTPHistory))
+				badRequestDecision = badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL, canRetry)
+				if badRequestDecision.retry && badRequestDecision.rotate && hasPreviousResponse && !continuationDegraded {
+					// Reuse only the complete history already recovered for this HTTP
+					// attempt. Never call the lossy degradation path to enable a retry.
+					codexBody, turnReplay = upstreamBody, attemptReplay
+					continuationDegraded = true
+				}
+			}
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if c.Request.Context().Err() != nil {
@@ -1024,24 +1066,30 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				continue
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); !badRequestDecision.matched && kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !badRequestDecision.matched {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
-			if !preserveContinuationBinding() {
+			if badRequestDecision.unbind() && !preserveContinuationBinding() {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
-			retryExclusions.MarkHTTPFailure(account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+			badRequestDecision.markExclusions(retryExclusions, account.ID(), resp.StatusCode, errBody, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
-			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
+			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody, resp)
 			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody, upstreamCyberPolicyAttempt{
 				Transport: upstreamPromptPolicyTransport(true, useWebsocket), StatusCode: resp.StatusCode,
 				AccountID: account.ID(), AttemptIndex: attempt + 1,
 			}))
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := retryEnabled && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+			var decision codex429Decision
+			shouldRetry := badRequestDecision.retry
+			if !badRequestDecision.matched {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry = retryEnabled && shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:              account.ID(),
@@ -1072,6 +1120,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				lastBody = errBody
 				lastRetryableUpstreamErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
 				retryOrdinal, retryLimit := retryStateForHTTPStatusWithBody(resp.StatusCode, errBody, generalRetries, rateLimitRetries, maxRetries, maxRateLimitRetries, continuousRetryPolicy)
+				retryOrdinal, retryLimit = badRequestDecision.waitBudget(retryOrdinal, retryLimit)
+				badRequestRetryPending = badRequestDecision.retry
 				if !h.waitBeforeRetryWithBudget(c.Request.Context(), retryOrdinal, retryLimit, resp) {
 					return errResponsesWSClientGone
 				}
