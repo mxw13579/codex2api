@@ -28,6 +28,7 @@ func TestIntelligenceExecutorPinsPromptAndFinishesBeforeEOF(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})
+	a.ResponsesUpstreamTransport = auth.OpenAIResponsesTransportWebsocket
 	h.store.AddAccount(&auth.Account{DBID: 43, UpstreamType: auth.UpstreamOpenAIResponses, APIKey: "wrong", BaseURL: "http://127.0.0.1:1"})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -64,10 +65,11 @@ func TestIntelligenceTimeoutKeepsPartialAnswerAsError(t *testing.T) {
 		w.(http.Flusher).Flush()
 		<-r.Context().Done()
 	})
+	a.ResponsesUpstreamTransport = auth.OpenAIResponsesTransportWebsocket
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	result := h.executeIntelligenceCheck(ctx, a, "gpt-4o-mini", "high", "answer")
-	if result.Complete || result.Error == "" || result.Output != "21" {
+	if result.Complete || !strings.Contains(result.Error, context.DeadlineExceeded.Error()) || result.Output != "21" || result.EffectiveContext["transport"] != "http" {
 		t.Fatalf("timeout result=%+v", result)
 	}
 }

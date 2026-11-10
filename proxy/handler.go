@@ -40,19 +40,10 @@ import (
 const consoleUpstreamErrorLogMaxBytes = 4 * 1024
 
 func upstreamErrorConsoleBody(body []byte) string {
-	if len(bytes.TrimSpace(body)) > 0 && !gjson.ValidBytes(body) {
-		return fmt.Sprintf("[non-JSON upstream body omitted; %d bytes]", len(body))
-	}
-	truncated := false
-	if len(body) > consoleUpstreamErrorLogMaxBytes {
-		body = body[:consoleUpstreamErrorLogMaxBytes]
-		truncated = true
-	}
-	bodyStr := security.SafeTruncate(security.SanitizeLog(string(body)), consoleUpstreamErrorLogMaxBytes)
-	if truncated {
-		bodyStr += " ... [truncated]"
-	}
-	return bodyStr
+	return sanitizedUpstreamErrorLogBody(body, consoleUpstreamErrorLogMaxBytes, consoleUpstreamErrorLogMaxBytes, func(text string) string {
+		// SanitizeLog 自带 1000 字符截断，这里必须先完整脱敏，再由共同函数截断并标记。
+		return security.MaskSensitiveData(strings.NewReplacer("\r", " ", "\n", " ").Replace(text))
+	})
 }
 
 // Handler API 路由处理器
@@ -885,56 +876,8 @@ func usageLogErrorMessageImpl(statusCode int, body []byte, trustedText bool) str
 		return ""
 	}
 
-	candidates := []string{
-		gjson.GetBytes(body, "error.message").String(),
-		gjson.GetBytes(body, "response.error.message").String(),
-		gjson.GetBytes(body, "response.status_details.error.message").String(),
-		gjson.GetBytes(body, "message").String(),
-	}
-	message := ""
-	for _, candidate := range candidates {
-		if candidate = strings.TrimSpace(candidate); candidate != "" {
-			message = candidate
-			break
-		}
-	}
-	if message == "" {
-		// Grok/xAI 风格错误体把说明放在顶层字符串 error 字段:
-		// {"code":"invalid-argument","error":"..."}。仅在 error 是字符串时采用,
-		// 避免把对象形态的整段 JSON 打进 message。
-		if errField := gjson.GetBytes(body, "error"); errField.Type == gjson.String {
-			message = strings.TrimSpace(errField.String())
-		}
-	}
-
-	codeCandidates := []string{
-		gjson.GetBytes(body, "error.code").String(),
-		gjson.GetBytes(body, "response.error.code").String(),
-		gjson.GetBytes(body, "response.status_details.error.code").String(),
-		gjson.GetBytes(body, "detail.code").String(),
-		gjson.GetBytes(body, "code").String(),
-	}
-	code := ""
-	for _, candidate := range codeCandidates {
-		if candidate = strings.TrimSpace(candidate); candidate != "" {
-			code = candidate
-			break
-		}
-	}
-
-	typeCandidates := []string{
-		gjson.GetBytes(body, "error.type").String(),
-		gjson.GetBytes(body, "response.error.type").String(),
-		gjson.GetBytes(body, "response.status_details.error.type").String(),
-		gjson.GetBytes(body, "type").String(),
-	}
-	errType := ""
-	for _, candidate := range typeCandidates {
-		if candidate = strings.TrimSpace(candidate); candidate != "" && candidate != "error" {
-			errType = candidate
-			break
-		}
-	}
+	fields := extractUpstreamErrorFields(body)
+	message, code, errType := fields.message, fields.code, fields.kind
 
 	if message == "" {
 		// HTML and plain-text provider pages routinely contain request IDs,

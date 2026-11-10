@@ -19,11 +19,11 @@ func TestUpstreamTraceAttemptIsolation(t *testing.T) {
 	account := &auth.Account{DBID: 1, UpstreamRequestIDHeader: "Vendor-Trace"}
 	first := beginUpstreamTrace(c.Request.Context(), account, "http://user:password@proxy.invalid:1080", false)
 	second := beginUpstreamTrace(c.Request.Context(), account, "", false)
-	second(&http.Response{Header: http.Header{"Vendor-Trace": {"second"}, "X-Request-Id": {"not-selected"}}})
+	second(&http.Response{Header: http.Header{"Vendor-Trace": {upstreamResponseTestUUID}, "X-Request-Id": {"not-selected"}}})
 	first(&http.Response{Header: http.Header{"Vendor-Trace": {"late-first"}}})
 	input := &database.UsageLogInput{AccountID: 1}
 	populateUpstreamTrace(c, input)
-	if input.RequestID == "" || input.UpstreamRequestID != "second" || input.UpstreamProxyName != "direct/no_proxy" {
+	if input.RequestID == "" || input.UpstreamRequestID != upstreamResponseTestUUID || input.UpstreamProxyName != "direct/no_proxy" {
 		t.Fatalf("trace = %+v", input)
 	}
 	before := input.RequestID
@@ -54,7 +54,7 @@ func TestUpstreamTraceHTTPFailureAndReset(t *testing.T) {
 	_ = resp.Body.Close()
 	input := &database.UsageLogInput{AccountID: 2}
 	populateUpstreamTrace(c, input)
-	if input.UpstreamRequestID == "" || len([]rune(input.UpstreamRequestID)) > 128 || input.UpstreamProxyName != "unmanaged" {
+	if input.UpstreamRequestID != "" || input.UpstreamProxyName != "unmanaged" {
 		t.Fatalf("failure trace = %+v", input)
 	}
 	resetUpstreamAttemptTrace(c.Request.Context())
@@ -64,6 +64,35 @@ func TestUpstreamTraceHTTPFailureAndReset(t *testing.T) {
 		t.Fatal("local failure inherited prior attempt")
 	}
 	beginUpstreamTrace(context.Background(), &auth.Account{}, "", false)(resp)
+}
+
+func TestUpstreamTraceResponseRequestID(t *testing.T) {
+	for _, tt := range upstreamResponseMetadataTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			attachUpstreamTrace(c, nil)
+			account := &auth.Account{DBID: 1, UpstreamRequestIDHeader: tt.configured}
+			beginUpstreamTrace(c.Request.Context(), account, "", false)(&http.Response{Header: tt.headers})
+			input := &database.UsageLogInput{AccountID: 1}
+			populateUpstreamTrace(c, input)
+			if input.UpstreamRequestID != tt.want {
+				t.Fatalf("usage request ID = %q, want %q", input.UpstreamRequestID, tt.want)
+			}
+			frozen := snapshotUpstreamTrace(c.Request.Context())
+			resetUpstreamAttemptTrace(c.Request.Context())
+			input = &database.UsageLogInput{AccountID: 1}
+			frozen.apply(input)
+			if input.UpstreamRequestID != tt.want {
+				t.Fatal("snapshot changed the request ID")
+			}
+			otherAccount := &database.UsageLogInput{AccountID: 2}
+			frozen.apply(otherAccount)
+			if otherAccount.UpstreamRequestID != "" {
+				t.Fatal("snapshot leaked another account's request ID")
+			}
+		})
+	}
 }
 
 func TestUpstreamTraceAccountBoundRouteSnapshot(t *testing.T) {

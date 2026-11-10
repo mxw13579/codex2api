@@ -34,8 +34,9 @@ type intelligenceExecution struct {
 }
 
 // Uses the same outbound executors as generation, with no browser request context
-// or application-level retry. The detector context freezes the measurement prompt
-// and model against user payload rules; identity/fingerprint/timezone still apply.
+// or application-level retry. Only this check requires HTTP, retaining SSE.
+// The detector context freezes the measurement prompt and model against user
+// payload rules; identity/fingerprint/timezone still apply.
 func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Account, model, effort, prompt string) (result intelligenceExecution) {
 	if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() {
 		return intelligenceExecution{Interrupted: true, Error: "配置错误：该账号渠道不支持降智检测"}
@@ -66,6 +67,7 @@ func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Ac
 	}
 	body, _ := json.Marshal(payload)
 	proxyURL := strings.TrimSpace(account.GetProxyURL())
+	ctx = proxy.WithUpstreamHTTPOnly(ctx)
 	ctx, cancel := context.WithCancel(proxy.WithAccountBoundEgress(proxy.WithUpstreamIdentityAudit(proxy.WithCodexDetectorRequest(ctx)), proxyURL))
 	defer cancel()
 	fingerprint := ""

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,7 @@ func TestHandlersBoundUpstreamErrorBodies(t *testing.T) {
 func TestReadUpstreamErrorBodyBoundsPrefix(t *testing.T) {
 	input := strings.NewReader(strings.Repeat("x", 2*maxUpstreamErrorBodyBytes))
 	data, err := readUpstreamErrorBody(context.Background(), input)
-	if err != nil || len(data) != maxUpstreamErrorBodyBytes || input.Len() != maxUpstreamErrorBodyBytes {
+	if !errors.Is(err, errUpstreamErrorBodyTooLarge) || len(data) != maxUpstreamErrorBodyBytes || input.Len() != maxUpstreamErrorBodyBytes-1 {
 		t.Fatalf("len=%d remaining=%d err=%v", len(data), input.Len(), err)
 	}
 	data, err = readUpstreamErrorBody(context.Background(), strings.NewReader(`{"error":{"code":"restricted"}}`))

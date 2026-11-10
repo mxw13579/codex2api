@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -13,8 +14,15 @@ import (
 // separate, larger budget so media-bearing responses are not capped at 1 MiB.
 const maxUpstreamResponseBodyBytes = 64 << 20
 
+var errUpstreamErrorBodyTooLarge = errors.New("upstream error body exceeds 1 MiB")
+
 func readUpstreamErrorBody(ctx context.Context, reader io.Reader) ([]byte, error) {
-	return readAllWithContinuousRetryKeepalive(ctx, io.LimitReader(reader, maxUpstreamErrorBodyBytes))
+	// 多读一个字节区分“恰好达到上限”和“被截断”；业务最多仍得到 1 MiB。
+	body, err := readAllWithContinuousRetryKeepalive(ctx, io.LimitReader(reader, maxUpstreamErrorBodyBytes+1))
+	if len(body) > maxUpstreamErrorBodyBytes {
+		return body[:maxUpstreamErrorBodyBytes], errors.Join(err, errUpstreamErrorBodyTooLarge)
+	}
+	return body, err
 }
 
 // upstreamResponseReadContext 保留普通请求取消后的有界 usage 补读窗口。

@@ -56,6 +56,7 @@ func TestUpstreamCookieHTTPRealAndSemantic429(t *testing.T) {
 				w.Header().Add("Set-Cookie", "__oailb="+token+"; Path=/; HttpOnly")
 				w.Header().Add("Set-Cookie", "__cflb=inbound; Path=/")
 				w.Header().Set("Cf-Ray", "ray-http")
+				w.Header().Set("X-Openai-Request-Id", upstreamResponseTestUUID)
 				w.WriteHeader(status)
 				if status == 200 {
 					io.WriteString(w, "data: "+payload+"\n\n")
@@ -97,6 +98,9 @@ func TestUpstreamCookieHTTPRealAndSemantic429(t *testing.T) {
 				t.Fatalf("entries=%d want=%d", len(entries), want)
 			}
 			last := entries[len(entries)-1]
+			if input.UpstreamRequestID != upstreamResponseTestUUID || last.UpstreamRequestID != upstreamResponseTestUUID || last.CFRay != "ray-http" {
+				t.Fatal("HTTP usage and cookie trace lost response IDs")
+			}
 			if last.Status != 429 || last.HTTPStatus != status || last.AccountID != 4286 || last.UnifiedHost != "chat.gateway.unified-23.api.openai.com" || last.Model != "gpt-6.1-sol" {
 				t.Fatalf("entry=%+v", last)
 			}
@@ -119,7 +123,7 @@ func TestUpstreamCookiePooledTurnCorrelation(t *testing.T) {
 	c.Request = httptest.NewRequest("GET", "/v1/responses", nil)
 	attachUpstreamTrace(c, nil)
 	reqHeader := http.Header{"Cookie": {"__cflb=actually-sent"}}
-	resp := &http.Response{StatusCode: 101, Header: http.Header{"Set-Cookie": {"__oailb=" + cookieLogTestToken("chat.gateway.unified-189.api.openai.com")}, "Cf-Ray": {"handshake-ray"}, "X-Request-Id": {"handshake-id"}}}
+	resp := &http.Response{StatusCode: 101, Header: http.Header{"Set-Cookie": {"__oailb=" + cookieLogTestToken("chat.gateway.unified-189.api.openai.com")}, "Cf-Ray": {"handshake-ray"}, "X-Request-Id": {upstreamResponseTestUUID}}}
 	trace := NewUpstreamCookieTrace(c.Request.Context(), &auth.Account{DBID: 4283}, "websocket", "connection-one", reqHeader, resp)
 	if trace.collector != nil {
 		t.Fatal("pooled connection retains first request buffer")
@@ -145,9 +149,109 @@ func TestUpstreamCookiePooledTurnCorrelation(t *testing.T) {
 	if one.CFRay != "turn-one-ray" || one.UpstreamRequestID != "turn-one-id" || two.CFRay != "" || two.UpstreamRequestID != "" {
 		t.Fatal("per-turn metadata inherited across turns")
 	}
+	first.ObserveEvent([]byte(`{"type":"codex.response.metadata","headers":{"x-request-id":"req_late_previous_turn"}}`))
+	if raw := SnapshotUpstreamCookieLog(c.Request.Context()); strings.Contains(raw, "req_late_previous_turn") {
+		t.Fatal("late metadata crossed turn boundaries")
+	}
 	for _, e := range append(firstEntries, secondEntries...) {
-		if e.ConnectionID != "connection-one" || e.UnifiedHost != "chat.gateway.unified-189.api.openai.com" || e.Cookie[0] != "__cflb=actually-sent" || e.HandshakeCFRay != "handshake-ray" || e.HandshakeRequestID != "handshake-id" {
+		if e.ConnectionID != "connection-one" || e.UnifiedHost != "chat.gateway.unified-189.api.openai.com" || e.Cookie[0] != "__cflb=actually-sent" || e.HandshakeCFRay != "handshake-ray" || e.HandshakeRequestID != upstreamResponseTestUUID {
 			t.Fatal("handshake snapshot mutated")
+		}
+	}
+}
+
+func TestUpstreamCookieResponseRequestID(t *testing.T) {
+	cookieLogTestSetup(t)
+	for _, tt := range upstreamResponseMetadataTestCases() {
+		for _, transport := range []string{"http", "websocket"} {
+			t.Run(tt.name+"/"+transport, func(t *testing.T) {
+				ctx := WithUpstreamCookieLog(context.Background())
+				headers := tt.headers.Clone()
+				if headers == nil {
+					headers = make(http.Header)
+				}
+				headers.Set("Cf-Ray", upstreamResponseTestUUID)
+				account := &auth.Account{DBID: 1, UpstreamRequestIDHeader: tt.configured}
+				trace := NewUpstreamCookieTrace(ctx, account, transport, "", nil, &http.Response{StatusCode: 200, Header: headers})
+				initial := cookieLogTestRead(t, SnapshotUpstreamCookieLog(ctx))[0]
+				if transport == "websocket" {
+					if initial.HandshakeRequestID != tt.want || initial.UpstreamRequestID != "" || initial.HandshakeCFRay != upstreamResponseTestUUID || initial.CFRay != "" {
+						t.Fatal("handshake IDs were masked or misattributed to a turn")
+					}
+					trace = trace.BeginTurn(ctx, "fixture-turn", "fixture-model")
+				} else if initial.UpstreamRequestID != tt.want || initial.CFRay != upstreamResponseTestUUID {
+					t.Fatal("HTTP response IDs differ from the shared extractor")
+				}
+				metadata := make(map[string]string)
+				for name := range headers {
+					metadata[name] = headers.Get(name)
+				}
+				payload, err := json.Marshal(map[string]any{"type": "codex.response.metadata", "headers": metadata})
+				if err != nil {
+					t.Fatal(err)
+				}
+				trace.ObserveEvent(payload)
+				trace.ObserveEvent([]byte(`{"type":"response.completed"}`))
+				entries := cookieLogTestRead(t, SnapshotUpstreamCookieLog(ctx))
+				last := entries[len(entries)-1]
+				if last.UpstreamRequestID != tt.want || last.CFRay != upstreamResponseTestUUID {
+					t.Fatalf("metadata ID = %q, want %q; cf_ray = %q", last.UpstreamRequestID, tt.want, last.CFRay)
+				}
+			})
+		}
+	}
+}
+
+func TestUpstreamCookieMetadataPriorityAndPartialFrames(t *testing.T) {
+	cookieLogTestSetup(t)
+	for _, tt := range []struct {
+		name, headers, followup, want string
+	}{
+		{name: "reverse_priority", headers: `{"x-goog-request-id":"req_google","x-oai-request-id":"req_oai","x-openai-request-id":"req_openai","request-id":"req_second","x-request-id":"req_first"}`, want: "req_first"},
+		{name: "duplicate_case_first_value", headers: `{"x-request-id":"req_first","X-Request-Id":"req_second"}`, want: "req_first"},
+		{name: "non_string_values", headers: `{"x-request-id":123,"request-id":true,"x-openai-request-id":[],"x-oai-request-id":{},"x-goog-request-id":"req_google"}`, want: "req_google"},
+		{name: "partial_frame", headers: `{"x-request-id":"req_first"}`, followup: `{"cf-ray":"new-ray"}`, want: "req_first"},
+		{name: "explicit_invalid", headers: `{"x-request-id":"req_first"}`, followup: `{"x-request-id":"sk-synthetic"}`},
+		{name: "explicit_non_string", headers: `{"x-request-id":"req_first"}`, followup: `{"x-request-id":42}`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := WithUpstreamCookieLog(context.Background())
+			handshake := NewUpstreamCookieTrace(ctx, &auth.Account{DBID: 1}, "websocket", "fixture-connection", nil, &http.Response{StatusCode: 101})
+			turn := handshake.BeginTurn(ctx, "fixture-turn", "")
+			turn.ObserveEvent([]byte(`{"type":"codex.response.metadata","headers":` + tt.headers + `}`))
+			if tt.followup != "" {
+				turn.ObserveEvent([]byte(`{"type":"codex.response.metadata","headers":` + tt.followup + `}`))
+			}
+			turn.ObserveEvent([]byte(`{"type":"response.completed"}`))
+			entries := cookieLogTestRead(t, SnapshotUpstreamCookieLog(ctx))
+			if got := entries[len(entries)-1].UpstreamRequestID; got != tt.want {
+				t.Fatalf("metadata ID = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpstreamCookieCFRayWhitelistAndOtherFieldsUnchanged(t *testing.T) {
+	cookieLogTestSetup(t)
+	if got := cookieLogValue(upstreamResponseTestUUID); got == upstreamResponseTestUUID || !strings.Contains(got, "MASKED") {
+		t.Fatal("general-purpose field masking changed")
+	}
+	for _, value := range []string{upstreamResponseTestUUID, "ray-fixture", "req\r\nInjected:yes", strings.Repeat("r", 129), "sk-synthetic", "sess-synthetic", "eyJfixture", "界", "****MASKED****"} {
+		ctx := WithUpstreamCookieLog(context.Background())
+		trace := NewUpstreamCookieTrace(ctx, &auth.Account{DBID: 1}, "http", "", nil, &http.Response{Header: http.Header{"Cf-Ray": {value}}})
+		entries := cookieLogTestRead(t, SnapshotUpstreamCookieLog(ctx))
+		if entries[0].CFRay != safeUpstreamTraceID(value) {
+			t.Fatal("HTTP CF-Ray bypassed whitelist")
+		}
+		payload, err := json.Marshal(map[string]any{"type": "codex.response.metadata", "headers": map[string]string{"cf-ray": value}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		trace.ObserveEvent(payload)
+		trace.ObserveEvent([]byte(`{"type":"response.completed"}`))
+		entries = cookieLogTestRead(t, SnapshotUpstreamCookieLog(ctx))
+		if entries[len(entries)-1].CFRay != safeUpstreamTraceID(value) {
+			t.Fatal("metadata CF-Ray bypassed whitelist")
 		}
 	}
 }
@@ -345,12 +449,20 @@ func TestUpstreamCookieSilentRetryFinalUsageAndSnapshot(t *testing.T) {
 	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
 	attachUpstreamTrace(c, nil)
 	ctx := c.Request.Context()
-	failed := NewUpstreamCookieTrace(ctx, &auth.Account{DBID: 1}, "http", "", nil, &http.Response{StatusCode: 200})
+	failedAccount := &auth.Account{DBID: 1}
+	failedResponse := &http.Response{StatusCode: 200, Header: http.Header{"X-Oai-Request-Id": {upstreamResponseTestUUID}}}
+	lateFailed := beginUpstreamTrace(ctx, failedAccount, "", false)
+	lateFailed(failedResponse)
+	failed := NewUpstreamCookieTrace(ctx, failedAccount, "http", "", nil, failedResponse)
 	failed.ObserveEvent([]byte(`{"type":"response.failed","response":{"error":{"code":"turn_rate_limit_exceeded"}}}`))
 	frozen := snapshotUpstreamTrace(ctx)
 	// The ordinary attempt reset must not discard a silently suppressed 429.
 	resetUpstreamAttemptTrace(ctx)
-	success := NewUpstreamCookieTrace(ctx, &auth.Account{DBID: 2}, "http", "", nil, &http.Response{StatusCode: 200})
+	successAccount := &auth.Account{DBID: 2}
+	successResponse := &http.Response{StatusCode: 200, Header: http.Header{"X-Request-Id": {"sk-synthetic"}, "X-Openai-Request-Id": {"req_success"}}}
+	beginUpstreamTrace(ctx, successAccount, "", false)(successResponse)
+	lateFailed(failedResponse)
+	success := NewUpstreamCookieTrace(ctx, successAccount, "http", "", nil, successResponse)
 	success.ObserveEvent([]byte(`{"type":"response.completed"}`))
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "cookie-usage.db"))
 	if err != nil {
@@ -362,7 +474,7 @@ func TestUpstreamCookieSilentRetryFinalUsageAndSnapshot(t *testing.T) {
 	h.logUsageForRequest(c, input)
 	db.FlushUsageLogs()
 	logs, err := db.ListRecentUsageLogs(ctx, 10)
-	if err != nil || len(logs) != 1 || logs[0].StatusCode != 200 {
+	if err != nil || len(logs) != 1 || logs[0].StatusCode != 200 || logs[0].UpstreamRequestID != "req_success" {
 		t.Fatal("final usage log not saved")
 	}
 	raw, err := db.GetUsageLogUpstreamCookies(ctx, logs[0].ID)
@@ -373,10 +485,13 @@ func TestUpstreamCookieSilentRetryFinalUsageAndSnapshot(t *testing.T) {
 	if len(entries) != 4 || entries[1].Status != 429 || entries[1].AccountID != 1 || entries[3].Status != 200 || entries[3].AccountID != 2 {
 		t.Fatal("successful usage row lost silent retries or their accounts")
 	}
+	if entries[1].UpstreamRequestID != upstreamResponseTestUUID || entries[3].UpstreamRequestID != "req_success" {
+		t.Fatal("retry request IDs mixed or masked")
+	}
 	hiddenRound := &database.UsageLogInput{AccountID: 1}
 	frozen.apply(hiddenRound)
 	populateUpstreamTrace(c, hiddenRound)
-	if len(cookieLogTestRead(t, hiddenRound.UpstreamCookieTrace)) != 2 {
+	if len(cookieLogTestRead(t, hiddenRound.UpstreamCookieTrace)) != 2 || hiddenRound.UpstreamRequestID != upstreamResponseTestUUID {
 		t.Fatal("continuation snapshot overwritten by later request events")
 	}
 	resetUpstreamRequestTrace(c)

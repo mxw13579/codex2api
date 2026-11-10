@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/codex2api/auth"
@@ -133,17 +132,7 @@ func beginUpstreamTrace(ctx context.Context, account *auth.Account, proxyURL str
 			return
 		} // A WS handshake ID is not a per-turn ID; WS turn state arrives per frame, see ObserveCodexTurnStateFrame.
 		turnState := observedCodexTurnState(resp.Header.Get(codexTurnStateHeader))
-		id := ""
-		if header != "" && auth.ValidateUpstreamRequestIDHeader(header) == nil {
-			id = resp.Header.Get(header)
-		} else if header == "" {
-			for _, name := range []string{"X-Request-Id", "Request-Id", "X-Goog-Request-Id"} {
-				if id = resp.Header.Get(name); strings.TrimSpace(id) != "" {
-					break
-				}
-			}
-		}
-		id = security.SafeTruncate(strings.TrimSpace(id), 128)
+		id := upstreamResponseRequestID(resp.Header, header)
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if a.current == attempt {
@@ -169,17 +158,22 @@ func noteUpstreamTurnState(ctx context.Context, state string) {
 	a.mu.Unlock()
 }
 
-func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *auth.Account, proxyURL string) (*http.Response, error) {
+func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *auth.Account, proxyURL string, diagnosticBody ...[]byte) (*http.Response, error) {
 	record := beginUpstreamTrace(req.Context(), account, proxyURL, false)
 	resp, err := client.Do(req)
 	record(resp)
 	sentRequest := req
 	if resp != nil && resp.Request != nil {
 		sentRequest = resp.Request
+		if sentRequest != req {
+			// 重定向可能改变方法/正文，不能把首跳摘要当作最终出站请求。
+			diagnosticBody = nil
+		}
 	}
 	if trace := NewUpstreamCookieTrace(req.Context(), account, "http", "", sentRequest.Header, resp); trace != nil && resp != nil && resp.Body != nil {
 		resp.Body = &upstreamCookieBody{ReadCloser: resp.Body, trace: trace}
 	}
+	wrapUpstreamHTTPDiagnostic(sentRequest, resp, account, diagnosticBody...)
 	return resp, err
 }
 

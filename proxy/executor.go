@@ -530,6 +530,7 @@ func resolveUpstreamSessionID(apiKeyID int64, upstreamSeed, explicitSessionID st
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
 // useWebsocket 可选：未传时遵循全局强制 WS；传 true/false 时由调用方显式控制。
+// WithUpstreamHTTPOnly 请求标记优先于上述 WS 选择。
 // headers 下游请求头，用于设备指纹学习
 func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, useWebsocket ...bool) (upstreamResponse *http.Response, upstreamErr error) {
 	// Defense in depth: this executor sends account.AccessToken to ChatGPT.
@@ -614,6 +615,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {
 		wantWebsocket = useWebsocket[0]
+	}
+	if isUpstreamHTTPOnly(ctx) {
+		wantWebsocket = false
 	}
 	// Agent Identity 账号强制走 HTTP：其鉴权是每请求动态签名的 AgentAssertion 头，
 	// 长连接 WS 的一次握手鉴权模型不适配，v1 统一走 HTTP。
@@ -904,7 +908,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 			}
 			return nil, err
 		}
-		resp, err := doTracedUpstreamRequest(sendClient, req, account, proxyURL)
+		resp, err := doTracedUpstreamRequest(sendClient, req, account, proxyURL, requestBody)
 		if closeIdle != nil {
 			if resp != nil && resp.Body != nil {
 				resp.Body = &safePreflightResponseBody{ReadCloser: resp.Body, closeIdle: closeIdle}
@@ -992,9 +996,9 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 			}
 		}
 	}
-	// 账号自行打开的 Responses WebSocket。生图仍走下面的 HTTP。
+	// 账号自行打开的 Responses WebSocket。生图及 HTTP-only 请求仍走下面的 HTTP。
 	// 握手失败由执行器返回上游状态或传输错误，这里不改回 HTTP。
-	if openAIResponsesRelayUsesUpstreamWebsocket(account, requestBody) {
+	if !isUpstreamHTTPOnly(ctx) && openAIResponsesRelayUsesUpstreamWebsocket(account, requestBody) {
 		return executeOpenAIResponsesWebsocket(ctx, account, requestBody, proxyURL, headers, baseURL, apiKey)
 	}
 	// stream_id belongs to the WebSocket envelope, including when an ingress
@@ -1013,7 +1017,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 		if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(body, "model").String()); err != nil {
 			return nil, err
 		}
-		resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
+		resp, err := doTracedUpstreamRequest(client, req, account, proxyURL, body)
 		if err != nil {
 			if shouldRecyclePooledClient(err) {
 				recycleRequestClient(ctx, account, proxyURL)
@@ -1221,7 +1225,7 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(requestBody, "model").String()); err != nil {
 		return nil, err
 	}
-	resp, err := doTracedUpstreamRequest(getPooledClient(account, proxyURL), req, account, proxyURL)
+	resp, err := doTracedUpstreamRequest(getPooledClient(account, proxyURL), req, account, proxyURL, requestBody)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, proxyURL)
@@ -1326,7 +1330,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	if err := guardUltrafastUpstream(ctx, account, requestBody); err != nil {
 		return nil, err
 	}
-	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
+	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL, requestBody)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
 			recyclePooledClient(account, proxyURL)

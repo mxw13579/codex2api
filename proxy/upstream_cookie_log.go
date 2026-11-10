@@ -92,10 +92,11 @@ type upstreamCookieEntry struct {
 // WS connection snapshots are immutable; each turn gets its own trace, so a
 // pooled handshake is not mistaken for this turn's request metadata.
 type UpstreamCookieTrace struct {
-	mu        sync.Mutex
-	entry     upstreamCookieEntry
-	terminal  bool
-	collector *upstreamCookieCollector
+	mu              sync.Mutex
+	entry           upstreamCookieEntry
+	terminal        bool
+	collector       *upstreamCookieCollector
+	requestIDHeader string // Immutable account override, also used by pooled WS turns.
 }
 
 func cookieLogRequestID(ctx context.Context) string {
@@ -139,13 +140,9 @@ func NewUpstreamCookieTrace(ctx context.Context, account *auth.Account, transpor
 	}
 	e.SetCookie, truncated = boundedCookieHeaders(responseHeaders.Values("Set-Cookie"))
 	e.CookieTruncated = e.CookieTruncated || truncated
-	e.CFRay = cookieLogValue(responseHeaders.Get("Cf-Ray"))
-	for _, name := range []string{"X-Request-Id", "Request-Id", "X-Openai-Request-Id", "X-Oai-Request-Id"} {
-		if value := responseHeaders.Get(name); value != "" {
-			e.UpstreamRequestID = cookieLogValue(value)
-			break
-		}
-	}
+	e.CFRay = safeUpstreamTraceID(responseHeaders.Get("Cf-Ray"))
+	requestIDHeader := account.GetUpstreamRequestIDHeader()
+	e.UpstreamRequestID = upstreamResponseRequestID(responseHeaders, requestIDHeader)
 	request := &http.Request{Header: http.Header{"Cookie": e.Cookie}}
 	response := &http.Response{Header: http.Header{"Set-Cookie": e.SetCookie}}
 	for _, source := range []struct {
@@ -175,7 +172,7 @@ func NewUpstreamCookieTrace(ctx context.Context, account *auth.Account, transpor
 	}
 	e.Status = e.HTTPStatus
 	collector := upstreamCookieCollectorFromContext(ctx)
-	t := &UpstreamCookieTrace{entry: e}
+	t := &UpstreamCookieTrace{entry: e, requestIDHeader: requestIDHeader}
 	collector.append(e)
 	if transport != "websocket" {
 		t.collector = collector
@@ -245,7 +242,7 @@ func (t *UpstreamCookieTrace) BeginTurn(ctx context.Context, attemptID, model st
 	e.Status = 0
 	collector := upstreamCookieCollectorFromContext(ctx)
 	collector.append(e)
-	return &UpstreamCookieTrace{entry: e, collector: collector}
+	return &UpstreamCookieTrace{entry: e, collector: collector, requestIDHeader: t.requestIDHeader}
 }
 
 // ObserveEvent runs before callbacks can suppress a retryable error. Both
@@ -261,12 +258,28 @@ func (t *UpstreamCookieTrace) ObserveEvent(payload []byte) {
 	}
 	event := gjson.GetBytes(payload, "type").String()
 	if event == "codex.response.metadata" {
-		for key, value := range gjson.GetBytes(payload, "headers").Map() {
-			switch strings.ToLower(key) {
-			case "cf-ray":
-				t.entry.CFRay = cookieLogValue(value.String())
-			case "x-request-id", "request-id", "x-openai-request-id", "x-oai-request-id":
-				t.entry.UpstreamRequestID = cookieLogValue(value.String())
+		headers := make(http.Header)
+		gjson.GetBytes(payload, "headers").ForEach(func(key, value gjson.Result) bool {
+			// Preserve JSON order for duplicate names, and never coerce objects,
+			// arrays or other non-string values into plausible request IDs.
+			if key.Type == gjson.String {
+				headerValue := ""
+				if value.Type == gjson.String {
+					headerValue = value.String()
+				}
+				headers.Add(key.String(), headerValue)
+			}
+			return true
+		})
+		if _, present := headers["Cf-Ray"]; present {
+			t.entry.CFRay = safeUpstreamTraceID(headers.Get("Cf-Ray"))
+		}
+		// Partial metadata frames must not erase an earlier response header,
+		// but an explicitly invalid value must not be retained as an ID.
+		for _, name := range upstreamResponseRequestIDHeaders(t.requestIDHeader) {
+			if _, present := headers[http.CanonicalHeaderKey(name)]; present {
+				t.entry.UpstreamRequestID = upstreamResponseRequestID(headers, t.requestIDHeader)
+				break
 			}
 		}
 		return

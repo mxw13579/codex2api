@@ -30,20 +30,28 @@ const defaultLogDir = "logs"
 const upstreamErrorLogBodyMaxBytes = 8 * 1024
 
 func upstreamErrorLogBody(body []byte) string {
+	return sanitizedUpstreamErrorLogBody(body, upstreamErrorLogBodyMaxBytes, 5000, security.MaskSensitiveData)
+}
+
+// 先处理完整的有界错误体，再截取日志前缀；否则跨截断点的 JWT/PEM 不能被完整模式识别。
+func sanitizedUpstreamErrorLogBody(body []byte, byteLimit, runeLimit int, sanitize func(string) string) string {
+	if len(body) > maxUpstreamErrorBodyBytes {
+		return fmt.Sprintf("[oversized upstream body omitted; %d bytes] ... [truncated]", len(body))
+	}
 	if len(strings.TrimSpace(string(body))) > 0 && !json.Valid(body) {
 		return fmt.Sprintf("[non-JSON upstream body omitted; %d bytes]", len(body))
 	}
-	truncated := false
-	if len(body) > upstreamErrorLogBodyMaxBytes {
-		body = body[:upstreamErrorLogBodyMaxBytes]
-		truncated = true
-	}
-	bodyStr := security.MaskSensitiveData(string(body))
-	bodyStr = security.SafeTruncate(bodyStr, 5000)
+	bodyStr := sanitize(string(body))
+	truncated := len(bodyStr) > byteLimit
 	if truncated {
-		bodyStr += " ... [truncated]"
+		bodyStr = bodyStr[:byteLimit]
 	}
-	return bodyStr
+	limited := security.SafeTruncate(bodyStr, runeLimit)
+	truncated = truncated || len(limited) < len(bodyStr)
+	if truncated {
+		limited += " ... [truncated]"
+	}
+	return limited
 }
 
 func errorLogDir() string {
@@ -113,4 +121,5 @@ func logUpstreamError(endpoint string, statusCode int, model string, accountID i
 func CloseErrorLogger() {
 	badRequestLogger.close()
 	serverErrorLogger.close()
+	upstreamDiagnosticLogger.close(time.Second)
 }

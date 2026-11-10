@@ -81,9 +81,11 @@ func TestIntelligenceActualCodexHTTPAndWebsocketIdentity(t *testing.T) {
 		body   []byte
 		ws     bool
 	}
+	var handshakes atomic.Int32
 	captured := make(chan capture, 4)
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if websocket.IsWebSocketUpgrade(r) {
+			handshakes.Add(1)
 			conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 			if err != nil {
 				t.Error(err)
@@ -102,6 +104,9 @@ func TestIntelligenceActualCodexHTTPAndWebsocketIdentity(t *testing.T) {
 					return
 				}
 			}
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected HTTP method: %s", r.Method)
 		}
 		body, _ := io.ReadAll(r.Body)
 		captured <- capture{r.Header.Clone(), body, false}
@@ -163,8 +168,8 @@ func TestIntelligenceActualCodexHTTPAndWebsocketIdentity(t *testing.T) {
 			t.Fatalf("run%d: %+v", i, result)
 		}
 		got := <-captured
-		if got.ws != (i == 2) || got.header.Get("Authorization") != "Bearer local-fixture-only" || got.header.Get("Cookie") != "" {
-			t.Fatalf("wrong transport/identity: %+v", got)
+		if got.ws || handshakes.Load() != 0 || got.header.Get("Authorization") != "Bearer local-fixture-only" || got.header.Get("Cookie") != "" {
+			t.Fatal("intelligence check attempted WebSocket or changed account identity")
 		}
 		expectedVersion := []string{"0.162.1", "0.162.2", "0.163.0"}[i]
 		if !strings.Contains(got.header.Get("User-Agent"), expectedVersion) || got.header.Get("Version") != expectedVersion {
@@ -176,12 +181,98 @@ func TestIntelligenceActualCodexHTTPAndWebsocketIdentity(t *testing.T) {
 		if !strings.Contains(gjson.GetBytes(got.body, "input.0.content.0.text").String(), "America/Los_Angeles") {
 			t.Fatalf("timezone lost: %s", got.body)
 		}
-		if gjson.GetBytes(got.body, "model").String() != "gpt-5.4" || gjson.GetBytes(got.body, "reasoning.effort").String() != "high" {
-			t.Fatalf("model/effort changed: %s", got.body)
+		if gjson.GetBytes(got.body, "model").String() != "gpt-5.4" || gjson.GetBytes(got.body, "reasoning.effort").String() != "high" || !gjson.GetBytes(got.body, "stream").Bool() {
+			t.Fatalf("model/effort/stream changed: %s", got.body)
 		}
-		if i == 2 && result.EffectiveContext["transport"] != "websocket" {
-			t.Fatal("transport audit lost")
+		if result.EffectiveContext["transport"] != "http" || result.EffectiveContext["attempts"] != "1" || result.EffectiveContext["proxy"] != "configured" || result.EffectiveContext["user_agent"] != got.header.Get("User-Agent") || result.EffectiveContext["timezone"] != account.Timezone || result.EffectiveContext["fingerprint_mode"] != account.EffectiveCodexFingerprintMode() {
+			t.Fatalf("incorrect effective context: %+v", result.EffectiveContext)
 		}
+		if proxy.CurrentRuntimeSettings().CodexForceWebsocket != settings.CodexForceWebsocket {
+			t.Fatal("intelligence check changed global WebSocket configuration")
+		}
+	}
+
+	// The same account and global WS setting still use a real WebSocket for an
+	// ordinary request. The HTTP-only marker must not escape the check's context.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := proxy.ExecuteRequest(proxy.WithAccountBoundEgress(ctx, account.GetProxyURL()), account,
+		[]byte(`{"model":"gpt-5.4","input":"21","stream":true}`), "", account.GetProxyURL(), "", nil, nil)
+	if err != nil {
+		t.Fatalf("ordinary request: %v", err)
+	}
+	defer resp.Body.Close()
+	result := readIntelligenceStream(resp.Body, false)
+	if !result.Complete || result.Error != "" {
+		t.Fatalf("ordinary WS response: %+v", result)
+	}
+	got := <-captured
+	if !got.ws || handshakes.Load() != 1 || codexTestTransport(resp.Header) != "websocket" {
+		t.Fatal("ordinary request no longer uses the configured WebSocket transport")
+	}
+}
+
+func TestIntelligenceRelayAccountWebsocketStillUsesHTTP(t *testing.T) {
+	t.Setenv("CODEX_TRANSPORT_MODE", "standard")
+	previous := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previous) })
+	var requests, handshakes, directRequests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directRequests.Add(1)
+		http.Error(w, "must use the bound proxy", http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+	const userAgent = "codex_exec/0.163.0 (Linux; x86_64)"
+	boundProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodConnect || websocket.IsWebSocketUpgrade(r) {
+			handshakes.Add(1)
+			http.Error(w, "must not attempt WebSocket", http.StatusBadGateway)
+			return
+		}
+		requests.Add(1)
+		if r.Method != http.MethodPost || r.URL.String() != upstream.URL+"/v1/responses" || r.Header.Get("Authorization") != "Bearer local-relay-key" || r.Header.Get("User-Agent") != userAgent || r.Header.Get("Cookie") != "" {
+			t.Error("relay request did not preserve target, account identity or HTTP method")
+		}
+		body, _ := io.ReadAll(r.Body)
+		if gjson.GetBytes(body, "model").String() != "gpt-5.4" || gjson.GetBytes(body, "reasoning.effort").String() != "high" || gjson.GetBytes(body, "input.0.content.0.text").String() != "literal relay prompt" || !gjson.GetBytes(body, "stream").Bool() {
+			t.Errorf("relay payload changed: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintf(w, "data: %s\n\n", intelligenceSuccess)
+	}))
+	defer boundProxy.Close()
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID: 778114, UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL: upstream.URL, APIKey: "local-relay-key", ProxyURL: boundProxy.URL,
+		Models: []string{"gpt-5.4"}, Status: auth.StatusReady, Timezone: "America/Los_Angeles",
+		CustomHeaders:              map[string]string{"User-Agent": userAgent},
+		ResponsesUpstreamTransport: auth.OpenAIResponsesTransportWebsocket,
+	}
+	store.AddAccount(account)
+	h := &Handler{store: store}
+	for _, forceWS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("global_ws_%t", forceWS), func(t *testing.T) {
+			settings := previous
+			settings.CodexForceWebsocket = forceWS
+			proxy.ApplyRuntimeSettings(settings)
+			before := requests.Load()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			result := h.executeIntelligenceCheck(ctx, account, "gpt-5.4", "high", "literal relay prompt")
+			if !result.Complete || result.Error != "" || result.Output != "21" || result.InputTokens != 4 || result.OutputTokens != 2 {
+				t.Fatalf("relay result: %+v", result)
+			}
+			if requests.Load() != before+1 || handshakes.Load() != 0 || directRequests.Load() != 0 {
+				t.Fatalf("requests=%d handshakes=%d direct=%d", requests.Load()-before, handshakes.Load(), directRequests.Load())
+			}
+			if result.EffectiveContext["transport"] != "http" || result.EffectiveContext["attempts"] != "1" || result.EffectiveContext["proxy"] != "configured" || result.EffectiveContext["user_agent"] != userAgent || result.EffectiveContext["timezone"] != account.Timezone {
+				t.Fatalf("incorrect relay effective context: %+v", result.EffectiveContext)
+			}
+			if !account.OpenAIResponsesUsesUpstreamWebsocket() || proxy.CurrentRuntimeSettings().CodexForceWebsocket != forceWS || account.GetProxyURL() != boundProxy.URL {
+				t.Fatal("intelligence check changed account or global transport configuration")
+			}
+		})
 	}
 }
 
