@@ -345,7 +345,7 @@ func (s *Store) selectAntigravityBalancedAccount(key string, apiKeyID int64, exc
 // NextForSessionWithDispatchGuardForProvider 是携带 SelectionOptions 的会话选号入口，
 // 供 proxy 在已知请求渠道 / public model 时调用，使 Antigravity 首绑与 Fresh 重选走加权
 // 避险。非 Antigravity 渠道或未开启时与 NextForSessionWithDispatchGuard 行为完全一致。
-func (s *Store) NextForSessionWithDispatchGuardForProvider(opts SelectionOptions, key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string, SessionAffinityGuard) {
+func (s *Store) NextForSessionWithDispatchGuardForProvider(ctx context.Context, opts SelectionOptions, key string, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) (*Account, string, SessionAffinityGuard) {
 	acc, proxyURL, guard := s.nextForSessionWithFilter(key, apiKeyID, exclude, filter, false, opts)
 	wait := opts.AffinityOverflowWait
 	if acc == nil || guard.preserveAccountID == 0 || wait <= 0 {
@@ -358,9 +358,13 @@ func (s *Store) NextForSessionWithDispatchGuardForProvider(opts SelectionOptions
 	waitOpts.AffinityOverflowWait = 0
 	waitOpts.noAffinityOverflow = true
 	started := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	got, gotProxy, gotGuard, _ := s.waitForSessionAvailableWithFilter(ctx, key, wait, apiKeyID, exclude, filter, false, waitOpts)
-	cancel()
+	if ctx.Err() != nil {
+		if got != nil {
+			s.Release(got)
+		}
+		return nil, "", guard
+	}
 	if got != nil {
 		log.Printf("会话粘性等待命中: 绑定账号=%d 等待=%s 选中账号=%d", boundID, time.Since(started).Round(time.Millisecond), got.DBID)
 		return got, gotProxy, gotGuard

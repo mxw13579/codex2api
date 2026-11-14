@@ -270,6 +270,10 @@ type encryptedErrorObserver struct {
 	record                      func([]byte)
 }
 
+func (r *encryptedErrorObserver) upstreamErrorMetadata() upstreamErrorLogMetadata {
+	return upstreamErrorMetadataFromBody(r.ReadCloser)
+}
+
 func (r *encryptedErrorObserver) observeUpstreamCookieEvent(payload []byte) {
 	forwardUpstreamCookieEvent(r.ReadCloser, payload)
 }

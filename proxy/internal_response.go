@@ -58,7 +58,7 @@ func internalResponseAttributionFromRequest(c *gin.Context, reason string) *inte
 		attribution.APIKeyMasked, _ = value.(string)
 	}
 	if c.Request != nil {
-		attribution.ParentRequestID = snapshotUpstreamTrace(c.Request.Context()).RequestID
+		attribution.ParentRequestID = snapshotUpstreamTrace(c.Request.Context(), false).RequestID
 	}
 	if attribution.ParentRequestID == "" {
 		if requestContext := api.GetRequestContext(c); requestContext != nil {

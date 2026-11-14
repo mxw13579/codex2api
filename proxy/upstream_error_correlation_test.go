@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/config"
+	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 )
 
@@ -44,6 +47,11 @@ func TestUpstreamErrorLogLinksOriginalBodyAndDiagnostic(t *testing.T) {
 	resp, err := doTracedUpstreamRequest(server.Client(), req, &auth.Account{DBID: 41}, "", requestBody)
 	if err != nil {
 		t.Fatal(err)
+	}
+	attempt := &encryptedContentAttempt{memory: &encryptedContentMemory{now: time.Now}}
+	attempt.observeResponse(resp, requestBody)
+	if _, ok := resp.Body.(*encryptedErrorObserver); !ok {
+		t.Fatal("fixture did not install the encrypted-content observer")
 	}
 	body, err := readUpstreamErrorBody(c.Request.Context(), resp.Body)
 	resp.Body.Close()
@@ -103,6 +111,12 @@ func TestUpstreamErrorLogCorrelationIsolation(t *testing.T) {
 		return resp
 	}
 	first := makeResponse(upstreamResponseTestUUID, "1234-IAD")
+	originalCorrelation := upstreamErrorLogCorrelation(first, 4)
+	attempt := &encryptedContentAttempt{memory: &encryptedContentMemory{now: time.Now}}
+	attempt.observeResponse(first, []byte(`{"input":"synthetic request"}`))
+	if upstreamErrorLogCorrelation(first, 4) != originalCorrelation {
+		t.Fatal("encrypted-content observer lost response-owned metadata")
+	}
 	firstRequestID := cookieLogRequestID(ctx)
 	// B starts on the same context/account; then A's body is logged late.
 	resetUpstreamRequestTrace(c)
@@ -116,6 +130,26 @@ func TestUpstreamErrorLogCorrelationIsolation(t *testing.T) {
 	if other := upstreamErrorLogCorrelation(first, 5); strings.Contains(other, "Upstream-") || strings.Contains(other, "CF-Ray") || !strings.HasPrefix(other, "Request-ID:") {
 		t.Fatal("error correlation borrowed another account's upstream identifiers")
 	}
+	// Spooling closes A after B has started, but must keep A's correlation.
+	pipeline := &ImagePipeline{slots: make(chan struct{}, 1), dir: t.TempDir()}
+	defer pipeline.Close()
+	metadata := upstreamErrorMetadataFromBody(first.Body)
+	file, err := pipeline.collectResponse(ctx, first.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer removePipelineFile(file)
+	first.Body = &pipelineResponseReader{File: file, err: pipeline.responseReadError, errorMetadata: metadata}
+	if upstreamErrorLogCorrelation(first, 4) != got {
+		t.Fatal("image pipeline lost the original response's metadata")
+	}
+	body, err := io.ReadAll(first.Body)
+	if err != nil || string(body) != `{"detail":"Bad Request"}` {
+		t.Fatal("image spooling changed the error body")
+	}
+	if other := upstreamErrorLogCorrelation(first, 5); strings.Contains(other, "Upstream-") || strings.Contains(other, "CF-Ray") {
+		t.Fatal("image pipeline borrowed another account's identifiers")
+	}
 	first.Body = &safePreflightResponseBody{ReadCloser: first.Body, closeIdle: func() {}}
 	if upstreamErrorLogCorrelation(first, 4) != got {
 		t.Fatal("safe preflight wrapper lost the response-owned snapshot")
@@ -124,9 +158,92 @@ func TestUpstreamErrorLogCorrelationIsolation(t *testing.T) {
 	if upstreamErrorLogCorrelation(first, 4) != got {
 		t.Fatal("reset changed an already returned response's metadata")
 	}
-	unknown := &http.Response{Header: http.Header{"X-Request-Id": {"unverified-handshake"}}, Body: io.NopCloser(strings.NewReader("unknown"))}
+	unknown := &http.Response{StatusCode: 400, Header: http.Header{"X-Request-Id": {"unverified-handshake"}}, Body: &struct{ io.ReadCloser }{first.Body}}
 	if upstreamErrorLogCorrelation(nil, 4) != "" || upstreamErrorLogCorrelation(unknown, 4) != "" {
-		t.Fatal("missing response snapshot should not invent correlation or use a handshake ID")
+		t.Fatal("unknown wrapper should not be unwrapped or borrow a header/current attempt")
+	}
+	attempt.observeResponse(unknown, nil)
+	if upstreamErrorLogCorrelation(unknown, 4) != "" {
+		t.Fatal("encrypted-content observer bypassed an unknown wrapper")
+	}
+	unknown.Body = &pipelineResponseReader{File: file, errorMetadata: upstreamErrorMetadataFromBody(unknown.Body)}
+	if upstreamErrorLogCorrelation(unknown, 4) != "" {
+		t.Fatal("image pipeline invented metadata for an unknown wrapper")
+	}
+}
+
+func TestUpstreamErrorLogQueuedImageCorrelation(t *testing.T) {
+	diagnosticRedirectLogging(t)
+	previousLogger := badRequestLogger
+	logger := &fileLogger{path: "bad_request.log"}
+	badRequestLogger = logger
+	t.Cleanup(func() { logger.close(); badRequestLogger = previousLogger })
+	previousSettings, previousResin := CurrentRuntimeSettings(), resinCfg.Load()
+	previousPipeline, previousExecution := processImagePipeline.Load(), processImageGate.Load()
+	t.Cleanup(func() {
+		ApplyRuntimeSettings(previousSettings)
+		SetResinConfig(previousResin)
+		processImagePipeline.Store(previousPipeline)
+		processImageGate.Store(previousExecution)
+	})
+	UpdateRuntimeSettings(func(s RuntimeSettings) RuntimeSettings {
+		s.CodexTelemetryEnabled = false
+		s.CodexForceWebsocket = false
+		s.ContinuousRetryPolicy = database.ContinuousRetryPolicy{}
+		return s
+	})
+	const originalError = `{"detail":"Bad Request"}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("X-Request-ID", upstreamResponseTestUUID)
+		w.Header().Set("CF-Ray", "image-fixture-ray")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, originalError)
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-correlation-fixture"})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, MaxRetries: 0})
+	defer store.Stop()
+	store.AddAccount(&auth.Account{DBID: 4, AccessToken: "synthetic-token", AccountID: "image-correlation-fixture", PlanType: "plus"})
+	h := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+	ConfigureImagePipeline(1)
+	ConfigureImageExecutionLimit(1)
+	executionCtx, releaseExecution, err := AcquireImageExecution(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseExecution()
+	ctx, pipeline, err := NewImagePipeline(executionCtx, t.TempDir(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipeline.Close()
+	_, status, err := h.GenerateQueuedImage(ctx, func() ([]byte, error) {
+		return []byte(`{"model":"gpt-image-2","prompt":"synthetic image"}`), nil
+	}, false, nil)
+	if status != http.StatusBadRequest || err == nil {
+		t.Fatalf("queued image status=%d err=%v, want synthetic upstream 400", status, err)
+	}
+	if !upstreamDiagnosticLogger.close(time.Second) {
+		t.Fatal("diagnostic writer did not drain")
+	}
+	diagnostics, err := os.ReadFile(filepath.Join(errorLogDir(), "upstream_errors.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var diagnostic upstreamHTTPDiagnostic
+	if err := json.Unmarshal(bytes.TrimSpace(diagnostics), &diagnostic); err != nil {
+		t.Fatal("expected one synthetic image diagnostic")
+	}
+	logged, err := os.ReadFile(filepath.Join(errorLogDir(), "bad_request.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diagnostic.RequestID == "" || !bytes.Contains(logged, []byte("Request-ID: "+diagnostic.RequestID+"\n")) ||
+		!bytes.Contains(logged, []byte("Upstream-Request-ID: "+upstreamResponseTestUUID+"\n")) ||
+		!bytes.Contains(logged, []byte("CF-Ray: image-fixture-ray\n")) || !bytes.Contains(logged, []byte("Response:\n"+originalError)) {
+		t.Fatal("queued image spooling lost response-owned correlation or changed the error body")
 	}
 }
 

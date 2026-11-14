@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -30,7 +31,7 @@ func TestAffinityOverflowWaitReturnsBoundAccountWhenSlotFrees(t *testing.T) {
 	}()
 	started := time.Now()
 	selected, _, guard := store.NextForSessionWithDispatchGuardForProvider(
-		SelectionOptions{Policy: DispatchPolicyStandard, AffinityOverflowWait: 2 * time.Second}, "overflow-wait", 0, nil, nil)
+		context.Background(), SelectionOptions{Policy: DispatchPolicyStandard, AffinityOverflowWait: 2 * time.Second}, "overflow-wait", 0, nil, nil)
 	if selected != bound {
 		t.Fatalf("selected = %p, want bound %p (fallback %p)", selected, bound, fallback)
 	}
@@ -51,7 +52,7 @@ func TestAffinityOverflowWaitFallsBackToBorrowAfterTimeout(t *testing.T) {
 	defer store.Release(bound)
 	started := time.Now()
 	selected, _, guard := store.NextForSessionWithDispatchGuardForProvider(
-		SelectionOptions{Policy: DispatchPolicyStandard, AffinityOverflowWait: 120 * time.Millisecond}, "overflow-wait", 0, nil, nil)
+		context.Background(), SelectionOptions{Policy: DispatchPolicyStandard, AffinityOverflowWait: 120 * time.Millisecond}, "overflow-wait", 0, nil, nil)
 	if selected != fallback {
 		t.Fatalf("selected = %p, want fallback %p after timeout", selected, fallback)
 	}
@@ -70,7 +71,7 @@ func TestAffinityOverflowWaitDisabledBorrowsImmediately(t *testing.T) {
 	defer store.Release(bound)
 	started := time.Now()
 	selected, _, guard := store.NextForSessionWithDispatchGuardForProvider(
-		SelectionOptions{Policy: DispatchPolicyStandard}, "overflow-wait", 0, nil, nil)
+		context.Background(), SelectionOptions{Policy: DispatchPolicyStandard}, "overflow-wait", 0, nil, nil)
 	if selected != fallback || !guard.PreservesExisting() {
 		t.Fatalf("selected = %p guard=%v, want immediate borrow of %p", selected, guard.PreservesExisting(), fallback)
 	}

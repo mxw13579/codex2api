@@ -39,7 +39,7 @@ func TestSafePreflightRuntimeFlagIsIndependentAndDefaultOff(t *testing.T) {
 }
 
 func TestSafePreflightSSEPreservesEnvelopeAndLargeNumbers(t *testing.T) {
-	const data = `{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":10,"reset_at":9007199254740993}}}`
+	const data = `{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":10,"window_minutes":300,"reset_at":9007199254740993}}}`
 	for _, newline := range []string{"\n", "\r\n"} {
 		wire := "event: codex.rate_limits" + newline + "data: " + data + newline + newline
 		for _, r := range []io.Reader{
@@ -55,10 +55,8 @@ func TestSafePreflightSSEPreservesEnvelopeAndLargeNumbers(t *testing.T) {
 			if f.event != "codex.rate_limits" || string(f.data) != data || string(f.wire) != wire || !f.envelopeChecked {
 				t.Fatal("strict observation changed original bytes")
 			}
-			// Schema acceptance belongs to the schema worker. This verifies
-			// exact delegation without assuming a wider schema than it allows.
-			if f.isRateLimits() != isSafePreflightRateLimitsFrame(f.event, f.data) {
-				t.Fatal("raw envelope adapter disagrees with the schema helper")
+			if f.isRateLimits() {
+				t.Fatal("out-of-range reset time must remain outside the strict schema")
 			}
 		}
 	}
@@ -145,7 +143,7 @@ func TestSafePreflightSSEBoundsAllEnvelopeBytes(t *testing.T) {
 }
 
 func TestSafePreflightSSESchemaCannotValidateUnobservedEnvelope(t *testing.T) {
-	data := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":10}}}`)
+	data := []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":10,"window_minutes":300}}}`)
 	if (safePreflightSSEFrame{event: "codex.rate_limits", data: data}).isRateLimits() {
 		t.Fatal("event/data callback alone must not certify an SSE envelope")
 	}

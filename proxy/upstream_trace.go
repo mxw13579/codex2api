@@ -30,14 +30,17 @@ type upstreamTraceSnapshot struct {
 	UpstreamCookieTrace string
 }
 
-func snapshotUpstreamTrace(ctx context.Context) upstreamTraceSnapshot {
+func snapshotUpstreamTrace(ctx context.Context, retainCookie bool) upstreamTraceSnapshot {
 	a := upstreamTraceFromContext(ctx)
 	if a == nil {
 		return upstreamTraceSnapshot{}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	result := upstreamTraceSnapshot{RequestID: a.requestID, UpstreamCookieTrace: SnapshotUpstreamCookieLog(ctx)}
+	result := upstreamTraceSnapshot{RequestID: a.requestID}
+	if retainCookie {
+		result.UpstreamCookieTrace = SnapshotUpstreamCookieLog(ctx)
+	}
 	if a.current != nil {
 		result.accountID = a.current.accountID
 		result.UpstreamRequestID = a.current.requestID
@@ -201,7 +204,7 @@ func sameUpstreamDiagnosticRequest(original, sent *http.Request) bool {
 		original.Header.Get("Content-Encoding") == sent.Header.Get("Content-Encoding")
 }
 
-func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput) {
+func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput, retainCookie bool) {
 	if c == nil || c.Request == nil || input == nil {
 		return
 	}
@@ -215,7 +218,9 @@ func populateUpstreamTrace(c *gin.Context, input *database.UsageLogInput) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	input.RequestID = a.requestID
-	input.UpstreamCookieTrace = SnapshotUpstreamCookieLog(c.Request.Context())
+	if retainCookie {
+		input.UpstreamCookieTrace = SnapshotUpstreamCookieLog(c.Request.Context())
+	}
 	if current := a.current; current != nil && current.accountID == input.AccountID {
 		input.UpstreamRequestID = current.requestID
 		input.UpstreamProxyID = current.proxy.ID

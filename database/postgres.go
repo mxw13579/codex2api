@@ -1159,7 +1159,9 @@ func (db *DB) getUsageLogFlushInterval() time.Duration {
 	return d
 }
 
-func (db *DB) shouldStoreUsageLog(input *UsageLogInput) bool {
+// ShouldStoreUsageLog reports whether the usage event's detail row is retained.
+// Billing is handled independently by InsertUsageLog, including when this is false.
+func (db *DB) ShouldStoreUsageLog(input *UsageLogInput) bool {
 	switch db.GetUsageLogMode() {
 	case UsageLogModeOff:
 		return false
@@ -4549,7 +4551,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 		return nil
 	}
 	log = SnapshotUsageLogBilling(log)
-	storeUsageLog := db.shouldStoreUsageLog(log)
+	storeUsageLog := db.ShouldStoreUsageLog(log)
 
 	billingServiceTier := usageLogBillingServiceTier(log)
 

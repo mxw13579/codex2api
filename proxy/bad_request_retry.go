@@ -30,6 +30,13 @@ func isBareBadRequest(status int, body []byte) bool {
 	return err == io.EOF
 }
 
+// Payload rules or Agent Identity can force HTTP after the handler selected WS.
+// A real POST response carries its request; synthetic WS responses do not, and
+// a WebSocket handshake's GET must not gain the dedicated HTTP retry budget.
+func badRequestRetryHTTPResponse(resp *http.Response, useWebsocket bool) bool {
+	return !useWebsocket || resp.Request != nil && resp.Request.Method == http.MethodPost
+}
+
 // One value snapshot and one independent budget per downstream request/WS
 // turn. A later settings change cannot increase an already-running budget.
 type badRequestRetryState struct {

@@ -591,7 +591,7 @@ func (h *Handler) nextRetryAccountWithGuard(ctx context.Context, affinityKey str
 			// 携带渠道时底层选号（含容量借用 / 首次绑定分支）不会丢掉加权避险上下文。
 			account, stickyProxyURL = h.store.NextForContinuationWithDispatchForProvider(opts, affinityKey, apiKeyID, exclude, filter)
 		} else {
-			account, stickyProxyURL, guard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, exclude, filter, opts)
+			account, stickyProxyURL, guard = h.nextAccountForSessionWithDispatchGuard(ctx, affinityKey, apiKeyID, exclude, filter, opts)
 		}
 		if account != nil {
 			if ctx.Err() != nil {

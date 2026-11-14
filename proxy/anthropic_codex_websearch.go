@@ -247,6 +247,21 @@ func (s *anthropicSearchOutput) emit(data []byte) bool {
 	return s.err == nil
 }
 
+// Publish the aggregate once, without replaying any already streamed items.
+func (s *anthropicSearchOutput) emitTerminal(terminal []byte, usage json.RawMessage) bool {
+	visible := make([]json.RawMessage, 0, len(s.items))
+	for _, item := range s.items {
+		if item != nil {
+			visible = append(visible, item)
+		}
+	}
+	terminal, _ = sjson.SetBytes(terminal, "response.output", visible)
+	if usage != nil {
+		terminal, _ = sjson.SetRawBytes(terminal, "response.usage", usage)
+	}
+	return s.emit(terminal)
+}
+
 type anthropicSearchPendingEvent struct {
 	order int
 	data  []byte
@@ -1170,24 +1185,11 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 			}
 		}
 		if finalRound {
-			visible := make([]json.RawMessage, 0, len(output.items))
-			for _, item := range output.items {
-				if item != nil {
-					visible = append(visible, item)
-				}
-			}
-			terminal, _ = sjson.SetBytes(terminal, "response.output", visible)
-			if usage != nil {
-				terminal, _ = sjson.SetRawBytes(terminal, "response.usage", usage)
-			}
 			if parsed.Get("type").String() == "response.completed" && b.onCompleted != nil {
-				completed := make([]json.RawMessage, len(replay))
-				for i, item := range replay {
-					completed[i] = append(json.RawMessage(nil), item...)
-				}
-				b.onCompleted(completed)
+				// Items were copied when appended; the consumer owns its slice.
+				b.onCompleted(replay)
 			}
-			if !output.emit(terminal) {
+			if !output.emitTerminal(terminal, usage) {
 				return io.ErrClosedPipe
 			}
 			if len(deferredAck) > 0 && !output.emit(deferredAck) {
@@ -1220,9 +1222,28 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, codexAlphaSearchBodyLimit))
 			_ = resp.Body.Close()
 			if readErr != nil {
-				return readErr
+				raw = nil // The HTTP rejection is known even if its error body is unreadable.
 			}
-			return ErrUpstream(resp.StatusCode, usageLogErrorMessage(resp.StatusCode, raw), nil)
+			// ExecuteRequest has already handled transport-local recovery and send
+			// quota. Let the outer failure-terminal path classify/account for this
+			// rejection once, rather than returning a generic pipe stream break.
+			failed := []byte(`{"type":"response.failed","response":{"object":"response","status":"failed"}}`)
+			failed, _ = sjson.SetBytes(failed, "response.status_code", resp.StatusCode)
+			upstreamError := gjson.GetBytes(raw, "error")
+			if gjson.ValidBytes(raw) && upstreamError.IsObject() {
+				failed, _ = sjson.SetRawBytes(failed, "response.error", []byte(upstreamError.Raw))
+			} else {
+				failed, _ = sjson.SetBytes(failed, "response.error.message", usageLogErrorMessage(resp.StatusCode, raw))
+			}
+			for _, field := range []string{"model", "service_tier"} {
+				if value := parsed.Get("response." + field); value.Exists() {
+					failed, _ = sjson.SetRawBytes(failed, "response."+field, []byte(value.Raw))
+				}
+			}
+			if !output.emitTerminal(failed, usage) {
+				return io.ErrClosedPipe
+			}
+			return nil
 		}
 	}
 	_ = resp.Body.Close()

@@ -109,17 +109,17 @@ func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int
 // nextAccountForSessionWithDispatch 按指定 DispatchPolicy 做会话选号，只返回账号与
 // 代理地址；需要容量溢出守卫时改用 nextAccountForSessionWithDispatchGuard。
 func (h *Handler) nextAccountForSessionWithDispatch(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, policy auth.DispatchPolicy) (*auth.Account, string) {
-	account, proxyURL, _ := h.nextAccountForSessionWithDispatchGuard(sessionID, apiKeyID, exclude, filter, auth.SelectionOptions{Policy: policy})
+	account, proxyURL, _ := h.nextAccountForSessionWithDispatchGuard(context.Background(), sessionID, apiKeyID, exclude, filter, auth.SelectionOptions{Policy: policy})
 	return account, proxyURL
 }
 
 // nextAccountForSessionWithDispatchGuard 用完整 SelectionOptions（渠道 + Policy）做
 // 会话选号，并返回容量溢出借用时携带的 SessionAffinityGuard。
-func (h *Handler) nextAccountForSessionWithDispatchGuard(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard) {
+func (h *Handler) nextAccountForSessionWithDispatchGuard(ctx context.Context, sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter, opts auth.SelectionOptions) (*auth.Account, string, auth.SessionAffinityGuard) {
 	if h == nil || h.store == nil {
 		return nil, "", auth.SessionAffinityGuard{}
 	}
-	return h.store.NextForSessionWithDispatchGuardForProvider(opts, sessionID, apiKeyID, exclude, filter)
+	return h.store.NextForSessionWithDispatchGuardForProvider(ctx, opts, sessionID, apiKeyID, exclude, filter)
 }
 
 // selectionOptionsForRequest 依据当前请求渠道与 public model 组装选号上下文：Antigravity
@@ -1670,7 +1670,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateClientIPFromRequest(c, input)
 	populateUserAgentMetaFromRequest(c, input)
 	populateWsAcquireFromRequest(c, input)
-	populateUpstreamTrace(c, input)
+	populateUpstreamTrace(c, input, h.db.ShouldStoreUsageLog(input))
 	populateCompactUsageMetaFromRequest(c, input)
 	populateUltraUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
@@ -3995,7 +3995,7 @@ func firstGJSONInt(body []byte, paths ...string) int64 {
 // Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
 func (h *Handler) Responses(c *gin.Context) {
 	badRequestRetry := newBadRequestRetryState(h.store.GetBadRequestRetryPolicy())
-	safePreflightSettings := CurrentRuntimeSettings()
+	safePreflightSettings := safePreflightRuntimeSettings()
 	var safePreflight *safePreflightState
 	defer func() {
 		// A cancelled precommit wait may return without another attempt/outcome.
@@ -4328,7 +4328,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return baseAccountFilter == nil || baseAccountFilter(a)
 	}
 	decideBadRequest := func(resp *http.Response, body []byte, readErr error, account *auth.Account, proxyURL string, useWebsocket bool) badRequestRetryDecision {
-		if pin != nil || useWebsocket || account.OpenAIResponsesUsesUpstreamWebsocket() {
+		if pin != nil || !badRequestRetryHTTPResponse(resp, useWebsocket) || account.OpenAIResponsesUsesUpstreamWebsocket() {
 			return badRequestRetryDecision{}
 		}
 		hasPrevious := gjson.GetBytes(rawBody, "previous_response_id").String() != ""
@@ -4392,7 +4392,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				stickyProxyURL = account.GetProxyURL()
 			}
 		} else if !sameBadRequestAccount && !retainedHTTPFallback && retryingBadRequest {
-			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if attempt == 0 && compactionAffinity.Known && !turnContinuationPinned {
@@ -4401,7 +4401,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if account != nil {
 				stickyProxyURL = account.GetProxyURL()
 			} else if continuationUnavailable && !relayContinuationAttempted {
-				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 			} else if turnContinuationPinned {
 				// 续链重试同样传 SelectionOptions，避免重试把选号上下文丢掉。
 				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithSelection(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
@@ -4530,15 +4530,20 @@ func (h *Handler) Responses(c *gin.Context) {
 			return
 		}
 		if searchReplay != nil {
+			// Recheck account/credential provenance on every attempt, but do not
+			// overwrite input repaired by compaction or encrypted-content removal.
 			searchReplay.setAccount(account)
-			expandedInputRaw = searchReplay.Input()
-			if expandedInputRaw == "" {
+			replayInput := searchReplay.Input()
+			if replayInput == "" {
 				h.store.Release(account)
 				sendResponseContextUnavailable(c, http.StatusConflict, responsesWSContextReason(searchReplay.err))
 				return
 			}
-			codexBody, _ = sjson.SetRawBytes(codexBody, "input", []byte(expandedInputRaw))
-			resetOpenAIResponsesBody()
+			if attempt == 0 {
+				expandedInputRaw = replayInput
+				codexBody, _ = sjson.SetRawBytes(codexBody, "input", []byte(expandedInputRaw))
+				resetOpenAIResponsesBody()
+			}
 		}
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		attemptMaxRateLimitRetries := pin.retryLimit(h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
@@ -5237,13 +5242,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, terminalFailurePayload)
 				_ = streamAttempt.Close()
 				clearNewAPIUpstreamCyberPolicyDecision(c)
-				h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+				h.logStreamRetryUsage(c, database.UsageLogInput{
 					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel, EffectiveModel: attemptLogEffectiveModel,
 					StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 					InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 					AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
+					RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
 					ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
-				}, promptPolicyIncidentID)
+				}, promptPolicyIncidentID, usage)
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %s, account %d): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -5931,6 +5937,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				if streamWriter.deliveredBytes() > before {
 					wroteAnyBody = true
 				}
+				preflightPassthrough = true
 			}
 			var rawPreflightFrame safePreflightSSEFrame
 			stagedTurnState := false
@@ -6173,7 +6180,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			if contEnabled {
 				requestKeepaliveOwnsWrites := continuousRetryKeepaliveActive(c.Request.Context()) && continuousRetryKeepaliveInterval > 0
 				fold := &continueFold{
-					trace:     func() upstreamTraceSnapshot { return snapshotUpstreamTrace(c.Request.Context()) },
+					trace: func(statusCode int) upstreamTraceSnapshot {
+						return snapshotUpstreamTrace(c.Request.Context(), h.db.ShouldStoreUsageLog(&database.UsageLogInput{StatusCode: statusCode}))
+					},
 					baseBody:  upstreamBody,
 					maxRounds: contMaxRounds,
 					forward:   forward,
@@ -6382,6 +6391,15 @@ func (h *Handler) Responses(c *gin.Context) {
 		outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 		var candidatePromoted bool
 		terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody || safePreflight.retryUnsafe(), gotTerminal, readErr, c.Request.Context().Err(), writeErr)
+		if len(terminalFailurePayload) > 0 {
+			failedResponse := gjson.GetBytes(terminalFailurePayload, "response")
+			if reported := failedResponse.Get("usage"); reported.IsObject() {
+				usage = extractUsageFromResult(reported)
+			}
+			if tier := failedResponse.Get("service_tier").String(); tier != "" {
+				actualServiceTier = tier
+			}
+		}
 		if candidatePromoted && isStream {
 			abortedForHTTPError = true
 		}
@@ -6456,16 +6474,16 @@ func (h *Handler) Responses(c *gin.Context) {
 			rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, terminalFailurePayload)
 			_ = streamAttempt.Close()
 			clearNewAPIUpstreamCyberPolicyDecision(c)
-			if safePreflight != nil {
+			if safePreflight != nil || usage != nil {
 				logResponseAttempt(outcome, totalDuration, true)
 			} else {
-				h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+				h.logStreamRetryUsage(c, database.UsageLogInput{
 					AccountID: account.ID(), Endpoint: "/v1/responses", Model: logModel, EffectiveModel: logEffectiveModel,
 					StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 					InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: isStream, ViaWebsocket: useWebsocket,
 					AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
 					ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
-				}, promptPolicyIncidentID)
+				}, promptPolicyIncidentID, usage)
 			}
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %s, account %d, /v1/responses): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 			if safePreflight == nil {
@@ -6525,7 +6543,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if outcome.logStatusCode != http.StatusOK {
 				c.Set(AccessLogStatusContextKey, outcome.logStatusCode)
 				log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
-				if deltaCharCount > 0 && (safePreflight == nil || usage == nil) {
+				if deltaCharCount > 0 && usage == nil {
 					estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
 					if estOutputTokens < 1 {
 						estOutputTokens = 1
@@ -6895,7 +6913,7 @@ func (h *Handler) responsesCompactWithBadRequestRetry(c *gin.Context, badRequest
 			}
 		}
 		if !sameBadRequestAccount && account == nil {
-			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 		}
 		if retryingBadRequest && c.Request.Context().Err() != nil {
 			if account != nil {
@@ -7841,7 +7859,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if retryingBadRequest {
-				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 			} else {
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
@@ -8139,7 +8157,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 			errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
 			var badRequestDecision badRequestRetryDecision
-			if pin == nil && !useWebsocket && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+			if pin == nil && badRequestRetryHTTPResponse(resp, useWebsocket) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				canRetry := !c.Writer.Written() && (!badRequestRetry.policy.SwitchAccount || !turnContinuationPinned)
 				badRequestDecision = badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL, canRetry)
 			}
@@ -8627,6 +8645,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
 		var candidatePromoted bool
 		terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
+		if len(terminalFailurePayload) > 0 {
+			failedResponse := gjson.GetBytes(terminalFailurePayload, "response")
+			if reported := failedResponse.Get("usage"); reported.IsObject() {
+				usage = extractUsageFromResult(reported)
+			}
+			if tier := failedResponse.Get("service_tier").String(); tier != "" {
+				actualServiceTier = tier
+			}
+		}
 		if candidatePromoted && isStream {
 			abortedForHTTPError = true
 		}
@@ -8677,13 +8704,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, terminalFailurePayload)
 			_ = streamAttempt.Close()
 			clearNewAPIUpstreamCyberPolicyDecision(c)
-			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+			h.logStreamRetryUsage(c, database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: "/v1/chat/completions", Model: logModel, EffectiveModel: attemptLogEffectiveModel,
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/chat/completions", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
+				RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
 				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
-			}, promptPolicyIncidentID)
+			}, promptPolicyIncidentID, usage)
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %s, account %d, /v1/chat/completions): %s", retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -8730,7 +8758,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if outcome.logStatusCode != http.StatusOK {
 			c.Set(AccessLogStatusContextKey, outcome.logStatusCode)
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
-			if deltaCharCount > 0 {
+			if deltaCharCount > 0 && usage == nil {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {
 					estOutputTokens = 1

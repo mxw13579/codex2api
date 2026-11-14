@@ -131,7 +131,7 @@ func (s *liveCreateState) save(account *auth.Account, created *liveCallCreated) 
 
 func (s *liveCreateState) record(account *auth.Account, created *liveCallCreated) *liveCallRecord {
 	now := time.Now()
-	trace := snapshotUpstreamTrace(s.client.Request.Context())
+	trace := snapshotUpstreamTrace(s.client.Request.Context(), false)
 	return &liveCallRecord{
 		RequestID: trace.RequestID, UpstreamRequestID: trace.UpstreamRequestID,
 		UpstreamProxyID: trace.Proxy.ID, UpstreamProxyName: trace.Proxy.Name,

@@ -417,6 +417,11 @@ type pipelineResponseReader struct {
 	*os.File
 	err            error
 	cookieObserver upstreamCookieEventObserver
+	errorMetadata  upstreamErrorLogMetadata // Frozen before collectResponse closes the original body.
+}
+
+func (r *pipelineResponseReader) upstreamErrorMetadata() upstreamErrorLogMetadata {
+	return r.errorMetadata
 }
 
 func (r *pipelineResponseReader) observeUpstreamCookieEvent(payload []byte) {

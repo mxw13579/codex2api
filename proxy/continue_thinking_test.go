@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
 
@@ -611,6 +615,134 @@ func TestFoldFirstRoundFailedPassthrough(t *testing.T) {
 	final := c.events[len(c.events)-1]
 	if string(final) != failed {
 		t.Fatalf("第 1 轮无输出的 failed 应字节级透传:\ngot  %s\nwant %s", final, failed)
+	}
+}
+
+func TestFoldTraceCookieRetentionByUsageLogMode(t *testing.T) {
+	cookieLogTestSetup(t)
+	for _, mode := range []string{database.UsageLogModeErrors, database.UsageLogModeOff} {
+		for _, tt := range []struct {
+			name       string
+			httpStatus int
+			terminal   string
+			wantStatus int
+		}{
+			{name: "completed", httpStatus: 200, terminal: evCompleted(1, 120, 900, 400), wantStatus: 200},
+			{name: "http_rejected", httpStatus: 429, wantStatus: 429},
+			{name: "open_error", wantStatus: 0},
+			{name: "failed", httpStatus: 200, terminal: evFailed(1), wantStatus: 0},
+			{name: "incomplete", httpStatus: 200, terminal: `{"type":"response.incomplete","response":{"status":"incomplete"}}`, wantStatus: 0},
+		} {
+			t.Run(mode+"/"+tt.name, func(t *testing.T) {
+				db := &database.DB{}
+				db.SetUsageLogConfig(mode, 0, 0)
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				attachUpstreamTrace(c, nil)
+				ctx := c.Request.Context()
+				requestID := cookieLogRequestID(ctx)
+				account := &auth.Account{DBID: 4}
+				first := fingerprintFirstRound()
+				first.Header = http.Header{"X-Request-Id": {"req_first"}, "Set-Cookie": {"__cflb=synthetic-first"}}
+				beginUpstreamTrace(ctx, account, "", false)(first)
+				NewUpstreamCookieTrace(ctx, account, "http", "", nil, first)
+				var statuses []int
+				f := &continueFold{
+					trace: func(statusCode int) upstreamTraceSnapshot {
+						statuses = append(statuses, statusCode)
+						return snapshotUpstreamTrace(ctx, db.ShouldStoreUsageLog(&database.UsageLogInput{StatusCode: statusCode}))
+					},
+					baseBody:  []byte(testBaseBody),
+					maxRounds: 2,
+					forward:   func([]byte) bool { return true },
+					observe:   func([]byte) {},
+					openRound: func([]byte) (*http.Response, error) {
+						resetUpstreamAttemptTrace(ctx)
+						if tt.httpStatus == 0 {
+							return nil, fmt.Errorf("synthetic open error")
+						}
+						next := &http.Response{
+							StatusCode: tt.httpStatus,
+							Header:     http.Header{"X-Request-Id": {"req_hidden"}, "Set-Cookie": {"__cflb=synthetic-hidden"}},
+							Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"synthetic rejection"}}`)),
+						}
+						if tt.httpStatus == http.StatusOK {
+							next.Body = sseBody(tt.terminal)
+						}
+						beginUpstreamTrace(ctx, account, "", false)(next)
+						NewUpstreamCookieTrace(ctx, account, "http", "", nil, next)
+						return next, nil
+					},
+					clientGone: func() bool { return false },
+				}
+				res := runContinueThinkingFold(first, f)
+				stats := res.Rounds
+				if res.FailedContinuation != nil {
+					stats = append(stats, *res.FailedContinuation)
+				}
+				if len(stats) != 2 || len(statuses) != 2 {
+					t.Fatalf("round stats=%d snapshots=%d, want 2 each", len(stats), len(statuses))
+				}
+				for i, wantStatus := range []int{http.StatusOK, tt.wantStatus} {
+					stat := stats[i]
+					if stat.StatusCode != wantStatus || statuses[i] != wantStatus {
+						t.Fatalf("round %d status=%d snapshot status=%d, want %d", i, stat.StatusCode, statuses[i], wantStatus)
+					}
+					wantID := "req_first"
+					if i == 1 {
+						wantID = "req_hidden"
+						if tt.httpStatus == 0 {
+							wantID = ""
+						}
+					}
+					if requestID == "" || stat.Trace.RequestID != requestID || stat.Trace.UpstreamRequestID != wantID {
+						t.Fatalf("round %d lost its frozen identity", i)
+					}
+					// Preserve the existing raw zero status; do not reinterpret
+					// transport/terminal failures while deciding Cookie retention.
+					retain := mode == database.UsageLogModeErrors && wantStatus == http.StatusTooManyRequests
+					if (stat.Trace.UpstreamCookieTrace != "") != retain {
+						t.Fatalf("round %d Cookie retention=%v, want %v", i, stat.Trace.UpstreamCookieTrace != "", retain)
+					}
+					if retain {
+						entries := cookieLogTestRead(t, stat.Trace.UpstreamCookieTrace)
+						if len(entries) != 2 || entries[1].Status != wantStatus || entries[1].UpstreamRequestID != wantID {
+							t.Fatal("rejected hidden round lost its Cookie snapshot")
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestFoldContinuationBodyErrorReusesRoundRequestID(t *testing.T) {
+	calls := 0
+	f := &continueFold{
+		trace: func(statusCode int) upstreamTraceSnapshot {
+			calls++
+			if statusCode != http.StatusOK {
+				t.Fatalf("snapshot status=%d, want 200", statusCode)
+			}
+			return upstreamTraceSnapshot{RequestID: "synthetic-request-id", UpstreamRequestID: "req_first", UpstreamCookieTrace: `{"entries":[]}`}
+		},
+		baseBody:  []byte(`[]`), // Cannot set an object input field on an array.
+		maxRounds: 2,
+		forward:   func([]byte) bool { return true },
+		observe:   func([]byte) {},
+		openRound: func([]byte) (*http.Response, error) {
+			t.Fatal("invalid continuation body must not open a round")
+			return nil, nil
+		},
+		clientGone: func() bool { return false },
+	}
+	res := runContinueThinkingFold(fingerprintFirstRound(), f)
+	if res.StopReason != continueStopRoundError || len(res.Rounds) != 1 || res.FailedContinuation == nil || calls != 1 {
+		t.Fatalf("body error must reuse the completed round snapshot; snapshots=%d", calls)
+	}
+	trace := res.FailedContinuation.Trace
+	if trace.RequestID != res.Rounds[0].Trace.RequestID || trace.UpstreamRequestID != "" || trace.UpstreamCookieTrace != "" {
+		t.Fatal("body error must retain only the completed round RequestID")
 	}
 }
 

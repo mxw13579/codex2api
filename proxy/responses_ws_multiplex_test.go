@@ -207,7 +207,7 @@ func TestResponsesWSMultiplexAuditStateIsTurnLocal(t *testing.T) {
 	observed := make(chan observation, 2)
 	release := make(chan struct{})
 	client := newResponsesWSMultiplexClient(t, func(ctx context.Context, body []byte) (*http.Response, error) {
-		observed <- observation{upstreamTraceFromContext(ctx), userAgentAuditFromContext(ctx), wsAcquireAuditFromContext(ctx), snapshotUpstreamTrace(ctx).RequestID}
+		observed <- observation{upstreamTraceFromContext(ctx), userAgentAuditFromContext(ctx), wsAcquireAuditFromContext(ctx), snapshotUpstreamTrace(ctx, false).RequestID}
 		select {
 		case <-release:
 		case <-ctx.Done():

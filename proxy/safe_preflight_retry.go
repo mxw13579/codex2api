@@ -47,10 +47,11 @@ type safePreflightSSEFrame struct {
 	event                       string
 	data, wire                  []byte
 	envelopeChecked, hasComment bool
+	rateLimits                  bool // Classified once at the complete, immutable envelope boundary.
 }
 
 func (f safePreflightSSEFrame) isRateLimits() bool {
-	return f.envelopeChecked && !f.hasComment && isSafePreflightRateLimitsFrame(f.event, f.data)
+	return f.rateLimits
 }
 
 // The standalone reader stays bounded. Once protocol commit permanently closes
@@ -105,6 +106,7 @@ func readSafePreflightSSEWithCommit(body io.Reader, onUnsafe func(), observe fun
 			if len(dataLines) != 0 {
 				frame.envelopeChecked = true
 				frame.data = bytes.Join(dataLines, []byte{'\n'})
+				frame.rateLimits = !frame.hasComment && isSafePreflightRateLimitsFrame(frame.event, frame.data)
 				if !observe(frame) {
 					return nil
 				}

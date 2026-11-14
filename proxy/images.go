@@ -1855,6 +1855,7 @@ func (h *Handler) forwardImagesRequestWithBadRequestRetry(c *gin.Context, inboun
 
 		if pipeline := pipelineFromContext(c.Request.Context()); pipeline != nil {
 			cookieObserver, _ := resp.Body.(upstreamCookieEventObserver)
+			errorMetadata := upstreamErrorMetadataFromBody(resp.Body)
 			file, err := pipeline.collectResponse(c.Request.Context(), resp.Body)
 			if err != nil {
 				h.store.Release(account)
@@ -1862,7 +1863,7 @@ func (h *Handler) forwardImagesRequestWithBadRequestRetry(c *gin.Context, inboun
 				return
 			}
 			defer removePipelineFile(file)
-			resp.Body = &pipelineResponseReader{File: file, err: pipeline.responseReadError, cookieObserver: cookieObserver}
+			resp.Body = &pipelineResponseReader{File: file, err: pipeline.responseReadError, cookieObserver: cookieObserver, errorMetadata: errorMetadata}
 		}
 
 		if resp.StatusCode != http.StatusOK {

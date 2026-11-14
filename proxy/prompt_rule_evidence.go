@@ -556,9 +556,20 @@ func upstreamPromptPolicyTransport(stream, viaWebsocket bool) string {
 	return "http"
 }
 
-func (h *Handler) logPromptPolicyRetryUsage(c *gin.Context, input database.UsageLogInput, incidentID string) {
-	if strings.TrimSpace(incidentID) == "" {
+// Record an abandoned stream attempt when it has real usage or a policy incident.
+// Hidden model rounds are already included in usage; copy, never sum them again.
+func (h *Handler) logStreamRetryUsage(c *gin.Context, input database.UsageLogInput, incidentID string, usage *UsageInfo) {
+	if usage == nil && strings.TrimSpace(incidentID) == "" {
 		return
+	}
+	if usage != nil {
+		input.PromptTokens, input.CompletionTokens, input.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
+		input.InputTokens, input.OutputTokens, input.ReasoningTokens, input.CachedTokens = usage.InputTokens, usage.OutputTokens, usage.ReasoningTokens, usage.CachedTokens
+		input.ImageInputTokens, input.ImageOutputTokens, input.CachedImageInputTokens = usage.ImageInputTokens, usage.ImageOutputTokens, usage.CachedImageInputTokens
+		applyUsageCacheWritesToLog(&input, usage)
+		tiers := resolveUsageServiceTiers(input.ActualServiceTier, input.RequestedServiceTier)
+		input.ServiceTier, input.BillingServiceTier = tiers.ServiceTier, tiers.BillingServiceTier
+		input.RequestedServiceTier, input.ActualServiceTier = tiers.RequestedServiceTier, tiers.ActualServiceTier
 	}
 	input.PromptPolicyIncidentID = incidentID
 	input.IsRetryAttempt = true

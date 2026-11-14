@@ -788,7 +788,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if retryingBadRequest {
 				// One ordinary selection, without the continuous pool wait/reset loop.
-				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+				account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 			} else {
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
@@ -1200,7 +1200,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			errBody, readErr := readUpstreamErrorBody(readCtx, resp.Body)
 			var badRequestDecision badRequestRetryDecision
-			if !useWebsocket && pin == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+			if badRequestRetryHTTPResponse(resp, useWebsocket) && pin == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				badRequestDecision = badRequestRetry.decide(c.Request.Context(), resp.StatusCode, errBody, readErr, account, proxyURL, !c.Writer.Written())
 			}
 			if readErr != nil {
@@ -1776,6 +1776,15 @@ func (h *Handler) Messages(c *gin.Context) {
 		outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
 		outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 		terminalFailurePayload, _ = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentStarted, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
+		if len(terminalFailurePayload) > 0 {
+			failedResponse := gjson.GetBytes(terminalFailurePayload, "response")
+			if reported := failedResponse.Get("usage"); reported.IsObject() {
+				usage = extractUsageFromResult(reported)
+			}
+			if tier := failedResponse.Get("service_tier").String(); tier != "" {
+				actualServiceTier = tier
+			}
+		}
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(attemptFirstTokenTimeout)
 		}
@@ -1820,13 +1829,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			rememberContinuousRetryStreamFailure(c.Request.Context(), outcome, terminalFailurePayload)
 			_ = streamAttempt.Close()
 			clearNewAPIUpstreamCyberPolicyDecision(c)
-			h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+			h.logStreamRetryUsage(c, database.UsageLogInput{
 				AccountID: account.ID(), Endpoint: "/v1/messages", Model: model, EffectiveModel: attemptEffectiveModel,
 				StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 				InboundEndpoint: "/v1/messages", UpstreamEndpoint: upstreamEndpoint, Stream: isStream, ViaWebsocket: useWebsocket,
 				AttemptIndex: attempt + 1, UpstreamErrorKind: outcome.failureKind,
+				RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
 				ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
-			}, promptPolicyIncidentID)
+			}, promptPolicyIncidentID, usage)
 			log.Printf("上游流在首包前断开，重试 (attempt %s, account %d, /v1/messages): %s",
 				retryAttemptProgress(attempt, maxRetries), account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
@@ -1885,6 +1895,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		if !isStream {
 			if !claimContinuousRetryTerminal(c, continuousRetryProtocolAnthropic) {
 				// The deadline owns the terminal response.
+			} else if len(terminalFailurePayload) > 0 {
+				statusCode := outcome.logStatusCode
+				if statusCode < 400 || statusCode > 599 || statusCode == logStatusUpstreamStreamBreak {
+					statusCode = http.StatusBadGateway
+				}
+				sendAnthropicError(c, statusCode, mapHTTPStatusToAnthropicError(statusCode), outcome.failureMessage)
 			} else if anthropicResp != nil {
 				c.JSON(http.StatusOK, anthropicResp)
 			} else {
@@ -1900,7 +1916,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/messages, status %d): %s，已转发约 %d 字符",
 				account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
-			if deltaCharCount > 0 {
+			if deltaCharCount > 0 && usage == nil {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {
 					estOutputTokens = 1

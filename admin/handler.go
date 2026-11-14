@@ -11687,8 +11687,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		effectiveRuntimeCfg.CodexSyncedVSCodeBuild = current.CodexSyncedVSCodeBuild
 		// Cookie diagnostics are applied only after their dedicated DB update.
 		effectiveRuntimeCfg.CodexUpstreamCookieLogEnabled = current.CodexUpstreamCookieLogEnabled
-		// Independent policy updates publish only after their own DB commit.
-		effectiveRuntimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 		return effectiveRuntimeCfg
 	})
 
@@ -12151,7 +12149,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		if autoResetCreditsChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-				runtimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
@@ -12163,7 +12160,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		if autoActivate5hChanged {
 			runtimeCfg = proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-				runtimeCfg.BadRequestRetryPolicy = current.BadRequestRetryPolicy
 				runtimeCfg.CodexSyncedCLIVersion = current.CodexSyncedCLIVersion
 				runtimeCfg.CodexSyncedDesktopMacBuild = current.CodexSyncedDesktopMacBuild
 				runtimeCfg.CodexSyncedDesktopWindowsBuild = current.CodexSyncedDesktopWindowsBuild
@@ -12193,10 +12189,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			}
 			badRequestRetryPolicy = committed
 			h.store.SetBadRequestRetryPolicy(committed)
-			proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-				current.BadRequestRetryPolicy = committed
-				return current
-			})
 			log.Printf("设置已更新: bad_request_retry enabled=%t max_retries=%d switch_account=%t", committed.Enabled, committed.MaxRetries, committed.SwitchAccount)
 		}
 	}

@@ -9,7 +9,6 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
-	"github.com/codex2api/proxy"
 )
 
 func TestBadRequestRetrySettingsAPIAndReload(t *testing.T) {
@@ -39,15 +38,12 @@ func TestBadRequestRetrySettingsAPIAndReload(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// Reconstruct Store and proxy settings as startup does; no accounts,
+			// Reconstruct Store settings as startup does; no accounts,
 			// authentication or upstream requests are involved.
 			reloaded := auth.NewStore(nil, nil, settings)
 			t.Cleanup(reloaded.Stop)
 			if got := reloaded.GetBadRequestRetryPolicy(); got != step.want {
 				t.Fatalf("reloaded store = %+v, want %+v", got, step.want)
-			}
-			if got := proxy.ApplyRuntimeSettingsFromSystem(settings).BadRequestRetryPolicy; got != step.want {
-				t.Fatalf("reloaded runtime = %+v, want %+v", got, step.want)
 			}
 		})
 	}
@@ -105,10 +101,6 @@ func TestBadRequestRetrySettingsPersistBeforePublish(t *testing.T) {
 					t.Fatal(err)
 				}
 				handler.store.SetBadRequestRetryPolicy(want)
-				proxy.UpdateRuntimeSettings(func(current proxy.RuntimeSettings) proxy.RuntimeSettings {
-					current.BadRequestRetryPolicy = want
-					return current
-				})
 				installTransient429SettingsTrigger(t, path, stage.trigger)
 				body := `{"bad_request_retry_enabled":true,"bad_request_retry_max_retries":0,"bad_request_retry_switch_account":false}`
 				if enabled {
@@ -144,12 +136,11 @@ func TestBadRequestRetrySettingsPartialUpdateUsesLatestDatabase(t *testing.T) {
 	assertBadRequestRetryAdminState(t, handler, db, want, want)
 }
 
-func TestBadRequestRetryStoreAndRuntimeDefaults(t *testing.T) {
+func TestBadRequestRetryStoreDefaultsAndNormalization(t *testing.T) {
 	var nilStore *auth.Store
 	store := &auth.Store{}
 	def := database.DefaultBadRequestRetryPolicy()
-	if nilStore.GetBadRequestRetryPolicy() != def || store.GetBadRequestRetryPolicy() != def ||
-		proxy.DefaultRuntimeSettings().BadRequestRetryPolicy != def {
+	if nilStore.GetBadRequestRetryPolicy() != def || store.GetBadRequestRetryPolicy() != def {
 		t.Fatal("uninitialized policy should be disabled with one extra retry")
 	}
 	nilStore.SetBadRequestRetryPolicy(def)
@@ -162,10 +153,9 @@ func TestBadRequestRetryStoreAndRuntimeDefaults(t *testing.T) {
 	if store.GetBadRequestRetryPolicy().MaxRetries != 10 {
 		t.Fatal("getter did not return a value copy")
 	}
-	settings := proxy.DefaultRuntimeSettings()
-	settings.BadRequestRetryPolicy = copy
-	if proxy.NormalizeRuntimeSettings(settings).BadRequestRetryPolicy.MaxRetries != 0 {
-		t.Fatal("runtime must preserve zero")
+	store.SetBadRequestRetryPolicy(copy)
+	if store.GetBadRequestRetryPolicy().MaxRetries != 0 {
+		t.Fatal("store must preserve zero")
 	}
 }
 
@@ -191,13 +181,10 @@ func assertBadRequestRetryResponse(t *testing.T, response *httptest.ResponseReco
 	}
 }
 
-func assertBadRequestRetryAdminState(t *testing.T, handler *Handler, db *database.DB, runtimeWant, persistedWant database.BadRequestRetryPolicy) {
+func assertBadRequestRetryAdminState(t *testing.T, handler *Handler, db *database.DB, storeWant, persistedWant database.BadRequestRetryPolicy) {
 	t.Helper()
-	if got := handler.store.GetBadRequestRetryPolicy(); got != runtimeWant {
-		t.Fatalf("store policy=%+v, want %+v", got, runtimeWant)
-	}
-	if got := proxy.CurrentRuntimeSettings().BadRequestRetryPolicy; got != runtimeWant {
-		t.Fatalf("runtime policy=%+v, want %+v", got, runtimeWant)
+	if got := handler.store.GetBadRequestRetryPolicy(); got != storeWant {
+		t.Fatalf("store policy=%+v, want %+v", got, storeWant)
 	}
 	settings, err := db.GetSystemSettings(context.Background())
 	if err != nil || settings == nil {

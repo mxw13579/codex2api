@@ -365,12 +365,12 @@ func TestBadRequestRetryRoutesCapacityOverflowKeepsBinding(t *testing.T) {
 					t.Fatal("fixture must start bound to A")
 				}
 				// Take a real lease, keeping A saturated for the whole request.
-				held, _, initialGuard := h.nextAccountForSessionWithDispatchGuard(affinityKey, 0, nil, nil, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
+				held, _, initialGuard := h.nextAccountForSessionWithDispatchGuard(context.Background(), affinityKey, 0, nil, nil, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if held != accounts[0] || !reflect.ValueOf(initialGuard).IsZero() {
 					t.Fatal("initial selection must use the bound A without overflow")
 				}
 				defer h.store.Release(held)
-				borrowed, _, overflowGuard := h.nextAccountForSessionWithDispatchGuard(affinityKey, 0, nil, nil, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
+				borrowed, _, overflowGuard := h.nextAccountForSessionWithDispatchGuard(context.Background(), affinityKey, 0, nil, nil, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if borrowed != nil {
 					h.store.Release(borrowed)
 				}

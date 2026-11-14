@@ -1134,6 +1134,9 @@ func TestNativeSearchResponsesPrivateReplayCompletion(t *testing.T) {
 	last.lifecycle("response.completed", call, client, nativeSearchMessage("M", "Answer"))
 	var stream strings.Builder
 	var replay []json.RawMessage
+	response := first.response()
+	attachCodexSearchContinuation(response, bridge)
+	publish := bridge.onCompleted
 	completed, opened, searched := 0, 0, 0
 	bridge.onCompleted = func(items []json.RawMessage) {
 		completed++
@@ -1141,8 +1144,9 @@ func TestNativeSearchResponsesPrivateReplayCompletion(t *testing.T) {
 			t.Fatal("private replay was attached after publishing terminal")
 		}
 		replay = items
+		publish(items)
 	}
-	err := bridge.run(context.Background(), first.response(), []byte(`{"input":[]}`), func([]byte) (*http.Response, error) {
+	err := bridge.run(context.Background(), response, []byte(`{"input":[]}`), func([]byte) (*http.Response, error) {
 		if completed != 0 {
 			t.Fatal("completion callback ran before the last round")
 		}
@@ -1170,5 +1174,19 @@ func TestNativeSearchResponsesPrivateReplayCompletion(t *testing.T) {
 	}
 	if len(calls) != 3 || len(results) != 2 || !calls["call_client"] || results["call_client"] || !results["call_search"] || !results["call_second"] || gjson.GetBytes(replay[0], "id").String() != "A" || terminal.Get("response.output.#").Int() != 5 || strings.Contains(stream.String(), bridge.name) {
 		t.Fatal("private replay lost a real output, hidden result, or unresolved external call")
+	}
+	stored := response.Body.(*codexSearchContextBody)
+	if !stored.completed || len(stored.replay) != len(replay) {
+		t.Fatal("completion did not publish the private replay")
+	}
+	for i := range replay {
+		if len(replay[i]) == 0 || len(stored.replay[i]) == 0 || &stored.replay[i][0] != &replay[i][0] {
+			t.Fatal("consumer should share immutable item bytes, not copy them again")
+		}
+	}
+	firstItem := string(replay[0])
+	replay[0] = nil // The consumer must own its slice, not the bridge's slice slots.
+	if string(stored.replay[0]) != firstItem {
+		t.Fatal("consumer retained the bridge's mutable slice backing array")
 	}
 }

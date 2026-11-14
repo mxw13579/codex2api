@@ -655,7 +655,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		if !sameBadRequestAccount && !retainedHTTPFallback && retryingBadRequest {
 			// Rotation was admitted only for self-contained, unpinned history.
-			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
+			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
 			if !continuationPinned && hasPreviousResponse && !continuationDegraded && !searchContinuation {
@@ -1005,7 +1005,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			errBody, readErr := readUpstreamErrorBody(c.Request.Context(), resp.Body)
 			var badRequestDecision badRequestRetryDecision
-			if !useWebsocket && pinnedAccountDispatchForRequest(c) == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
+			if badRequestRetryHTTPResponse(resp, useWebsocket) && pinnedAccountDispatchForRequest(c) == nil && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				// No turn output has been committed on this HTTP-error path. Do not
 				// degrade a continuation merely to enable rotation for this policy.
 				canRetry := !continuationContextLost && (!badRequestPolicy.SwitchAccount ||
@@ -1572,6 +1572,15 @@ func (h *Handler) streamResponsesWSUpstream(
 	outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 	var candidatePromoted bool
 	terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
+	if len(terminalFailurePayload) > 0 {
+		failedResponse := gjson.GetBytes(terminalFailurePayload, "response")
+		if reported := failedResponse.Get("usage"); reported.IsObject() {
+			usage = extractUsageFromResult(reported)
+		}
+		if tier := failedResponse.Get("service_tier").String(); tier != "" {
+			actualServiceTier = tier
+		}
+	}
 	if candidatePromoted {
 		terminalFailureEventType = "error"
 	} else if len(terminalFailurePayload) > 0 && terminalFailureEventType == "" {
@@ -1629,13 +1638,14 @@ func (h *Handler) streamResponsesWSUpstream(
 	if transparentRetrySelected {
 		_ = wsReplay.Close()
 		clearNewAPIUpstreamCyberPolicyDecision(c)
-		h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
+		h.logStreamRetryUsage(c, database.UsageLogInput{
 			AccountID: account.ID(), Endpoint: "/v1/responses", Model: model, EffectiveModel: logEffectiveModel,
 			StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
 			InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint, Stream: true, ViaWebsocket: viaWebsocket,
 			AttemptIndex: fallbackAttempt, UpstreamErrorKind: outcome.failureKind,
+			RequestedServiceTier: serviceTier, ActualServiceTier: actualServiceTier,
 			ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
-		}, promptPolicyIncidentID)
+		}, promptPolicyIncidentID, usage)
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) {
 			h.reportStreamOutcomeFailure(account, outcome, time.Duration(totalDuration)*time.Millisecond)

@@ -88,7 +88,7 @@ func TestUpstreamCookieHTTPRealAndSemantic429(t *testing.T) {
 				}
 			}
 			input := &database.UsageLogInput{AccountID: 4286}
-			populateUpstreamTrace(c, input)
+			populateUpstreamTrace(c, input, true)
 			entries := cookieLogTestRead(t, input.UpstreamCookieTrace)
 			want := 1
 			if status == 200 {
@@ -455,7 +455,7 @@ func TestUpstreamCookieSilentRetryFinalUsageAndSnapshot(t *testing.T) {
 	lateFailed(failedResponse)
 	failed := NewUpstreamCookieTrace(ctx, failedAccount, "http", "", nil, failedResponse)
 	failed.ObserveEvent([]byte(`{"type":"response.failed","response":{"error":{"code":"turn_rate_limit_exceeded"}}}`))
-	frozen := snapshotUpstreamTrace(ctx)
+	frozen := snapshotUpstreamTrace(ctx, true)
 	// The ordinary attempt reset must not discard a silently suppressed 429.
 	resetUpstreamAttemptTrace(ctx)
 	successAccount := &auth.Account{DBID: 2}
@@ -488,11 +488,17 @@ func TestUpstreamCookieSilentRetryFinalUsageAndSnapshot(t *testing.T) {
 	if entries[1].UpstreamRequestID != upstreamResponseTestUUID || entries[3].UpstreamRequestID != "req_success" {
 		t.Fatal("retry request IDs mixed or masked")
 	}
-	hiddenRound := &database.UsageLogInput{AccountID: 1}
-	frozen.apply(hiddenRound)
-	populateUpstreamTrace(c, hiddenRound)
-	if len(cookieLogTestRead(t, hiddenRound.UpstreamCookieTrace)) != 2 || hiddenRound.UpstreamRequestID != upstreamResponseTestUUID {
-		t.Fatal("continuation snapshot overwritten by later request events")
+	for _, retainCookie := range []bool{false, true} {
+		hiddenRound := &database.UsageLogInput{AccountID: 1, StatusCode: 429, InputTokens: 11, OutputTokens: 3, TotalTokens: 14}
+		frozen.apply(hiddenRound)
+		populateUpstreamTrace(c, hiddenRound, retainCookie)
+		if hiddenRound.RequestID != frozen.RequestID || hiddenRound.UpstreamCookieTrace != frozen.UpstreamCookieTrace ||
+			len(cookieLogTestRead(t, hiddenRound.UpstreamCookieTrace)) != 2 || hiddenRound.UpstreamRequestID != upstreamResponseTestUUID {
+			t.Fatal("continuation snapshot overwritten by later request events")
+		}
+		if hiddenRound.AccountID != 1 || hiddenRound.StatusCode != 429 || hiddenRound.InputTokens != 11 || hiddenRound.OutputTokens != 3 || hiddenRound.TotalTokens != 14 {
+			t.Fatal("Cookie retention changed hidden-round usage/accounting input")
+		}
 	}
 	resetUpstreamRequestTrace(c)
 	// Even a late terminal from the previous request cannot enter the new one.
