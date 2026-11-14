@@ -133,6 +133,7 @@ class IsolatedReleaseTest(unittest.TestCase):
             for slot in release.SLOTS
         }
         self.running_images = {slot: SOURCE_IMAGE for slot in release.SLOTS}
+        self.edge = {"Status": "running", "Running": True}
         self.rows = {"blue": counters("UP"), "green": counters("MAINT")}
         self.frames = []
         self.app = release.Release(self.root)
@@ -157,6 +158,13 @@ class IsolatedReleaseTest(unittest.TestCase):
             for slot in release.SLOTS:
                 if name == PROJECT + "-" + slot:
                     return json.dumps([{"State": self.containers[slot], "Image": self.running_images[slot]}])
+        elif arguments == ["docker", "container", "ls", "--all", "--quiet", "--filter",
+                           f"name=^/{PROJECT}-edge$"]:
+            self.events.append(("edge_lookup", PROJECT + "-edge"))
+            return "synthetic-edge-id\n" if self.edge is not None else ""
+        elif arguments == ["docker", "image", "inspect", "synthetic.invalid/app:initial"]:
+            self.events.append(("image", "synthetic.invalid/app:initial"))
+            return json.dumps([{"Id": SOURCE_IMAGE}])
         elif arguments == ["docker", "image", "inspect", CANDIDATE_REFERENCE]:
             self.events.append(("image", CANDIDATE_REFERENCE))
             return json.dumps([{"Id": CANDIDATE_IMAGE}])
@@ -168,7 +176,10 @@ class IsolatedReleaseTest(unittest.TestCase):
             Path(arguments[5]).relative_to(self.root)
             action = tuple(arguments[6:])
             self.events.append(("compose", action))
-            if action in (("config", "--quiet"), ("up", "-d", "--no-deps", "--no-recreate", "edge")):
+            if action == ("config", "--quiet"):
+                return ""
+            if action == ("up", "-d", "--no-deps", "--no-recreate", "edge"):
+                self.edge = {"Status": "running", "Running": True}
                 return ""
             for slot in release.SLOTS:
                 if action == ("up", "-d", "--no-deps", slot):
@@ -477,29 +488,178 @@ class DrainTests(IsolatedReleaseTest):
 
 
 class BootstrapRecoveryTests(IsolatedReleaseTest):
+    def test_unhealthy_first_image_can_be_replaced_before_edge_exists(self):
+        self.app.state["bootstrapped"] = False
+        self.edge = None
+        self.containers["blue"]["Health"]["Status"] = "unhealthy"
+        with self.assertRaisesRegex(release.ReleaseError, "did not become healthy"):
+            self.app.bootstrap("synthetic.invalid/app:initial", False, 0)
+        self.assertFalse(self.disk_state()["bootstrapped"])
+        self.assertFalse(self.disk_state().get("bootstrap_edge_started"))
+        self.assertEqual(self.disk_state()["bootstrap_image"]["image"], SOURCE_IMAGE)
+        self.assertEqual(self.compose_actions(), [("up", "-d", "--no-deps", "blue")])
+        self.assertIsNone(self.edge)
+        self.control.assert_not_called()
+
+        # A fresh process must be able to replace the failed candidate container.
+        self.app = release.Release(self.root)
+        self.control = self.patch(self.app, "socket_command", side_effect=self.fake_control)
+        self.events.clear()
+        self.containers["blue"]["Health"]["Status"] = "healthy"
+        self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
+        pinned = {"image": CANDIDATE_IMAGE, "reference": CANDIDATE_REFERENCE}
+        self.assertTrue(self.disk_state()["bootstrapped"])
+        self.assertTrue(self.disk_state()["bootstrap_edge_started"])
+        self.assertEqual(self.disk_state()["bootstrap_image"], pinned)
+        self.assertEqual(self.disk_state()["slots"]["blue"], pinned)
+        self.assertEqual(self.running_images["blue"], CANDIDATE_IMAGE)
+        self.assertEqual(self.running_images["green"], SOURCE_IMAGE)
+        self.assertEqual(self.compose_actions(), [
+            ("up", "-d", "--no-deps", "blue"),
+            ("up", "-d", "--no-deps", "--no-recreate", "edge"),
+        ])
+        self.assertEqual(self.events[0], ("edge_lookup", PROJECT + "-edge"))
+
+    def test_interrupted_pre_edge_replacement_reuses_saved_id_and_recreates_candidate(self):
+        # Crash after saving the replacement, before Compose updates old blue.
+        self.app.state["bootstrapped"] = False
+        pinned = {"image": CANDIDATE_IMAGE, "reference": CANDIDATE_REFERENCE}
+        self.app.state["bootstrap_image"] = copy.deepcopy(pinned)
+        self.app.state["slots"]["blue"] = copy.deepcopy(pinned)
+        self.app.persist()
+        self.edge = None
+        self.app.bootstrap(CANDIDATE_REFERENCE, True, 0)
+        self.assertTrue(self.disk_state()["bootstrapped"])
+        self.assertEqual(self.running_images["blue"], CANDIDATE_IMAGE)
+        self.assertEqual(self.compose_actions()[0], ("up", "-d", "--no-deps", "blue"))
+        self.assertFalse(any(kind in ("image", "pull") for kind, _ in self.events))
+
     def test_interrupted_bootstrap_resumes_pinned_image_without_recreating(self):
+        for status in ("created", "running", "exited"):
+            with self.subTest(edge_status=status):
+                self.events.clear()
+                self.edge = {"Status": status, "Running": status == "running"}
+                self.app.state["bootstrapped"] = False
+                self.app.state.pop("bootstrap_edge_started", None)
+                pinned = {"image": SOURCE_IMAGE, "reference": CANDIDATE_REFERENCE}
+                self.app.state["bootstrap_image"] = pinned
+                self.rows["blue"]["sessions"] = 1
+                self.app.persist()
+                self.app.bootstrap(CANDIDATE_REFERENCE, True, 0)
+                self.assertTrue(self.app.state["bootstrapped"])
+                self.assertEqual(self.running_images["blue"], SOURCE_IMAGE)
+                self.assertEqual(self.app.state["slots"]["blue"], pinned)
+                self.assertEqual(self.compose_actions(), [
+                    ("up", "-d", "--no-deps", "--no-recreate", "blue"),
+                    ("up", "-d", "--no-deps", "--no-recreate", "edge"),
+                ])
+                self.assertFalse(any(kind in ("image", "pull") for kind, _ in self.events))
+                self.assertEqual(self.rows["blue"]["sessions"], 1)
+
+    def test_interrupted_bootstrap_rejects_different_image(self):
+        for status in ("created", "running", "exited"):
+            with self.subTest(edge_status=status):
+                self.events.clear()
+                self.edge = {"Status": status, "Running": status == "running"}
+                self.app.state["bootstrapped"] = False
+                self.app.state["bootstrap_image"] = {
+                    "image": SOURCE_IMAGE, "reference": "synthetic.invalid/app:initial",
+                }
+                self.app.persist()
+                before = self.disk_state()
+                with self.assertRaisesRegex(release.ReleaseError, "Bootstrap already started"):
+                    self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
+                self.assertEqual(self.events, [("edge_lookup", PROJECT + "-edge")])
+                self.assertEqual(self.disk_state(), before)
+                self.assertEqual(self.app.state, before)
+                self.control.assert_not_called()
+
+    def test_edge_lookup_failure_is_not_container_absence(self):
+        self.app.state["bootstrapped"] = False
+        self.app.state["bootstrap_image"] = {
+            "image": SOURCE_IMAGE, "reference": "synthetic.invalid/app:initial",
+        }
+        self.app.persist()
+        before = self.disk_state()
+        failure = release.ReleaseError("synthetic Docker query failure")
+        self.docker.side_effect = failure
+        with self.assertRaises(release.ReleaseError) as raised:
+            self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
+        self.assertIs(raised.exception, failure)
+        self.docker.assert_called_once_with([
+            "docker", "container", "ls", "--all", "--quiet", "--filter",
+            f"name=^/{PROJECT}-edge$",
+        ])
+        self.assertEqual(self.disk_state(), before)
+        self.assertEqual(self.app.state, before)
+        self.control.assert_not_called()
+
+    def test_health_inspect_failure_does_not_unpin_existing_edge(self):
         self.app.state["bootstrapped"] = False
         pinned = {"image": SOURCE_IMAGE, "reference": CANDIDATE_REFERENCE}
         self.app.state["bootstrap_image"] = pinned
         self.app.persist()
-        self.app.bootstrap(CANDIDATE_REFERENCE, True, 0)
-        self.assertTrue(self.app.state["bootstrapped"])
+        self.patch(release, "inspect_container", side_effect=release.ReleaseError("synthetic inspect failure"))
+        with self.assertRaisesRegex(release.ReleaseError, "did not become healthy"):
+            self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
+        self.assertEqual(self.disk_state()["bootstrap_image"], pinned)
+        self.assertTrue(self.disk_state()["bootstrap_edge_started"])
+        self.assertEqual(self.compose_actions(), [
+            ("up", "-d", "--no-deps", "--no-recreate", "blue"),
+        ])
+        self.control.assert_not_called()
+
+    def test_edge_start_failure_keeps_pin_before_container_creation(self):
+        self.app.state["bootstrapped"] = False
+        self.edge = None
+        compose = self.app.compose
+
+        def fail_edge(*args, **kwargs):
+            if args[-1] == "edge":
+                self.assertTrue(self.disk_state()["bootstrap_edge_started"])
+                raise release.ReleaseError("synthetic edge start failure")
+            return compose(*args, **kwargs)
+
+        with mock.patch.object(self.app, "compose", side_effect=fail_edge):
+            with self.assertRaisesRegex(release.ReleaseError, "synthetic edge start failure"):
+                self.app.bootstrap("synthetic.invalid/app:initial", False, 0)
+        self.assertIsNone(self.edge)
+        self.app = release.Release(self.root)
+        self.control = self.patch(self.app, "socket_command", side_effect=self.fake_control)
+        self.events.clear()
+        with self.assertRaisesRegex(release.ReleaseError, "Bootstrap already started"):
+            self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
+        self.assertEqual(self.events, [])
+        self.app.bootstrap("synthetic.invalid/app:initial", True, 0)
         self.assertEqual(self.running_images["blue"], SOURCE_IMAGE)
-        self.assertEqual(self.app.state["slots"]["blue"], pinned)
         self.assertEqual(self.compose_actions(), [
             ("up", "-d", "--no-deps", "--no-recreate", "blue"),
             ("up", "-d", "--no-deps", "--no-recreate", "edge"),
         ])
-        self.assertFalse(any(kind in ("image", "pull") for kind, _ in self.events))
 
-    def test_interrupted_bootstrap_rejects_different_image(self):
+    def test_proxy_readiness_failure_remembers_started_edge_after_removal(self):
         self.app.state["bootstrapped"] = False
-        self.app.state["bootstrap_image"] = {"image": SOURCE_IMAGE, "reference": "synthetic.invalid/app:initial"}
-        self.app.persist()
+        self.edge = None
+        self.rows["blue"] = counters("DOWN", sessions=1)
+        with self.assertRaisesRegex(release.ReleaseError, "Proxy readiness timed out"):
+            self.app.bootstrap("synthetic.invalid/app:initial", False, 0)
+        self.assertTrue(self.edge["Running"])
+        self.assertTrue(self.disk_state()["bootstrap_edge_started"])
+        self.assertFalse(self.disk_state()["bootstrapped"])
+        self.app = release.Release(self.root)
+        self.control = self.patch(self.app, "socket_command", side_effect=self.fake_control)
+        self.edge = None
+        self.events.clear()
         with self.assertRaisesRegex(release.ReleaseError, "Bootstrap already started"):
             self.app.bootstrap(CANDIDATE_REFERENCE, False, 0)
-        self.docker.assert_not_called()
-        self.control.assert_not_called()
+        self.assertEqual(self.events, [])
+        self.rows["blue"]["status"] = "UP"
+        self.app.bootstrap("synthetic.invalid/app:initial", False, 0)
+        self.assertEqual(self.compose_actions(), [
+            ("up", "-d", "--no-deps", "--no-recreate", "blue"),
+            ("up", "-d", "--no-deps", "--no-recreate", "edge"),
+        ])
+        self.assertEqual(self.running_images["blue"], SOURCE_IMAGE)
 
 
 class DeploymentTests(IsolatedReleaseTest):

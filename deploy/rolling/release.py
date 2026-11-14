@@ -329,21 +329,33 @@ class Release:
         self.require_idle_transaction()
         if self.state["bootstrapped"]:
             raise ReleaseError("Already bootstrapped; use deploy.")
+        edge_started = self.state.get("bootstrap_edge_started", False)
+        if not edge_started:
+            # Include created/stopped containers. Only a successful empty query
+            # proves absence; an inspect/daemon error must never authorize replacement.
+            edge_started = bool(run([
+                "docker", "container", "ls", "--all", "--quiet", "--filter",
+                f"name=^/{self.state['project']}-edge$",
+            ]).strip())
         pinned = self.state.get("bootstrap_image")
-        if pinned:
-            if image not in (pinned["reference"], pinned["image"]):
+        if not pinned or image not in (pinned["reference"], pinned["image"]):
+            if pinned and edge_started:
                 raise ReleaseError("Bootstrap already started. Resume its saved image first, then use deploy for another version.")
-        else:
             pinned = self.resolve_image(image, pull)
             self.state["bootstrap_image"] = copy.deepcopy(pinned)
         self.state["slots"]["blue"] = copy.deepcopy(pinned)
+        self.state["bootstrap_edge_started"] = edge_started
         self.persist()
         self.render()
-        # A prior invocation may already have a serving listener. Never
-        # recreate either container during bootstrap recovery, even when a tag
-        # now resolves to a different image. Resume the journaled image only.
-        self.compose("up", "-d", "--no-deps", "--no-recreate", "blue")
+        # Only the unserved candidate may be replaced. Once edge may have
+        # accepted traffic, keep both containers and the saved immutable image.
+        options = ("--no-recreate",) if edge_started else ()
+        self.compose("up", "-d", "--no-deps", *options, "blue")
         self.wait_healthy("blue", timeout)
+        # Record entry into the edge phase before Compose: a failed command or
+        # later removal of edge does not prove that it never served traffic.
+        self.state["bootstrap_edge_started"] = True
+        self.persist()
         self.compose("up", "-d", "--no-deps", "--no-recreate", "edge")
         self.wait_proxy("blue", timeout)
         self.state["bootstrapped"] = True
