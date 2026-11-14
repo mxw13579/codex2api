@@ -278,8 +278,8 @@ def _probe(account: dict[str, Any], args: argparse.Namespace, attempt: int) -> d
                         result["html_file"] = _save_html(html_dir, "\n".join(texts))
                     result["status"] = "completed"
                     break
-                if event_type in {"response.failed", "error"}:
-                    result["status"] = "failed"
+                if event_type in {"response.failed", "response.incomplete", "error"}:
+                    result["status"] = "incomplete" if event_type == "response.incomplete" else "failed"
                     result["error_type"] = event_type
                     # Upstream error messages/codes may echo credentials or body
                     # text. Keep only the event classification, not free-form data.

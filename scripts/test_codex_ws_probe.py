@@ -430,6 +430,37 @@ class ProbeTests(unittest.TestCase):
                 save.assert_not_called()
                 self.assertTrue(self.ws.closed)
 
+    def test_incomplete_stops_before_open_connection_timeout_without_saving(self):
+        body = "synthetic incomplete response 42"
+        terminal = completed(body)
+        terminal["type"] = "response.incomplete"
+        terminal["response"].update({
+            "status": "incomplete",
+            "incomplete_details": {"reason": ACCOUNT["token"]},
+            "error": {"code": "fixture password", "message": ACCOUNT["proxy"]},
+        })
+        for prefix in ([], [delta(body), done(body)]):
+            for html_dir in (None, Path("unused-fixture-dir")):
+                with self.subTest(streamed=bool(prefix), html_opt_in=html_dir is not None), \
+                        mock.patch.object(probe, "_save_html") as save:
+                    # The peer keeps its connection open after the terminal;
+                    # another recv would time out, not deliver a close frame.
+                    result = self.run_probe([
+                        *prefix, terminal, TimeoutError("synthetic open connection timeout"),
+                    ], html_dir=html_dir)
+                    self.assertEqual(result["status"], "incomplete")
+                    self.assertEqual(result["error_type"], "response.incomplete")
+                    self.assertEqual(result["last_event_type"], "response.incomplete")
+                    self.assertEqual(self.ws.recv_calls, len(prefix) + 1)
+                    self.assertTrue(self.ws.closed)
+                    self.assert_no_body(result, body)
+                    for secret in (ACCOUNT["token"], ACCOUNT["proxy"], "fixture password"):
+                        self.assertNotIn(secret, json.dumps(result))
+                    for key in ("error", "incomplete_details", "error_message", "error_code",
+                                "error_reason", "answer_candidates", "html_file"):
+                        self.assertNotIn(key, result)
+                    save.assert_not_called()
+
     def test_empty_close_frames_stop_without_spinning_or_saving(self):
         for frame in (None, "", b""):
             with self.subTest(frame=frame), mock.patch.object(probe, "_save_html") as save:
