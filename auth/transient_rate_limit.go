@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"math"
 	"time"
 
 	"github.com/codex2api/cache"
@@ -44,22 +43,6 @@ func (s *Store) CodexTransient429CooldownPolicy() database.CodexTransient429Cool
 		}
 	}
 	return database.CodexTransient429CooldownPolicy{Enabled: true}
-}
-
-// SetCodexTransient429CooldownEnabled is only a convenience for bare/in-memory
-// Stores. DB-backed Stores must publish a durable policy, not invent local
-// generations. Production callers use SetCodexTransient429CooldownPolicy.
-func (s *Store) SetCodexTransient429CooldownEnabled(enabled bool) {
-	if s == nil || s.db != nil {
-		return
-	}
-	s.transient429PolicyMu.Lock()
-	defer s.transient429PolicyMu.Unlock()
-	current := s.CodexTransient429CooldownPolicy()
-	if current.Enabled == enabled || current.Generation == math.MaxInt64 {
-		return
-	}
-	s.setCodexTransient429CooldownPolicyLocked(database.CodexTransient429CooldownPolicy{Enabled: enabled, Generation: current.Generation + 1})
 }
 
 // SetCodexTransient429CooldownPolicy publishes a committed DB revision. Older

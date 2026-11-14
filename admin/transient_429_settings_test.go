@@ -84,7 +84,7 @@ func TestTransient429SettingsSaveFailureDoesNotToggle(t *testing.T) {
 func TestTransient429SettingsOmittedFieldPreservesNewerDatabaseValue(t *testing.T) {
 	handler, db, path := newTransient429SettingsAdminHandler(t)
 	// Simulate another replica's committed change before this Store reloads it.
-	if err := db.UpdateCodexTransient429CooldownEnabled(context.Background(), true); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
 	// Keep the runtime's old default-off revision until outbox reload.

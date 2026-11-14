@@ -67,7 +67,7 @@ func TestTransient429SwitchReleasesOnlyTransientAndRestoresIndex(t *testing.T) {
 	for i, acc := range accounts {
 		_, deadlines[i] = acc.GetCooldownSnapshot()
 	}
-	s.SetCodexTransient429CooldownEnabled(false)
+	s.SetCodexTransient429CooldownPolicy(database.CodexTransient429CooldownPolicy{Enabled: false, Generation: 1})
 	if transient.HasActiveCooldown() || !transient.IsAvailable() || transient.TransientRateLimitBackoff() != 0 {
 		t.Fatal("active transient cooldown not released immediately")
 	}
@@ -170,11 +170,14 @@ func TestTransient429SwitchConcurrentToggleAndThrottle(t *testing.T) {
 			}
 		}()
 	}
-	for i := 0; i < 100; i++ {
-		s.SetCodexTransient429CooldownEnabled(i%2 == 0)
+	// Publish explicit synthetic revisions through the real policy interface.
+	for generation := int64(1); generation <= 100; generation++ {
+		s.SetCodexTransient429CooldownPolicy(database.CodexTransient429CooldownPolicy{
+			Enabled: generation%2 == 0, Generation: generation,
+		})
 	}
 	wg.Wait()
-	s.SetCodexTransient429CooldownEnabled(false)
+	s.SetCodexTransient429CooldownPolicy(database.CodexTransient429CooldownPolicy{Enabled: false, Generation: 101})
 	if acc.HasActiveCooldown() || acc.TransientRateLimitBackoff() != 0 || !acc.IsAvailable() {
 		t.Fatal("concurrent throttles left a pause after disabling")
 	}
@@ -188,7 +191,7 @@ func TestTransient429SwitchReloadsAcrossInstancesWithPinnedEngine(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if err := db.UpdateCodexTransient429CooldownEnabled(ctx, true); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	settings, err := db.GetSystemSettings(ctx)
@@ -212,7 +215,7 @@ func TestTransient429SwitchReloadsAcrossInstancesWithPinnedEngine(t *testing.T) 
 		stores = append(stores, s)
 		accounts = append(accounts, acc)
 	}
-	if err := db.UpdateCodexTransient429CooldownEnabled(ctx, false); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, false); err != nil {
 		t.Fatal(err)
 	}
 	for i, s := range stores {
@@ -221,7 +224,7 @@ func TestTransient429SwitchReloadsAcrossInstancesWithPinnedEngine(t *testing.T) 
 			return !s.CodexTransient429CooldownEnabled() && !acc.HasActiveCooldown()
 		})
 	}
-	if err := db.UpdateCodexTransient429CooldownEnabled(ctx, true); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	for _, s := range stores {

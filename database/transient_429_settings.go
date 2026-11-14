@@ -24,14 +24,6 @@ func (s *SystemSettings) CodexTransient429Policy() CodexTransient429CooldownPoli
 	}
 }
 
-// UpdateCodexTransient429CooldownEnabled retains the error-only API. Runtime
-// publishers must use UpdateCodexTransient429CooldownPolicy instead of rereading
-// settings after this call (another writer may have committed in between).
-func (db *DB) UpdateCodexTransient429CooldownEnabled(ctx context.Context, enabled bool) error {
-	_, err := db.UpdateCodexTransient429CooldownPolicy(ctx, enabled)
-	return err
-}
-
 // UpdateCodexTransient429CooldownPolicy returns the policy from this exact
 // committed narrow update. Row locking and the SQL increment serialize writers
 // across processes on both PostgreSQL and SQLite. Full settings saves never

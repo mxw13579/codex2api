@@ -52,7 +52,7 @@ func TestSQLiteTransient429RoundTripAndReopen(t *testing.T) {
 	db := openTransient429SettingsTestDB(t, path)
 	for _, enabled := range []bool{false, true, false} {
 		// The first narrow save also tests upserting an absent settings row.
-		if err := db.UpdateCodexTransient429CooldownEnabled(context.Background(), enabled); err != nil {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(context.Background(), enabled); err != nil {
 			t.Fatalf("set %t: %v", enabled, err)
 		}
 		assertTransient429SettingsValue(t, db, enabled)
@@ -80,7 +80,7 @@ func TestSQLiteTransient429FullSavePreservesSwitch(t *testing.T) {
 		if stale.CodexTransient429CooldownEnabled == enabled {
 			t.Fatal("test requires a snapshot older than the narrow update")
 		}
-		if err := db.UpdateCodexTransient429CooldownEnabled(ctx, enabled); err != nil {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, enabled); err != nil {
 			t.Fatal(err)
 		}
 		afterNarrow := assertTransient429SettingsValue(t, db, enabled)
@@ -123,7 +123,7 @@ func TestSQLiteTransient429UpgradeDefaultsFalse(t *testing.T) {
 	if got.SiteName != "synthetic legacy" || got.MaxConcurrency != 7 {
 		t.Fatal("migration changed unrelated settings")
 	}
-	if err := db.UpdateCodexTransient429CooldownEnabled(ctx, true); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -137,7 +137,7 @@ func TestSQLiteTransient429FailedWritePreservesValue(t *testing.T) {
 	db := openTransient429SettingsTestDB(t, filepath.Join(t.TempDir(), "transient-429-failure.sqlite"))
 	ctx := context.Background()
 	for _, enabled := range []bool{false, true} {
-		if err := db.UpdateCodexTransient429CooldownEnabled(ctx, enabled); err != nil {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, enabled); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.conn.ExecContext(ctx, `CREATE TRIGGER reject_transient_429_update
@@ -145,7 +145,7 @@ func TestSQLiteTransient429FailedWritePreservesValue(t *testing.T) {
 			BEGIN SELECT RAISE(ABORT, 'synthetic switch write failure'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if err := db.UpdateCodexTransient429CooldownEnabled(ctx, !enabled); err == nil {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, !enabled); err == nil {
 			t.Fatal("failed write must return an error")
 		}
 		assertTransient429SettingsValue(t, db, enabled)
@@ -155,7 +155,7 @@ func TestSQLiteTransient429FailedWritePreservesValue(t *testing.T) {
 
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
-		if err := db.UpdateCodexTransient429CooldownEnabled(cancelled, !enabled); !errors.Is(err, context.Canceled) {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(cancelled, !enabled); !errors.Is(err, context.Canceled) {
 			t.Fatalf("cancelled write error = %v, want context.Canceled", err)
 		}
 		assertTransient429SettingsValue(t, db, enabled)
@@ -164,7 +164,7 @@ func TestSQLiteTransient429FailedWritePreservesValue(t *testing.T) {
 
 func TestTransient429SetterRequiresDatabase(t *testing.T) {
 	for _, db := range []*DB{nil, {}} {
-		if err := db.UpdateCodexTransient429CooldownEnabled(context.Background(), true); err == nil {
+		if _, err := db.UpdateCodexTransient429CooldownPolicy(context.Background(), true); err == nil {
 			t.Fatal("uninitialized database must not report a successful save")
 		}
 	}

@@ -190,11 +190,6 @@ func TestTransient429SharedPolicyStaleAndSameValueDoNotReset(t *testing.T) {
 			t.Fatalf("stale/conflicting/same policy reset a current freeze: %+v", policy)
 		}
 	}
-	// The bool-only test convenience must not manufacture production revisions.
-	s.SetCodexTransient429CooldownEnabled(false)
-	if s.CodexTransient429CooldownPolicy() != on {
-		t.Fatal("DB-backed Store accepted a process-local production generation")
-	}
 }
 
 func TestTransient429PolicyMarkAndCacheApplyDuringSweep(t *testing.T) {

@@ -78,7 +78,7 @@ func TestTransient429PolicyMigrationPreservesLegacyEnabled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-policy.sqlite")
 	db := openTransient429SettingsTestDB(t, path)
 	ctx := context.Background()
-	if err := db.UpdateCodexTransient429CooldownEnabled(ctx, true); err != nil {
+	if _, err := db.UpdateCodexTransient429CooldownPolicy(ctx, true); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.conn.ExecContext(ctx, `ALTER TABLE system_settings DROP COLUMN codex_transient_429_cooldown_generation`); err != nil {
