@@ -16,7 +16,8 @@ import (
 //     汇总数据不受影响；任一汇总未就绪时本轮跳过。
 //   - API Key 的窗口限额（RPM/RPD、5h/日/7d/30d 的 cost/token、scope 限额）直接扫描明细计算，
 //     最长已配置窗口内的行永远保留，避免限额被“清零”。
-//   - 只删最旧的行，MAX(id) 不变，不会触发小时汇总的整表重建。
+//   - 保留最近三个已结束小时及当前小时的完整明细，避免小时核对器用残缺明细覆盖汇总。
+//   - 保留最高 ID 的行，MAX(id) 不变，不会触发小时汇总的整表重建。
 //   - 多实例（蓝绿重叠）用 PG advisory lock 串行，分批删除避免长事务。
 //
 // MaxBytes 按“最近行的平均行宽 × 索引系数”估算逻辑体积，不读物理文件大小：DELETE 后表文件
@@ -31,6 +32,15 @@ const (
 	// 堆元组头（23B + 对齐）与行指针（4B）。
 	usageLogTupleOverhead = 28
 )
+
+// ID 只限定汇总水位和体积裁剪范围，不能替代 created_at 的保留条件。
+// $2 是 Key 窗口与小时核对窗口中较早的起点；$3/$4 控制年龄清理，$5 为体积 cutoff。
+const usageLogRetentionDeleteSQL = `DELETE FROM usage_logs WHERE id IN
+	(SELECT id FROM usage_logs
+	 WHERE id <= $1 AND id < (SELECT MAX(id) FROM usage_logs)
+	   AND created_at < $2
+	   AND (($3 AND created_at < $4) OR id <= $5)
+	 ORDER BY id LIMIT $6)`
 
 // UsageLogRetentionPolicy 为 0 的维度表示不按该维度清理。
 type UsageLogRetentionPolicy struct {
@@ -47,7 +57,7 @@ func (p UsageLogRetentionPolicy) Enabled() bool {
 type UsageLogPruneResult struct {
 	Deleted           int64
 	Batches           int
-	CutoffID          int64
+	CutoffID          int64 // 本轮删除候选的 ID 上界，实际删除仍须满足时间保护条件。
 	SafeMaxID         int64
 	KeepWindow        time.Duration
 	EstimatedRowBytes int64
@@ -153,21 +163,11 @@ func (db *DB) PruneUsageLogs(ctx context.Context, policy UsageLogRetentionPolicy
 		return result, fmt.Errorf("读取 API Key 限额失败: %w", err)
 	}
 
-	maxIDBefore := func(t time.Time) (int64, error) {
-		var id int64
-		err := conn.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM usage_logs WHERE created_at < $1`, t).Scan(&id)
-		return id, err
+	keepBefore := now.UTC().Truncate(time.Hour).Add(-usageHourlyVerifyHours * time.Hour)
+	if keyBefore := now.Add(-result.KeepWindow); keyBefore.Before(keepBefore) {
+		keepBefore = keyBefore
 	}
-	var ageCut, sizeCut int64
-	if policy.MaxAge > 0 {
-		horizon := policy.MaxAge
-		if result.KeepWindow > horizon {
-			horizon = result.KeepWindow
-		}
-		if ageCut, err = maxIDBefore(now.Add(-horizon)); err != nil {
-			return result, err
-		}
-	}
+	var sizeCut int64
 	if policy.MaxBytes > 0 {
 		var avg sql.NullFloat64
 		if err := conn.QueryRowContext(ctx, `SELECT AVG(pg_column_size(u.*)) FROM
@@ -181,22 +181,18 @@ func (db *DB) PruneUsageLogs(ctx context.Context, policy UsageLogRetentionPolicy
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return result, err
 			}
-			if result.KeepWindow > 0 && sizeCut > 0 {
-				keepCut, err := maxIDBefore(now.Add(-result.KeepWindow))
-				if err != nil {
-					return result, err
-				}
-				sizeCut = min(sizeCut, keepCut)
-			}
 		}
 	}
-	result.CutoffID = min(max(ageCut, sizeCut), result.SafeMaxID)
+	result.CutoffID = min(sizeCut, result.SafeMaxID)
+	if policy.MaxAge > 0 {
+		result.CutoffID = result.SafeMaxID
+	}
 	if result.CutoffID <= 0 {
 		return result, nil
 	}
 	for ctx.Err() == nil {
-		res, err := conn.ExecContext(ctx, `DELETE FROM usage_logs WHERE id IN
-			(SELECT id FROM usage_logs WHERE id <= $1 ORDER BY id LIMIT $2)`, result.CutoffID, usageLogRetentionBatchSize)
+		res, err := conn.ExecContext(ctx, usageLogRetentionDeleteSQL,
+			result.CutoffID, keepBefore, policy.MaxAge > 0, now.Add(-policy.MaxAge), sizeCut, usageLogRetentionBatchSize)
 		if err != nil {
 			return result, err
 		}

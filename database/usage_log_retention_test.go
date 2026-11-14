@@ -69,7 +69,7 @@ func TestPruneUsageLogsSkipsSQLiteAndDisabled(t *testing.T) {
 func TestPruneUsageLogsPostgres(t *testing.T) {
 	db := newIsolatedPostgresTestDB(t, "retention")
 	ctx := context.Background()
-	now := time.Now()
+	now := time.Now().UTC().Truncate(time.Hour).Add(37 * time.Minute)
 
 	// reset 写入 total 行：old 行在 3 天前，其余在 1 小时前；返回 (最小 id, 最大 id)。
 	reset := func(old, recent int) (int64, int64) {
@@ -142,10 +142,89 @@ func TestPruneUsageLogsPostgres(t *testing.T) {
 			t.Fatal(err)
 		}
 		_, perRow := usageLogRowBudget(0, avg)
-		r := prune(UsageLogRetentionPolicy{MaxBytes: perRow*25 + perRow/2})
-		if n, min := count(); n != 25 || min != hi-24 {
+		r := prune(UsageLogRetentionPolicy{MaxBytes: perRow*75 + perRow/2})
+		if n, min := count(); n != 75 || min != hi-74 {
 			t.Fatalf("remaining=%d min=%d hi=%d (%+v)", n, min, hi, r)
 		}
+		// 预算再缩小也不能删除小时核对窗口内的 40 行。
+		r = prune(UsageLogRetentionPolicy{MaxBytes: perRow*25 + perRow/2})
+		if n, min := count(); n != 40 || min != hi-39 {
+			t.Fatalf("protected hours: remaining=%d min=%d hi=%d (%+v)", n, min, hi, r)
+		}
+	})
+
+	t.Run("age keeps newer lower IDs outside hourly window", func(t *testing.T) {
+		ids := resetUsageLogRetentionFixture(t, db, []time.Time{
+			now.Add(-10 * time.Hour), now.Add(-72 * time.Hour), now.Add(-73 * time.Hour),
+		})
+		setProgress(ids[2], ids[2])
+		before := usageLogRetentionHourlyTotals(t, db)
+		r := prune(UsageLogRetentionPolicy{MaxAge: 48 * time.Hour})
+		if r.Deleted != 1 {
+			t.Fatalf("deleted=%d want=1 (%+v)", r.Deleted, r)
+		}
+		assertUsageLogRetentionIDs(t, db, []int64{ids[0], ids[2]})
+		assertUsageLogRetentionHourlyUnchanged(t, db, before)
+	})
+
+	for _, tc := range []struct {
+		name   string
+		policy UsageLogRetentionPolicy
+	}{
+		{"all expired keeps highest ID", UsageLogRetentionPolicy{MaxAge: 48 * time.Hour}},
+		{"sub-row size budget keeps highest ID", UsageLogRetentionPolicy{MaxBytes: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := resetUsageLogRetentionFixture(t, db, []time.Time{
+				now.Add(-96 * time.Hour), now.Add(-72 * time.Hour), now.Add(-80 * time.Hour),
+			})
+			setProgress(ids[2], ids[2])
+			before := usageLogRetentionHourlyTotals(t, db)
+			r := prune(tc.policy)
+			if r.Deleted != 2 {
+				t.Fatalf("deleted=%d want=2 (%+v)", r.Deleted, r)
+			}
+			assertUsageLogRetentionIDs(t, db, []int64{ids[2]})
+			assertUsageLogRetentionHourlyUnchanged(t, db, before)
+		})
+	}
+
+	t.Run("size protects full hourly verification window", func(t *testing.T) {
+		current := now.UTC().Truncate(time.Hour)
+		boundary := current.Add(-usageHourlyVerifyHours * time.Hour)
+		ids := resetUsageLogRetentionFixture(t, db, []time.Time{
+			boundary.Add(-time.Second), boundary, boundary.Add(time.Minute),
+			current.Add(-2*time.Hour + time.Minute), current.Add(-time.Hour + time.Minute),
+			current.Add(time.Minute), now.Add(-72 * time.Hour),
+		})
+		setProgress(ids[6], ids[6])
+		before := usageLogRetentionHourlyTotals(t, db)
+		r := prune(UsageLogRetentionPolicy{MaxBytes: 1})
+		if r.Deleted != 1 {
+			t.Fatalf("deleted=%d want=1 (%+v)", r.Deleted, r)
+		}
+		assertUsageLogRetentionIDs(t, db, ids[1:])
+		assertUsageLogRetentionHourlyUnchanged(t, db, before)
+	})
+
+	t.Run("age or size independently deletes eligible rows", func(t *testing.T) {
+		ids := resetUsageLogRetentionFixture(t, db, []time.Time{
+			now.Add(-10 * time.Hour), now.Add(-72 * time.Hour), now.Add(-12 * time.Hour),
+			now.Add(-80 * time.Hour), now.Add(-10 * time.Hour),
+		})
+		setProgress(ids[4], ids[4])
+		before := usageLogRetentionHourlyTotals(t, db)
+		var avg float64
+		if err := db.conn.QueryRow(`SELECT AVG(pg_column_size(u.*)) FROM (SELECT * FROM usage_logs) u`).Scan(&avg); err != nil {
+			t.Fatal(err)
+		}
+		_, perRow := usageLogRowBudget(0, avg)
+		r := prune(UsageLogRetentionPolicy{MaxAge: 48 * time.Hour, MaxBytes: perRow*4 + perRow/2})
+		if r.Deleted != 3 {
+			t.Fatalf("deleted=%d want=3 (%+v)", r.Deleted, r)
+		}
+		assertUsageLogRetentionIDs(t, db, []int64{ids[2], ids[4]})
+		assertUsageLogRetentionHourlyUnchanged(t, db, before)
 	})
 
 	t.Run("api key window limits protect rows", func(t *testing.T) {
@@ -161,6 +240,27 @@ func TestPruneUsageLogsPostgres(t *testing.T) {
 		if n, _ := count(); n != 100 || r.KeepWindow != 7*24*time.Hour {
 			t.Fatalf("7d limit must keep 3-day-old rows: remaining=%d (%+v)", n, r)
 		}
+	})
+
+	t.Run("key window protects out of order rows and exact boundary", func(t *testing.T) {
+		ids := resetUsageLogRetentionFixture(t, db, []time.Time{
+			now.Add(-3 * 24 * time.Hour), now.Add(-8 * 24 * time.Hour),
+			now.Add(-7 * 24 * time.Hour), now.Add(-7*24*time.Hour - time.Second), now.Add(-9 * 24 * time.Hour),
+		})
+		setProgress(ids[4], ids[4])
+		before := usageLogRetentionHourlyTotals(t, db)
+		keyID, err := db.InsertAPIKeyWithOptions(ctx, APIKeyInput{Name: "retention-synthetic", Key: "sk-retention-" + uuid.NewString(),
+			Limits: APIKeyLimits{TokenLimit7d: 1}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.DeleteAPIKey(ctx, keyID)
+		r := prune(UsageLogRetentionPolicy{MaxAge: 48 * time.Hour, MaxBytes: 1})
+		if r.Deleted != 2 || r.KeepWindow != 7*24*time.Hour {
+			t.Fatalf("key-window pruning: %+v", r)
+		}
+		assertUsageLogRetentionIDs(t, db, []int64{ids[0], ids[2], ids[4]})
+		assertUsageLogRetentionHourlyUnchanged(t, db, before)
 	})
 }
 
