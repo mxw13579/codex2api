@@ -29,6 +29,19 @@ export function buildBadRequestRetryMaxRetriesPatch(raw: string) {
   return { bad_request_retry_max_retries: parseBadRequestRetryMaxRetries(raw) }
 }
 
+export interface BadRequestRetryMaxRetriesDraft {
+  value: string
+}
+
+// Each edit has its own identity, even when the user retypes the same value.
+// null follows the form; an older save must not clear a newer local draft.
+export function settleBadRequestRetryMaxRetriesDraft(
+  current: BadRequestRetryMaxRetriesDraft | null,
+  submitted: BadRequestRetryMaxRetriesDraft | null,
+): BadRequestRetryMaxRetriesDraft | null {
+  return current === submitted ? null : current
+}
+
 // This policy is saved by its own partial updates, never by a stale full form.
 export function omitBadRequestRetrySettings<T extends Partial<BadRequestRetrySettings>>(settings: T): Omit<T, keyof BadRequestRetrySettings> {
   const {

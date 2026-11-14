@@ -28,6 +28,8 @@ import {
   buildBadRequestRetrySwitchAccountPatch,
   createBadRequestRetrySaveQueue,
   omitBadRequestRetrySettings,
+  settleBadRequestRetryMaxRetriesDraft,
+  type BadRequestRetryMaxRetriesDraft,
   type BadRequestRetrySettings,
 } from '../lib/badRequestRetrySettings'
 import {
@@ -2893,7 +2895,7 @@ export default function Settings() {
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSaveStatusTimerRef = useRef<number | null>(null)
   const badRequestRetrySaveQueueRef = useRef(createBadRequestRetrySaveQueue())
-  const [badRequestRetryMaxRetriesDraft, setBadRequestRetryMaxRetriesDraft] = useState(String(settingsForm.bad_request_retry_max_retries))
+  const [badRequestRetryMaxRetriesDraft, setBadRequestRetryMaxRetriesDraft] = useState<BadRequestRetryMaxRetriesDraft | null>(null)
   const continuousRetrySaveQueueRef = useRef(createContinuousRetrySaveQueue())
   const { toast, showToast } = useToast()
   // 邀请引导开关走独立端点(system_settings.invite_guide_config),不进主设置
@@ -2926,10 +2928,6 @@ export default function Settings() {
   useEffect(() => {
     settingsFormRef.current = settingsForm
   }, [settingsForm])
-
-  useEffect(() => {
-    setBadRequestRetryMaxRetriesDraft(String(settingsForm.bad_request_retry_max_retries))
-  }, [settingsForm.bad_request_retry_max_retries])
 
   useEffect(() => {
     setContinuousRetryStatusCodesDraft(continuousRetryStatusCodesText)
@@ -3057,15 +3055,17 @@ export default function Settings() {
   }, [commitSettingsForm, finishAutoSaveRequest, showToast, t])
 
   const autoSaveBadRequestRetryPatch = useCallback((patch: Partial<BadRequestRetrySettings>) => {
+    // Capture at submission, not when this task reaches the front of the queue.
+    const submittedDraft = badRequestRetryMaxRetriesDraft
     return badRequestRetrySaveQueueRef.current(async () => {
       await autoSaveSettingsPatch(patch)
-      // Also reset a rejected budget draft if the committed value did not change.
+      // Success and rollback follow the form only if this draft is still current.
       // Saving a switch must not discard an in-progress budget edit.
       if (patch.bad_request_retry_max_retries !== undefined) {
-        setBadRequestRetryMaxRetriesDraft(String(settingsFormRef.current.bad_request_retry_max_retries))
+        setBadRequestRetryMaxRetriesDraft((current) => settleBadRequestRetryMaxRetriesDraft(current, submittedDraft))
       }
     })
-  }, [autoSaveSettingsPatch])
+  }, [autoSaveSettingsPatch, badRequestRetryMaxRetriesDraft])
 
   const autoSaveContinuousRetryPatch = useCallback((patch: Partial<SystemSettings>) => {
     return continuousRetrySaveQueueRef.current(() => autoSaveSettingsPatch(patch))
@@ -5927,8 +5927,8 @@ export default function Settings() {
                           max={10}
                           step={1}
                           disabled={!settingsForm.bad_request_retry_enabled}
-                          value={badRequestRetryMaxRetriesDraft}
-                          onChange={(event) => setBadRequestRetryMaxRetriesDraft(event.target.value)}
+                          value={badRequestRetryMaxRetriesDraft?.value ?? String(settingsForm.bad_request_retry_max_retries)}
+                          onChange={(event) => setBadRequestRetryMaxRetriesDraft({ value: event.target.value })}
                           onBlur={(event) => void autoSaveBadRequestRetryPatch(buildBadRequestRetryMaxRetriesPatch(event.target.value))}
                         />
                       </SettingField>
