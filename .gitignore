@@ -29,7 +29,7 @@ Thumbs.db
 .env.bak.*
 .deploy/
 USAGE_WINDOW_LOGIC.md
-.claude/settings.local.json
+.claude/
 .pi
 # Preserve the original ignore for scripts at any depth.
 scripts
