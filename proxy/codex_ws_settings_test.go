@@ -15,7 +15,8 @@ func TestCodexWSChatRetentionRuntimeAndReload(t *testing.T) {
 	}
 	for _, tt := range []struct{ input, want int }{
 		{-1, 8}, {0, 0}, {8, 8}, {32, 32}, {33, 33}, {48, 48},
-		{64, 64}, {96, 96}, {128, 128}, {129, 128},
+		{64, 64}, {96, 96}, {128, 128}, {129, 129}, {256, 256},
+		{512, 512}, {513, 512}, {1024, 512},
 	} {
 		settings := DefaultRuntimeSettings()
 		settings.CodexWSDownstreamKeepaliveSlots = tt.input

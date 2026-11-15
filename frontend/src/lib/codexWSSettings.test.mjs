@@ -7,7 +7,7 @@ import { buildWritableSettingsPayload } from './settingsPayload.ts'
 const settings = readFileSync(new URL('../pages/Settings.tsx', import.meta.url), 'utf8')
 
 for (const [field, maximum] of [
-  ['codex_ws_downstream_keepalive_slots', 128],
+  ['codex_ws_downstream_keepalive_slots', 512],
   ['codex_ws_stateless_slots', 32],
 ]) {
   test(`${field} has independent input bounds and preserves the default`, () => {
@@ -26,13 +26,13 @@ for (const [field, maximum] of [
 for (const locale of ['zh', 'en']) {
   test(`${locale} documents distinct chat and blank retention limits`, () => {
     const { settings: labels } = JSON.parse(readFileSync(new URL(`../locales/${locale}.json`, import.meta.url), 'utf8'))
-    assert.match(labels.codexWSDownstreamKeepaliveSlotsDesc, /0[～–]128/)
+    assert.match(labels.codexWSDownstreamKeepaliveSlotsDesc, /0[～–]512/)
     assert.match(labels.codexWSStatelessSlotsDesc, /0[～–]32/)
   })
 }
 
 test('retention payload keeps extended values, zero and partial updates', () => {
-  for (const chat of [0, 8, 32, 48, 64, 96, 128]) {
+  for (const chat of [0, 8, 32, 48, 64, 96, 128, 256, 512]) {
     const settings = Object.freeze({ codex_ws_downstream_keepalive_slots: chat, codex_ws_stateless_slots: 32 })
     assert.deepEqual(buildWritableSettingsPayload(settings), settings)
     assert.deepEqual(buildWritableSettingsPayload({ codex_ws_downstream_keepalive_slots: chat }), {

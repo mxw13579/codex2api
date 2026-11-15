@@ -9,7 +9,7 @@ import (
 )
 
 func TestChatRetentionAbove32PreservesActiveAndBlankConnections(t *testing.T) {
-	for _, limit := range []int{32, 48, 64, 96, 128} {
+	for _, limit := range []int{32, 48, 64, 96, 128, 256, 512} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			setBusyRuntimeSettings(t, func(s *proxy.RuntimeSettings) {
 				s.CodexWSDownstreamKeepaliveSlots = limit

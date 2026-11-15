@@ -9,7 +9,8 @@ func TestCodexWSChatRetentionNormalization(t *testing.T) {
 	}{
 		{-1, 8}, {0, 0}, {8, 8}, {32, 32}, {33, 33},
 		{48, 48}, {64, 64}, {96, 96}, {127, 127}, {128, 128},
-		{129, 128}, {1024, 128}, {int(^uint(0) >> 1), 128},
+		{129, 129}, {256, 256}, {511, 511}, {512, 512},
+		{513, 512}, {1024, 512}, {int(^uint(0) >> 1), 512},
 	} {
 		if got := NormalizeCodexWSDownstreamKeepaliveSlots(tt.input); got != tt.want {
 			t.Errorf("NormalizeCodexWSDownstreamKeepaliveSlots(%d) = %d, want %d", tt.input, got, tt.want)
