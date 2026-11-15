@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
@@ -17,6 +18,8 @@ type connectionDialRequest struct {
 	headers       http.Header
 	proxyOverride string
 	capacity      *connectionCapacitySlot
+	// dialKind 标记发起握手的取连路径，仅供 [WS-Stats] 统计。
+	dialKind connectionDialKind
 }
 
 func (m *Manager) createConnection(ctx context.Context, input connectionDialRequest) (wc *WsConnection, err error) {
@@ -30,7 +33,9 @@ func (m *Manager) createConnection(ctx context.Context, input connectionDialRequ
 		return nil, err
 	}
 	session, poolKey := m.newDialSession(ctx, input)
+	dialStarted := time.Now()
 	conn, resp, err := dialer.DialContext(ctx, input.url, input.headers)
+	m.connStats.recordHandshake(ctx, input.account.ID(), input.dialKind, time.Since(dialStarted), resp, err)
 	cookieTrace := proxy.NewUpstreamCookieTrace(ctx, input.account, "websocket", "", input.headers, resp)
 	if err != nil {
 		m.sessions.CompareAndDelete(poolKey, session)

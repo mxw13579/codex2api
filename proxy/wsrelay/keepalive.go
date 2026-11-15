@@ -124,9 +124,10 @@ func (t *KeepaliveTask) loop() {
 				continue
 			}
 			lastRun = now
+			started := time.Now()
 			pinged, failed := t.manager.PingIdleConnections()
 			if pinged > 0 || failed > 0 {
-				log.Printf("[WS-Keepalive] 保活完成: pinged=%d failed=%d", pinged, failed)
+				log.Printf("[WS-Keepalive] 保活完成: pinged=%d failed=%d elapsed_ms=%d", pinged, failed, time.Since(started).Milliseconds())
 			}
 		}
 	}

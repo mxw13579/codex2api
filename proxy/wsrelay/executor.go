@@ -41,6 +41,18 @@ func shouldSendWebsocketUserAgent() bool {
 	}
 }
 
+// slotReuseBoundEnabled 是否允许无会话请求在没有空槽位时接管空闲但带续链绑定的
+// 槽位连接（放弃其旧绑定）。默认开启；CODEX_WS_SLOT_REUSE_BOUND=0/false/no/off
+// 时关闭，恢复为"带绑定的槽位一律跳过、槽位全忙时新建一次性连接"。
+func slotReuseBoundEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WS_SLOT_REUSE_BOUND"))) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 // statelessOneShotEnabled 是否禁用无显式会话请求的 WS 连接复用（每请求独享连接、
 // 用完即毁）。这是杜绝一切连接级状态跨请求/跨用户泄漏的硬隔离逃生阀，代价是
 // 逐请求握手（高 RPM 下可能触发上游握手限流 503）。

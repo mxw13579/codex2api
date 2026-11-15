@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -274,7 +275,13 @@ type Manager struct {
 	// 清理定时器
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
-	stopOnce      sync.Once
+
+	// 每账号握手/关闭汇总，由 cleanupLoop 周期输出，Stop 时输出最后一个窗口
+	connStats connectionStatsRecorder
+	// 统计行输出函数（测试替换），受 mu 保护；nil 时使用 log.Print
+	statsOutput func(string)
+
+	stopOnce sync.Once
 
 	// 连接回调
 	onConnected    func(accountID int64, session *Session)
@@ -333,7 +340,7 @@ const (
 	// (30min) 后被清理，绑定活得再久也无意义，与其对齐。
 	responseConnBindingTTL = IdleTimeout
 	// responseConnBindingMaxEntries 绑定表上限，防止内存膨胀。
-	responseConnBindingMaxEntries = 4096
+	responseConnBindingMaxEntries = 16384
 )
 
 // wsWriteBufferPool 在所有上游 WS 连接间共享写缓冲，降低高并发下的内存占用。
@@ -360,17 +367,22 @@ func NewManager() *Manager {
 
 	// 启动后台清理
 	m.cleanupTicker = time.NewTicker(30 * time.Second)
-	go m.cleanupLoop()
+	m.connStats.startWindow(time.Now())
+	go m.cleanupLoop(connectionStatsInterval)
 
 	return m
 }
 
 // cleanupLoop 定期清理过期连接
-func (m *Manager) cleanupLoop() {
+func (m *Manager) cleanupLoop(statsInterval time.Duration) {
+	statsTicker := time.NewTicker(statsInterval)
+	defer statsTicker.Stop()
 	for {
 		select {
 		case <-m.cleanupTicker.C:
 			m.evictExpired()
+		case <-statsTicker.C:
+			m.logConnectionStats()
 		case <-m.stopCleanup:
 			m.cleanupTicker.Stop()
 			return
@@ -417,6 +429,8 @@ func (m *Manager) Stop() {
 	m.stopOnce.Do(func() {
 		close(m.stopCleanup)
 		m.closeAll()
+		// 最后一个窗口包含 closeAll 产生的关闭。
+		m.logConnectionStats()
 	})
 }
 
@@ -602,6 +616,7 @@ func (m *Manager) AcquireConnection(
 						m.trimIdleAccountConnections(account.ID(), connectionLimit(connectionBudgetKind(wc)), wc)
 						accountLock.Unlock()
 						lock.Unlock()
+						m.connStats.recordReuse(account.ID(), reuseKindSession)
 						return wc, pr, nil
 					}
 					m.discardAcquisitionFailure(wc, leaseErr)
@@ -663,7 +678,11 @@ func (m *Manager) AcquireConnection(
 		// 空白连接的拨号登记占用预算；聊天推理不占空闲保留额度。
 		accountLock.Unlock()
 
-		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: sessionKey, headers: headers, proxyOverride: proxyOverride, capacity: capacity})
+		dialKind := dialKindSession
+		if proxy.IsStatelessWebsocketSessionID(sessionKey) {
+			dialKind = dialKindOneShot
+		}
+		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: sessionKey, headers: headers, proxyOverride: proxyOverride, capacity: capacity, dialKind: dialKind})
 		if err != nil {
 			lock.Unlock()
 			return nil, nil, err
@@ -750,6 +769,7 @@ func (m *Manager) tryAcquireBusyOverflow(
 							m.trimIdleAccountConnections(account.ID(), connectionLimit(connectionBudgetKind(wc)), wc)
 							accountLock.Unlock()
 							lock.Unlock()
+							m.connStats.recordReuse(account.ID(), reuseKindOverflow)
 							return wc, pr, true
 						}
 						m.discardAcquisitionFailure(wc, leaseErr)
@@ -782,7 +802,7 @@ func (m *Manager) tryAcquireBusyOverflow(
 			return nil, nil, false
 		}
 		accountLock.Unlock()
-		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity})
+		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity, dialKind: dialKindOverflow})
 		if err != nil {
 			lock.Unlock()
 			log.Printf("[WS] busy overflow 新建连接失败，回落等待原连接 (account=%d): %v", account.ID(), err)
@@ -828,8 +848,9 @@ const maxCreateLeaseAttempts = 3
 const newConnectionReadFailureGrace = 5 * time.Millisecond
 
 // AcquireReusableConnection 在固定槽位内复用或创建连接，返回实际使用的 session key。
-// 第一遍只复用已存在且空闲的连接；第二遍在空槽位新建持久连接；槽位全忙时回退到
-// fallbackKey 的临时连接。空白预热共用账号空白预算；聊天收尾后按空闲上限保留。
+// 第一遍只复用已存在、空闲且无续链绑定的连接；第二遍在空槽位新建持久连接；第三遍
+// （CODEX_WS_SLOT_REUSE_BOUND，默认开启）接管空闲但带续链绑定的槽位并放弃旧绑定；
+// 仍不成功时回退到 fallbackKey 的临时连接。空白预热共用账号空白预算；聊天收尾后按空闲上限保留。
 func (m *Manager) AcquireReusableConnection(
 	ctx context.Context,
 	account *auth.Account,
@@ -848,6 +869,10 @@ func (m *Manager) AcquireReusableConnection(
 	}
 	accountLock, releaseAccountLock := m.accountLock(account.ID())
 	defer releaseAccountLock()
+	// 第一遍顺带记录槽位状态：空闲但带续链绑定的连接是第三遍的候选，
+	// 两类计数用于兜底统计，不额外扫描连接表。
+	var boundSlots []boundReusableSlot
+	busySlots := 0
 	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第二遍可以补位）
 	for i := 0; i < slots; i++ {
 		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
@@ -859,6 +884,7 @@ func (m *Manager) AcquireReusableConnection(
 			wc := v.(*WsConnection)
 			if canReuseConnection(wc) {
 				if m.hasLiveResponseBinding(wc) {
+					boundSlots = append(boundSlots, boundReusableSlot{wc: wc, slotSession: slotSession, key: key, lastUsed: wc.lastUsed.Load()})
 					lock.Unlock()
 					continue
 				}
@@ -877,6 +903,7 @@ func (m *Manager) AcquireReusableConnection(
 						m.trimIdleAccountConnections(account.ID(), connectionLimit(connectionBudgetKind(wc)), wc)
 						accountLock.Unlock()
 						lock.Unlock()
+						m.connStats.recordReuse(account.ID(), reuseKindSlot)
 						return wc, pr, slotSession, nil
 					}
 					m.discardAcquisitionFailure(wc, leaseErr)
@@ -887,6 +914,8 @@ func (m *Manager) AcquireReusableConnection(
 				m.discardConnectionFor(wc, closeProbeFailed)
 			} else if wc.session == nil || wc.session.PendingCount() == 0 {
 				m.discardConnectionFor(wc, connectionExpiryReason(wc))
+			} else {
+				busySlots++
 			}
 		}
 		lock.Unlock()
@@ -915,7 +944,7 @@ func (m *Manager) AcquireReusableConnection(
 			continue
 		}
 		accountLock.Unlock()
-		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity})
+		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity, dialKind: dialKindSlot})
 		if err != nil {
 			lock.Unlock()
 			return nil, nil, "", err
@@ -945,9 +974,91 @@ func (m *Manager) AcquireReusableConnection(
 		}
 		return wc, pr, slotSession, nil
 	}
+	// 第三遍：没有空槽位时，按 lastUsed 从旧到新接管空闲但带续链绑定的槽位，
+	// 放弃其旧绑定，避免每个请求都落到一次性连接上重新握手。
+	if slotReuseBoundEnabled() && len(boundSlots) > 0 {
+		wc, pr, slotSession, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSlots, accountLock)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if ok {
+			return wc, pr, slotSession, nil
+		}
+	}
 	// 槽位全忙：回退一次性连接
+	m.connStats.recordSlotFallback(account.ID(), len(boundSlots), busySlots)
 	wc, pr, err := m.AcquireConnection(ctx, account, wsURL, fallbackKey, headers, proxyOverride)
 	return wc, pr, fallbackKey, err
+}
+
+// boundReusableSlot 是第一遍记录下的空闲但带续链绑定的槽位连接。
+type boundReusableSlot struct {
+	wc          *WsConnection
+	slotSession string
+	key         string
+	lastUsed    int64
+}
+
+// acquireBoundReusableSlot 依次尝试接管带续链绑定的空闲槽位（lastUsed 最旧优先），
+// 第一个成功的即返回。调用方持有 accountLock 的引用但未加锁。每个候选开始前检查
+// ctx：已取消时返回 ctx.Err()，与第二遍取消时直接返回错误一致，不再落到一次性拨号。
+//
+// 与续链取连（acquirePreferredConnection）互斥依赖同一把 pool-key 锁：续链取连在
+// keyLock(wc.PoolKey) 内完成"复验绑定 + 复验无在途 + 占位"，这里在同一把 keyLock
+// 内完成"复验无在途 + 占位 + 删除绑定"，两者加锁顺序同为 keyLock → accountLock。
+// 绑定只在占位成功后删除：占位失败（如容量不足）时旧续链仍可用。占位与删除之间
+// 两把锁都未释放，续链方无法进入复验；锁释放后连接已有在途请求、旧绑定已删，
+// 续链方复验 canReuseConnection 失败，重试时查找返回空，由 acquireContinuation
+// 返回 ResponsesContinuationLostError。
+func (m *Manager) acquireBoundReusableSlot(ctx context.Context, account *auth.Account, kind connectionCapacityKind, candidates []boundReusableSlot, accountLock *sync.Mutex) (*WsConnection, *PendingRequest, string, bool, error) {
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].lastUsed < candidates[j].lastUsed })
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, "", false, err
+		}
+		wc := candidate.wc
+		lock, releaseKeyLock := m.keyLock(candidate.key)
+		lock.Lock()
+		current, exists := m.connections.Load(candidate.key)
+		if !exists || current != wc || !canReuseConnection(wc) {
+			lock.Unlock()
+			releaseKeyLock()
+			continue
+		}
+		// 与第一遍相同：网络探活只持有 pool-key 锁，不持有账号锁。
+		if !m.probe(wc) {
+			m.discardConnectionFor(wc, closeProbeFailed)
+			lock.Unlock()
+			releaseKeyLock()
+			continue
+		}
+		accountLock.Lock()
+		current, exists = m.connections.Load(candidate.key)
+		if !exists || current != wc || !canReuseConnection(wc) {
+			accountLock.Unlock()
+			lock.Unlock()
+			releaseKeyLock()
+			continue
+		}
+		pr, leaseErr := m.addPendingAndBeginReadLease(wc, candidate.slotSession, kind)
+		if leaseErr != nil {
+			m.discardAcquisitionFailure(wc, leaseErr)
+			accountLock.Unlock()
+			lock.Unlock()
+			releaseKeyLock()
+			continue
+		}
+		m.dropResponseConnBindings(wc)
+		wc.account = account
+		wc.Touch()
+		m.trimIdleAccountConnections(account.ID(), connectionLimit(connectionBudgetKind(wc)), wc)
+		accountLock.Unlock()
+		lock.Unlock()
+		releaseKeyLock()
+		m.connStats.recordReuse(account.ID(), reuseKindSlotBound)
+		return wc, pr, candidate.slotSession, true, nil
+	}
+	return nil, nil, "", false, nil
 }
 
 // addPendingAndBeginReadLease keeps the Session reservation and the pump lease
@@ -1118,6 +1229,18 @@ func (m *Manager) removeResponseConnBindings(wc *WsConnection) {
 	}
 }
 
+// dropResponseConnBindings 放弃指向 wc 的全部续链绑定，但不禁止之后的新绑定：
+// 连接被第三遍槽位复用接管后，新请求完成时照常绑定。调用方持有 wc 的 pool-key 锁。
+func (m *Manager) dropResponseConnBindings(wc *WsConnection) {
+	m.respConnMu.Lock()
+	defer m.respConnMu.Unlock()
+	for responseID, binding := range m.respConnBindings {
+		if binding.conn == wc {
+			delete(m.respConnBindings, responseID)
+		}
+	}
+}
+
 // responseConnBindingLiveLocked requires respConnMu. Pool identity prevents a
 // late completion for a replaced socket from keeping the old socket alive.
 func (m *Manager) responseConnBindingLiveLocked(wc *WsConnection) bool {
@@ -1183,6 +1306,8 @@ func (m *Manager) bindResponseConn(responseID string, binding responseConnBindin
 	if len(m.respConnBindings) < responseConnBindingMaxEntries {
 		binding.expiresAt = now.Add(responseConnBindingTTL)
 		m.respConnBindings[responseID] = binding
+	} else {
+		m.connStats.recordBindingRejected()
 	}
 }
 
@@ -1261,6 +1386,7 @@ func (m *Manager) acquirePreferredConnection(input websocketContinuation) (*WsCo
 	if wc.account != nil {
 		m.trimIdleAccountConnections(accountID, connectionLimit(connectionBudgetKind(wc)), wc)
 	}
+	m.connStats.recordReuse(accountID, reuseKindContinuation)
 	return wc, pr, sessionKey
 }
 

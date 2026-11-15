@@ -90,6 +90,7 @@ func (wc *WsConnection) logClose() {
 	}
 	if slot := wc.capacitySlot.Load(); slot != nil {
 		remaining = slot.manager.accountConnectionCount(accountID)
+		slot.manager.connStats.recordClose(accountID, cause.reason)
 	}
 	age, idle := time.Duration(0), time.Duration(0)
 	if wc.createdAt > 0 {
