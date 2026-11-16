@@ -1365,6 +1365,30 @@ func grokNativeVisibleEvent(protocol GrokProtocol, payload []byte) bool {
 	}
 }
 
+// 同会话并发排队超时（busy acquire 超时，issue #413）的终态文案。重试换号后调度器
+// 因已尝试账号被排除而选不到账号时，若最后一次失败正是 busy acquire 超时，返回 429
+// 与本文案，而不是含糊的「无可用账号」503。
+const (
+	wsBusyAcquireQueueTimeoutMessageZH = "同一会话并发请求过多，排队超时，请降低并发或稍后重试"
+	wsBusyAcquireQueueTimeoutMessageEN = "Too many concurrent requests in the same session; queue wait timed out. Reduce concurrency or retry later."
+)
+
+// setWsBusyAcquireRetryAfter 为 busy 排队超时的 429 设置 Retry-After，取值与并发饱和
+// 503 的 setConcurrencySaturatedRetryAfter 一致（1 秒，响应头已写出时不再设置）。
+func setWsBusyAcquireRetryAfter(c *gin.Context) {
+	setConcurrencySaturatedRetryAfter(c)
+}
+
+func wsBusyAcquireQueueTimeoutError() gin.H {
+	return gin.H{
+		"error": gin.H{
+			"message": wsBusyAcquireQueueTimeoutMessageZH,
+			"type":    ErrorTypeRateLimitError,
+			"code":    ErrorCodeRateLimited,
+		},
+	}
+}
+
 func noAvailableAnthropicAccountMessage(model string) string {
 	if isProOnlyModel(model) {
 		return "No available paid or unknown-plan account for gpt-5.3-codex-spark"
@@ -4288,6 +4312,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
+	var lastAttemptWsBusyAcquire bool // 最近一次尝试是否因同会话 busy acquire 超时失败
 	var lastBody []byte
 	var lastRetryAfter string
 	retryExclusions := newRetryAccountExclusions()
@@ -4425,6 +4450,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				if status == 0 {
 					status = http.StatusServiceUnavailable
 				}
+				// 响应头在此先行写出，状态码须与下面实际走到的正文出口一致：只有排在
+				// busy 分支之前的出口（调度队列错误、上游 HTTP 失败、compaction 归属）
+				// 都不命中时，才会写 busy 排队超时的 429 正文。
+				if lastAttemptWsBusyAcquire && (retryingBadRequest || schedulerSelectionAPIError(selectionErr) == nil) &&
+					!(lastStatusCode > 0 && len(lastBody) > 0) && !compactionAffinity.Known {
+					status = http.StatusTooManyRequests
+					setWsBusyAcquireRetryAfter(c)
+				}
 				// Every branch below exits. Check the selected existing renderer,
 				// including scheduler/quota refusals, without inventing a send or
 				// replacing any already finalized prior-attempt usage/health.
@@ -4459,6 +4492,15 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				sendCompactionUpstreamUnavailable(c)
+				return
+			}
+			// 最后一次失败是同会话 busy acquire 超时：如实报排队超时，而不是「无可用账号」。
+			if lastAttemptWsBusyAcquire {
+				setWsBusyAcquireRetryAfter(c)
+				if isStream && writeCommittedResponsesRetryError(c, wsBusyAcquireQueueTimeoutMessageZH) {
+					return
+				}
+				c.JSON(http.StatusTooManyRequests, wsBusyAcquireQueueTimeoutError())
 				return
 			}
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
@@ -4513,6 +4555,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if attempt > 0 {
 			clearNewAPIUpstreamCyberPolicyDecision(c)
 		}
+		lastAttemptWsBusyAcquire = false
 
 		if attempt == 0 {
 			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
@@ -4696,6 +4739,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 				}
 				kind := classifyTransportFailure(reqErr)
+				lastAttemptWsBusyAcquire = kind == upstreamErrorKindWsBusyAcquire
 				if wsHTTPFallback.ForceHTTP() {
 					wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 				}
@@ -5516,6 +5560,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			lastAttemptWsBusyAcquire = kind == upstreamErrorKindWsBusyAcquire
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
@@ -7811,6 +7856,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
+	var lastAttemptWsBusyAcquire bool // 最近一次尝试是否因同会话 busy acquire 超时失败
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	badRequestRetryPending := false
@@ -7895,6 +7941,15 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			// 最后一次失败是同会话 busy acquire 超时：如实报排队超时，而不是「无可用账号」。
+			if lastAttemptWsBusyAcquire {
+				setWsBusyAcquireRetryAfter(c)
+				if isStream && writeCommittedChatRetryError(c, wsBusyAcquireQueueTimeoutMessageZH) {
+					return
+				}
+				c.JSON(http.StatusTooManyRequests, wsBusyAcquireQueueTimeoutError())
+				return
+			}
 			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				if isStream && writeCommittedChatRetryError(c, msg) {
@@ -7927,6 +7982,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		if attempt > 0 {
 			clearNewAPIUpstreamCyberPolicyDecision(c)
 		}
+		lastAttemptWsBusyAcquire = false
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		attemptMaxRateLimitRetries := pin.retryLimit(h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
@@ -8075,6 +8131,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
 			kind := classifyTransportFailure(reqErr)
+			lastAttemptWsBusyAcquire = kind == upstreamErrorKindWsBusyAcquire
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/chat/completions", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}

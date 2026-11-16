@@ -741,6 +741,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	generalRetries := 0
 	rateLimitRetries := 0
 	var lastStatusCode int
+	var lastAttemptWsBusyAcquire bool // 最近一次尝试是否因同会话 busy acquire 超时失败
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	badRequestRetryPending := false
@@ -840,6 +841,15 @@ func (h *Handler) Messages(c *gin.Context) {
 				sendAnthropicError(c, http.StatusBadRequest, ErrorTypeInvalidRequest, msg)
 				return
 			}
+			// 最后一次失败是同会话 busy acquire 超时：如实报排队超时，而不是「无可用账号」。
+			if lastAttemptWsBusyAcquire {
+				setWsBusyAcquireRetryAfter(c)
+				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", wsBusyAcquireQueueTimeoutMessageEN) {
+					return
+				}
+				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", wsBusyAcquireQueueTimeoutMessageEN)
+				return
+			}
 			// 候选被 scope 预算剔空时给出真实原因（issue #439）。
 			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
 				if isStream && writeCommittedAnthropicRetryError(c, "rate_limit_error", msg) {
@@ -872,6 +882,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		if attempt > 0 {
 			clearNewAPIUpstreamCyberPolicyDecision(c)
 		}
+		lastAttemptWsBusyAcquire = false
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		attemptMaxRateLimitRetries := pin.retryLimit(h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
@@ -1097,6 +1108,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				reqErr = firstTokenTimeoutError(attemptFirstTokenTimeout)
 			}
 			kind := classifyTransportFailure(reqErr)
+			lastAttemptWsBusyAcquire = kind == upstreamErrorKindWsBusyAcquire
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
