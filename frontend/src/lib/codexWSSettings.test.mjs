@@ -40,3 +40,20 @@ test('retention payload keeps extended values, zero and partial updates', () => 
     })
   }
 })
+
+test('codex_ws_busy_overflow_slots input is bounded 1-16 with default 4', () => {
+  const inputs = [...settings.matchAll(/<DraftNumberInput\b[\s\S]*?\/>/g)]
+    .map(([input]) => input)
+    .filter((input) => input.includes('value={settingsForm.codex_ws_busy_overflow_slots}'))
+  assert.equal(inputs.length, 1)
+  assert.match(inputs[0], /min=\{1\}/)
+  assert.match(inputs[0], /max=\{16\}/)
+  assert.match(inputs[0], /emptyValue=\{4\}/)
+  assert.match(inputs[0], /autoSaveSettingsPatch\(\{\s*codex_ws_busy_overflow_slots: value/)
+  assert.match(settings, /codex_ws_busy_overflow_slots: 4,/)
+  for (const locale of ['zh', 'en']) {
+    const { settings: labels } = JSON.parse(readFileSync(new URL(`../locales/${locale}.json`, import.meta.url), 'utf8'))
+    assert.ok(labels.codexWSBusyOverflowSlots)
+    assert.match(labels.codexWSBusyOverflowSlotsDesc, /1[～–]16/)
+  }
+})

@@ -4,11 +4,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 )
 
 // issue #413：一个逻辑 session 独占一条 WS 连接，同会话的并发请求会在 busy 轮询里
-// 排队；前一请求长时间流式输出时，后来者最长会等满整个上限才报错换号。以下三个
+// 排队；前一请求长时间流式输出时，后来者最长会等满整个上限才报错换号。以下四个
 // 管理界面设置项（系统设置，热更新生效）控制分级降级：
 //
 //	codex_ws_busy_acquire_max_wait_sec  busy/账号容量等待的累计上限秒数，
@@ -23,10 +24,22 @@ import (
 //	codex_ws_busy_patience_sec          触发 overflow 前的短等待秒数，默认 2，
 //	                                    范围 0~max wait。短请求间隙内空闲的原连接
 //	                                    仍被优先复用，保住连接局部性。
+//	codex_ws_busy_overflow_slots        每个 busy session 的 overflow 兄弟槽位数，
+//	                                    默认 4，范围 1~16。
 
-// BusyOverflowSlots 每个 busy session 允许的 overflow 兄弟槽位数。有界且入池复用，
-// 避免同会话高并发时逐请求握手触发上游握手限流。
-const BusyOverflowSlots = 2
+// DefaultBusyOverflowSlots / MaxBusyOverflowSlots 是每个 busy session 允许的 overflow
+// 兄弟槽位数的默认值与上限（系统设置 codex_ws_busy_overflow_slots）。槽位有界且入池
+// 复用，避免同会话高并发时逐请求握手触发上游握手限流。
+const (
+	DefaultBusyOverflowSlots = database.DefaultCodexWSBusyOverflowSlots
+	MaxBusyOverflowSlots     = database.MaxCodexWSBusyOverflowSlots
+)
+
+// busyOverflowSlots 返回当前生效的 overflow 兄弟槽位数（RuntimeSettings 已做 1~16 钳位，
+// 热更新生效）。调小后编号超出新上限的已有兄弟连接不主动关闭，由空闲/到龄回收处理。
+func busyOverflowSlots() int {
+	return database.NormalizeCodexWSBusyOverflowSlots(proxy.CurrentRuntimeSettings().CodexWSBusyOverflowSlots)
+}
 
 // busyOverflowKeyInfix 标记 overflow 槽位的 session key；带该标记的 key 自身不再
 // 二次 overflow，防止槽位递归膨胀。

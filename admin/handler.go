@@ -9323,6 +9323,7 @@ type settingsResponse struct {
 	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
+	CodexWSBusyOverflowSlots            int    `json:"codex_ws_busy_overflow_slots"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
 	CodexWSDownstreamKeepaliveSlots     int    `json:"codex_ws_downstream_keepalive_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
@@ -9525,6 +9526,7 @@ type updateSettingsReq struct {
 	CodexWSBusyAcquireMaxWaitSec        *int                             `json:"codex_ws_busy_acquire_max_wait_sec"`
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
+	CodexWSBusyOverflowSlots            *int                             `json:"codex_ws_busy_overflow_slots"`
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
 	CodexWSDownstreamKeepaliveSlots     *int                             `json:"codex_ws_downstream_keepalive_slots"`
 	GithubToken                         *string                          `json:"github_token"`
@@ -10375,6 +10377,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSBusyOverflowSlots:            h.store.CodexWSBusyOverflowSlots(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
@@ -11194,6 +11197,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_busy_patience_sec = %d", v)
 	}
 
+	if req.CodexWSBusyOverflowSlots != nil {
+		v := database.NormalizeCodexWSBusyOverflowSlots(*req.CodexWSBusyOverflowSlots)
+		h.store.SetCodexWSBusyOverflowSlots(v)
+		runtimeCfg.CodexWSBusyOverflowSlots = v
+		log.Printf("设置已更新: codex_ws_busy_overflow_slots = %d", v)
+	}
+
 	if req.CodexWSStatelessSlots != nil {
 		v := database.NormalizeCodexWSStatelessSlots(*req.CodexWSStatelessSlots)
 		h.store.SetCodexWSStatelessSlots(v)
@@ -11948,6 +11958,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSBusyOverflowSlots:            h.store.CodexWSBusyOverflowSlots(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubToken:                         h.store.GithubToken(),
@@ -12350,6 +12361,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyAcquireMaxWaitSec:        h.store.CodexWSBusyAcquireMaxWaitSec(),
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
+		CodexWSBusyOverflowSlots:            h.store.CodexWSBusyOverflowSlots(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
 		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",

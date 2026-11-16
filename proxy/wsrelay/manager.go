@@ -640,10 +640,13 @@ func (m *Manager) AcquireConnection(
 				//
 				// 短等待(patience)后可溢出到同账号的兄弟槽位（issue #413，默认关闭）：
 				// 前一请求长时间流式输出时，同会话的并发请求不再等满整个上限。
-				// 只尝试一次；失败（容量满/拨号失败）回落到继续等待，最坏情况与关闭时一致。
-				if !busyOverflowAttempted && busyOverflowEnabled() && waited >= busyOverflowPatience() && !isBusyOverflowSessionKey(sessionKey) {
+				// 过了 patience 后每次醒来都尝试复用空闲兄弟连接；允许新建兄弟连接的
+				// 尝试每次取连最多一次。失败（容量满/拨号失败/全忙）回落到继续等待，
+				// 最坏情况与关闭时一致。
+				if busyOverflowEnabled() && waited >= busyOverflowPatience() && !isBusyOverflowSessionKey(sessionKey) {
+					allowCreate := !busyOverflowAttempted
 					busyOverflowAttempted = true
-					if owc, opr, ok := m.tryAcquireBusyOverflow(ctx, account, wsURL, sessionKey, headers, proxyOverride); ok {
+					if owc, opr, ok := m.tryAcquireBusyOverflow(ctx, account, wsURL, sessionKey, headers, proxyOverride, allowCreate); ok {
 						log.Printf("[WS] busy session 溢出到同账号兄弟连接 (account=%d, waited=%s)", account.ID(), waited.Round(time.Millisecond))
 						return owc, opr, nil
 					}
@@ -728,10 +731,22 @@ func (m *Manager) AcquireConnection(
 }
 
 // tryAcquireBusyOverflow 在 busy session 等待超过 patience 后，尝试在同账号的有界
-// overflow 槽位（<sessionKey>#ovf-N）上复用空闲兄弟连接或新建一条（issue #413）。
-// 单遍、尽力而为：槽位也在忙则换下一个；账号容量满或拨号/租约失败即放弃，调用方
-// 回落到继续等待原连接——失败路径不会比不开启 overflow 更差。
-// 兄弟连接正常入池，由既有的 IdleTimeout/容量裁剪回收。
+// overflow 槽位（<sessionKey>#ovf-N，N 不超过 codex_ws_busy_overflow_slots）上取一条
+// 兄弟连接（issue #413）。尽力而为，按以下顺序：
+//
+//  1. 复用空闲且无续链绑定的兄弟连接；死/到龄/过期连接顺手清掉腾出槽位。
+//  2. allowCreate 为真且有空槽位时在第一个空槽位新建兄弟连接。新建失败（容量满/
+//     拨号/租约失败）即放弃，不再转去接管带绑定的连接。
+//  3. 没有空槽位或不允许新建时（CODEX_WS_SLOT_REUSE_BOUND，默认开启），按 lastUsed
+//     从旧到新接管空闲但带续链绑定的兄弟连接并放弃其旧绑定，与无会话槽位第三遍共用
+//     acquireBoundReusableSlot，加锁约定与续链取连互斥方式相同。
+//
+// 顺序与 AcquireReusableConnection 一致：接管会让该连接上刚完成响应的续链必然丢失，
+// 有空槽位时宁可多握手一次也不付这个代价。
+//
+// 正在处理请求的兄弟连接一律跳过。账号容量满或拨号/租约失败即放弃，调用方回落到
+// 继续等待原连接——失败路径不会比不开启 overflow 更差。兄弟连接正常入池，由既有的
+// IdleTimeout/容量裁剪回收。
 func (m *Manager) tryAcquireBusyOverflow(
 	ctx context.Context,
 	account *auth.Account,
@@ -739,13 +754,17 @@ func (m *Manager) tryAcquireBusyOverflow(
 	baseSessionKey string,
 	headers http.Header,
 	proxyOverride string,
+	allowCreate bool,
 ) (*WsConnection, *PendingRequest, bool) {
 	proxyURL := requestProxyKey(ctx, account, proxyOverride)
 	kind := requestConnectionCapacityKind(ctx)
 	accountLimit := connectionLimit(kind)
 	accountLock, releaseAccountLock := m.accountLock(account.ID())
 	defer releaseAccountLock()
-	for i := 1; i <= BusyOverflowSlots; i++ {
+	slots := busyOverflowSlots()
+	var boundSiblings []boundReusableSlot
+	// 第一遍：复用空闲且无续链绑定的兄弟连接，带绑定的记为第二遍候选。
+	for i := 1; i <= slots; i++ {
 		slotSession := fmt.Sprintf("%s%s%d", baseSessionKey, busyOverflowKeyInfix, i)
 		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
 		lock, releaseKeyLock := m.keyLock(key)
@@ -755,6 +774,7 @@ func (m *Manager) tryAcquireBusyOverflow(
 			wc := v.(*WsConnection)
 			if canReuseConnection(wc) {
 				if m.hasLiveResponseBinding(wc) {
+					boundSiblings = append(boundSiblings, boundReusableSlot{wc: wc, slotSession: slotSession, key: key, lastUsed: wc.lastUsed.Load()})
 					lock.Unlock()
 					continue
 				}
@@ -779,56 +799,74 @@ func (m *Manager) tryAcquireBusyOverflow(
 					continue
 				}
 				m.discardConnectionFor(wc, closeProbeFailed)
-			} else if wc.session != nil && wc.session.PendingCount() > 0 {
-				// 兄弟槽位也在忙：换下一个槽位
-				lock.Unlock()
-				continue
-			} else {
-				// 死/到龄/过期连接：清掉腾出槽位，下方直接新建
+			} else if wc.session == nil || wc.session.PendingCount() == 0 {
+				// 死/到龄/过期连接：清掉腾出槽位，第三遍可在此新建
 				m.discardConnectionFor(wc, connectionExpiryReason(wc))
 			}
-		}
-		accountLock.Lock()
-		if _, ok := m.connections.Load(key); ok {
-			accountLock.Unlock()
-			lock.Unlock()
-			continue
-		}
-		capacity := m.reserveAccountConnectionCapacity(connectionCapacityRequest{accountID: account.ID(), limit: accountLimit, protectedKey: key, kind: kind})
-		if capacity == nil {
-			// 账号连接容量已满：不为 overflow 挤占更多连接，放弃降级回到等待
-			accountLock.Unlock()
-			lock.Unlock()
-			return nil, nil, false
-		}
-		accountLock.Unlock()
-		wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity, dialKind: dialKindOverflow})
-		if err != nil {
-			lock.Unlock()
-			log.Printf("[WS] busy overflow 新建连接失败，回落等待原连接 (account=%d): %v", account.ID(), err)
-			return nil, nil, false
-		}
-		m.connections.Store(key, wc)
-		if m.afterConnectionStored != nil {
-			m.afterConnectionStored(wc)
-		}
-		pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession, kind)
-		if leaseErr == nil {
-			if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
-				wc.session.RemovePendingRequest(pr.RequestID)
-				leaseErr = earlyErr
-			}
-		}
-		if leaseErr != nil {
-			m.DiscardConnection(wc)
-			lock.Unlock()
-			return nil, nil, false
+			// 兄弟槽位也在忙：保持不动，换下一个槽位
 		}
 		lock.Unlock()
-		if fn := m.getOnConnected(); fn != nil {
-			fn(account.ID(), wc.session)
+	}
+	// 第二遍：允许新建时在第一个空槽位新建兄弟连接；新建失败（容量满/拨号/租约失败）即放弃，不再接管带绑定的连接。
+	if allowCreate {
+		for i := 1; i <= slots; i++ {
+			slotSession := fmt.Sprintf("%s%s%d", baseSessionKey, busyOverflowKeyInfix, i)
+			key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
+			lock, releaseKeyLock := m.keyLock(key)
+			defer releaseKeyLock()
+			lock.Lock()
+			accountLock.Lock()
+			if _, ok := m.connections.Load(key); ok {
+				accountLock.Unlock()
+				lock.Unlock()
+				continue
+			}
+			capacity := m.reserveAccountConnectionCapacity(connectionCapacityRequest{accountID: account.ID(), limit: accountLimit, protectedKey: key, kind: kind})
+			if capacity == nil {
+				// 账号连接容量已满：不为 overflow 挤占更多连接，放弃降级回到等待
+				accountLock.Unlock()
+				lock.Unlock()
+				return nil, nil, false
+			}
+			accountLock.Unlock()
+			wc, err := m.createConnection(ctx, connectionDialRequest{account: account, url: wsURL, sessionKey: slotSession, headers: headers, proxyOverride: proxyOverride, capacity: capacity, dialKind: dialKindOverflow})
+			if err != nil {
+				lock.Unlock()
+				log.Printf("[WS] busy overflow 新建连接失败，回落等待原连接 (account=%d): %v", account.ID(), err)
+				return nil, nil, false
+			}
+			m.connections.Store(key, wc)
+			if m.afterConnectionStored != nil {
+				m.afterConnectionStored(wc)
+			}
+			pr, leaseErr := m.addPendingAndBeginReadLease(wc, slotSession, kind)
+			if leaseErr == nil {
+				if earlyErr := wc.waitForEarlyReadFailure(ctx, newConnectionReadFailureGrace); earlyErr != nil {
+					wc.session.RemovePendingRequest(pr.RequestID)
+					leaseErr = earlyErr
+				}
+			}
+			if leaseErr != nil {
+				m.DiscardConnection(wc)
+				lock.Unlock()
+				return nil, nil, false
+			}
+			lock.Unlock()
+			if fn := m.getOnConnected(); fn != nil {
+				fn(account.ID(), wc.session)
+			}
+			return wc, pr, true
 		}
-		return wc, pr, true
+	}
+	// 第三遍：没有空槽位或不允许新建时，接管空闲但带续链绑定的兄弟连接（最久未使用优先），放弃其旧绑定。
+	if slotReuseBoundEnabled() && len(boundSiblings) > 0 {
+		wc, pr, _, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSiblings, accountLock, reuseKindOverflow)
+		if err != nil {
+			return nil, nil, false
+		}
+		if ok {
+			return wc, pr, true
+		}
 	}
 	return nil, nil, false
 }
@@ -977,7 +1015,7 @@ func (m *Manager) AcquireReusableConnection(
 	// 第三遍：没有空槽位时，按 lastUsed 从旧到新接管空闲但带续链绑定的槽位，
 	// 放弃其旧绑定，避免每个请求都落到一次性连接上重新握手。
 	if slotReuseBoundEnabled() && len(boundSlots) > 0 {
-		wc, pr, slotSession, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSlots, accountLock)
+		wc, pr, slotSession, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSlots, accountLock, reuseKindSlotBound)
 		if err != nil {
 			return nil, nil, "", err
 		}
@@ -1000,7 +1038,8 @@ type boundReusableSlot struct {
 }
 
 // acquireBoundReusableSlot 依次尝试接管带续链绑定的空闲槽位（lastUsed 最旧优先），
-// 第一个成功的即返回。调用方持有 accountLock 的引用但未加锁。每个候选开始前检查
+// 第一个成功的即返回，成功时按 reuseKind 记复用统计（无会话槽位记 slot_bound，busy
+// overflow 兄弟连接记 overflow）。调用方持有 accountLock 的引用但未加锁。每个候选开始前检查
 // ctx：已取消时返回 ctx.Err()，与第二遍取消时直接返回错误一致，不再落到一次性拨号。
 //
 // 与续链取连（acquirePreferredConnection）互斥依赖同一把 pool-key 锁：续链取连在
@@ -1010,7 +1049,7 @@ type boundReusableSlot struct {
 // 两把锁都未释放，续链方无法进入复验；锁释放后连接已有在途请求、旧绑定已删，
 // 续链方复验 canReuseConnection 失败，重试时查找返回空，由 acquireContinuation
 // 返回 ResponsesContinuationLostError。
-func (m *Manager) acquireBoundReusableSlot(ctx context.Context, account *auth.Account, kind connectionCapacityKind, candidates []boundReusableSlot, accountLock *sync.Mutex) (*WsConnection, *PendingRequest, string, bool, error) {
+func (m *Manager) acquireBoundReusableSlot(ctx context.Context, account *auth.Account, kind connectionCapacityKind, candidates []boundReusableSlot, accountLock *sync.Mutex, reuseKind connectionReuseKind) (*WsConnection, *PendingRequest, string, bool, error) {
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].lastUsed < candidates[j].lastUsed })
 	for _, candidate := range candidates {
 		if err := ctx.Err(); err != nil {
@@ -1055,7 +1094,7 @@ func (m *Manager) acquireBoundReusableSlot(ctx context.Context, account *auth.Ac
 		accountLock.Unlock()
 		lock.Unlock()
 		releaseKeyLock()
-		m.connStats.recordReuse(account.ID(), reuseKindSlotBound)
+		m.connStats.recordReuse(account.ID(), reuseKind)
 		return wc, pr, candidate.slotSession, true, nil
 	}
 	return nil, nil, "", false, nil

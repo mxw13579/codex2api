@@ -2728,6 +2728,7 @@ export default function Settings() {
     codex_ws_busy_acquire_max_wait_sec: 30,
     codex_ws_busy_overflow_enabled: false,
     codex_ws_busy_patience_sec: 2,
+    codex_ws_busy_overflow_slots: 4,
     codex_ws_stateless_slots: 8,
     codex_ws_downstream_keepalive_slots: 8,
     github_token_configured: false,
@@ -4390,6 +4391,26 @@ export default function Settings() {
                           if (!settingsForm.codex_ws_busy_overflow_enabled) return
                           void autoSaveSettingsPatch({
                             codex_ws_busy_patience_sec: value,
+                          })
+                        }}
+                      />
+                    </SettingField>
+                    <SettingField
+                      label={t('settings.codexWSBusyOverflowSlots')}
+                      description={t('settings.codexWSBusyOverflowSlotsDesc')}
+                      className={cn(!settingsForm.codex_ws_busy_overflow_enabled && 'opacity-60')}
+                    >
+                      <DraftNumberInput
+                        min={1}
+                        max={16}
+                        disabled={!settingsForm.codex_ws_busy_overflow_enabled}
+                        value={settingsForm.codex_ws_busy_overflow_slots}
+                        emptyValue={4}
+                        onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_overflow_slots: value }))}
+                        onValueCommit={(value) => {
+                          if (!settingsForm.codex_ws_busy_overflow_enabled) return
+                          void autoSaveSettingsPatch({
+                            codex_ws_busy_overflow_slots: value,
                           })
                         }}
                       />

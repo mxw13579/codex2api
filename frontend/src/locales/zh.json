@@ -4651,6 +4651,8 @@
     "codexWSBusyOverflowEnabledDesc": "排队超过下方短等待仍未空闲时，在同账号上复用或新建有界的兄弟连接立即发出请求，消除固定约 30 秒的首字长尾。请求的 prompt_cache_key 不变，上游缓存不受影响。默认关闭。",
     "codexWSBusyPatience": "溢出前短等待",
     "codexWSBusyPatienceDesc": "触发溢出前先等待原连接空闲的秒数：前一请求在短间隙内结束时直接复用原连接，保住连接局部性。默认 2 秒。",
+    "codexWSBusyOverflowSlots": "溢出兄弟连接数",
+    "codexWSBusyOverflowSlotsDesc": "每个会话在同一账号上最多使用多少条溢出兄弟连接，空闲的兄弟连接会被后续排队请求复用。调大可承接更高的同会话并发，但会多占账号连接。调小后超出的已有连接不会立即关闭，按空闲回收。默认 4，范围 1～16，保存后生效。",
     "codexOverloadPause": "过载自动暂停",
     "codexOverloadPauseDesc": "上游返回 server_is_overloaded(服务过载)时按账号统计:滑动窗口内过载错误占比达到阈值就自动暂停该账号调度,到期自动恢复。仅 Codex 渠道。",
     "codexOverloadPauseEnabled": "启用过载熔断",

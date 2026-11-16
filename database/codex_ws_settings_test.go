@@ -25,3 +25,16 @@ func TestCodexWSChatRetentionNormalization(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexWSBusyOverflowSlotsNormalization(t *testing.T) {
+	for _, tt := range []struct{ input, want int }{
+		{-5, 4}, {-1, 4}, {0, 4}, {1, 1}, {2, 2}, {4, 4}, {15, 15}, {16, 16}, {17, 16}, {int(^uint(0) >> 1), 16},
+	} {
+		if got := NormalizeCodexWSBusyOverflowSlots(tt.input); got != tt.want {
+			t.Errorf("NormalizeCodexWSBusyOverflowSlots(%d) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+	if DefaultCodexWSBusyOverflowSlots != 4 || MaxCodexWSBusyOverflowSlots != 16 {
+		t.Fatalf("default/max = %d/%d, want 4/16", DefaultCodexWSBusyOverflowSlots, MaxCodexWSBusyOverflowSlots)
+	}
+}

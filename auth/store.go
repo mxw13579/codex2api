@@ -4063,6 +4063,7 @@ type Store struct {
 	codexWSBusyMaxWaitSec           atomic.Int64 // busy session 等待上限（秒），默认 30（issue #413）
 	codexWSBusyOverflowEnabled      atomic.Bool  // busy session 溢出到同账号兄弟连接，默认关闭
 	codexWSBusyPatienceSec          atomic.Int64 // 触发溢出前的短等待（秒），默认 2
+	codexWSBusyOverflowSlots        atomic.Int64 // 每个 busy 会话的 overflow 兄弟连接数，默认 4
 	codexWSStatelessSlots           atomic.Int64 // 每账号空白上游 WS 槽位预算，默认 8
 	codexWSDownstreamKeepaliveSlots atomic.Int64
 	overflowAutoCompactEnabled      atomic.Bool // 上下文超窗自动摘要重试（实验性，默认关闭，issue #415）
@@ -4790,6 +4791,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSSizeRouterEnabled:           true,
 			CodexWSBusyAcquireMaxWaitSec:       30,
 			CodexWSBusyPatienceSec:             2,
+			CodexWSBusyOverflowSlots:           database.DefaultCodexWSBusyOverflowSlots,
 			CodexWSStatelessSlots:              8,
 			CodexWSDownstreamKeepaliveSlots:    database.DefaultCodexWSDownstreamKeepaliveSlots,
 			CodexContinueMaxRounds:             8,
@@ -4917,6 +4919,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSBusyMaxWaitSec.Store(int64(database.NormalizeCodexWSBusyAcquireMaxWaitSec(settings.CodexWSBusyAcquireMaxWaitSec)))
 	s.codexWSBusyOverflowEnabled.Store(settings.CodexWSBusyOverflowEnabled)
 	s.codexWSBusyPatienceSec.Store(int64(database.NormalizeCodexWSBusyPatienceSec(settings.CodexWSBusyPatienceSec)))
+	s.SetCodexWSBusyOverflowSlots(settings.CodexWSBusyOverflowSlots)
 	s.codexWSStatelessSlots.Store(int64(database.NormalizeCodexWSStatelessSlots(settings.CodexWSStatelessSlots)))
 	s.SetCodexWSDownstreamKeepaliveSlots(settings.CodexWSDownstreamKeepaliveSlots)
 	s.overflowAutoCompactEnabled.Store(settings.OverflowAutoCompactEnabled)

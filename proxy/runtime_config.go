@@ -103,6 +103,8 @@ type RuntimeSettings struct {
 	CodexWSBusyMaxWaitSec  int                            // busy session/容量等待的累计上限秒数（默认 30，issue #413）
 	CodexWSBusyOverflow    bool                           // busy session 溢出到同账号兄弟连接（默认 false）
 	CodexWSBusyPatienceSec int                            // 触发溢出前的短等待秒数（默认 2）
+	// CodexWSBusyOverflowSlots 每个 busy 会话在同账号上允许的 overflow 兄弟连接数（默认 4，范围 1-16）。
+	CodexWSBusyOverflowSlots int
 	// CodexWSStatelessSlots 限制每账号的空白连接预算及通用池扫描窗口。
 	CodexWSStatelessSlots int
 	// CodexWSDownstreamKeepaliveSlots 独立限制每账号输出收尾后保留的空闲聊天连接。
@@ -209,6 +211,7 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
 		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
 		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
+		CodexWSBusyOverflowSlots:         database.DefaultCodexWSBusyOverflowSlots,
 		CodexWSStatelessSlots:            defaultCodexWSStatelessSlots,
 		CodexWSDownstreamKeepaliveSlots:  database.DefaultCodexWSDownstreamKeepaliveSlots,
 		CodexOverloadThresholdPercent:    database.NormalizeCodexOverloadThresholdPercent(0),
@@ -337,6 +340,7 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSBusyPatienceSec > maxCodexWSBusyWaitSec {
 		settings.CodexWSBusyPatienceSec = maxCodexWSBusyWaitSec
 	}
+	settings.CodexWSBusyOverflowSlots = database.NormalizeCodexWSBusyOverflowSlots(settings.CodexWSBusyOverflowSlots)
 	if settings.CodexWSStatelessSlots < 0 {
 		settings.CodexWSStatelessSlots = defaultCodexWSStatelessSlots
 	}
@@ -393,6 +397,7 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSBusyMaxWaitSec = settings.CodexWSBusyAcquireMaxWaitSec
 		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
 		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
+		next.CodexWSBusyOverflowSlots = settings.CodexWSBusyOverflowSlots
 		next.CodexWSStatelessSlots = settings.CodexWSStatelessSlots
 		next.CodexWSDownstreamKeepaliveSlots = settings.CodexWSDownstreamKeepaliveSlots
 		next.GithubToken = strings.TrimSpace(settings.GithubToken)

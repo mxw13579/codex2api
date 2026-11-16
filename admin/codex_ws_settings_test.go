@@ -95,3 +95,78 @@ func TestCodexWSChatRetentionSettingsRejectInvalidTypes(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexWSBusyOverflowSlotsSettingsPersistence(t *testing.T) {
+	handler, db, _ := newTransient429SettingsAdminHandler(t)
+	for _, tt := range []struct {
+		name, body string
+		want       int
+	}{
+		{"default", `{"site_name":"overflow slots test"}`, 4},
+		{"set", `{"codex_ws_busy_overflow_slots":6}`, 6},
+		{"omitted preserves value", `{"site_name":"unrelated update"}`, 6},
+		{"null preserves value", `{"codex_ws_busy_overflow_slots":null}`, 6},
+		{"minimum", `{"codex_ws_busy_overflow_slots":1}`, 1},
+		{"zero restores default", `{"codex_ws_busy_overflow_slots":0}`, 4},
+		{"maximum", `{"codex_ws_busy_overflow_slots":16}`, 16},
+		{"negative restores default", `{"codex_ws_busy_overflow_slots":-2}`, 4},
+		{"above maximum clamps", `{"codex_ws_busy_overflow_slots":17}`, 16},
+		{"hot decrease", `{"codex_ws_busy_overflow_slots":2}`, 2},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			put := invokeTransient429SettingsAdmin(handler, http.MethodPut, tt.body)
+			get := invokeTransient429SettingsAdmin(handler, http.MethodGet, "")
+			if put.Code != http.StatusOK || get.Code != http.StatusOK {
+				t.Fatalf("PUT/GET status=%d/%d, body=%s", put.Code, get.Code, put.Body.String())
+			}
+			for _, body := range [][]byte{put.Body.Bytes(), get.Body.Bytes()} {
+				var got struct {
+					Slots *int `json:"codex_ws_busy_overflow_slots"`
+				}
+				if err := json.Unmarshal(body, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got.Slots == nil || *got.Slots != tt.want {
+					t.Fatalf("settings response overflow slots=%v, want %d", got.Slots, tt.want)
+				}
+			}
+			persisted, err := db.GetSystemSettings(context.Background())
+			if err != nil || persisted == nil {
+				t.Fatalf("GetSystemSettings: present=%t err=%v", persisted != nil, err)
+			}
+			if persisted.CodexWSBusyOverflowSlots != tt.want {
+				t.Fatalf("persisted overflow slots=%d, want %d", persisted.CodexWSBusyOverflowSlots, tt.want)
+			}
+			reloaded := auth.NewStore(nil, nil, persisted)
+			defer reloaded.Stop()
+			for _, store := range []*auth.Store{handler.store, reloaded} {
+				if store.CodexWSBusyOverflowSlots() != tt.want {
+					t.Fatalf("store overflow slots=%d, want %d", store.CodexWSBusyOverflowSlots(), tt.want)
+				}
+			}
+			if runtime := proxy.CurrentRuntimeSettings(); runtime.CodexWSBusyOverflowSlots != tt.want {
+				t.Fatalf("runtime overflow slots=%d, want %d", runtime.CodexWSBusyOverflowSlots, tt.want)
+			}
+		})
+	}
+}
+
+func TestCodexWSBusyOverflowSlotsRejectInvalidTypes(t *testing.T) {
+	handler, db, _ := newTransient429SettingsAdminHandler(t)
+	if put := invokeTransient429SettingsAdmin(handler, http.MethodPut, `{"codex_ws_busy_overflow_slots":5}`); put.Code != http.StatusOK {
+		t.Fatalf("initial PUT: status=%d", put.Code)
+	}
+	for _, value := range []string{`"8"`, `2.5`, `true`, `{}`, `[]`, `9223372036854775808`} {
+		response := invokeTransient429SettingsAdmin(handler, http.MethodPut, `{"codex_ws_busy_overflow_slots":`+value+`}`)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("value=%s status=%d, want 400", value, response.Code)
+		}
+		persisted, err := db.GetSystemSettings(context.Background())
+		if err != nil || persisted == nil {
+			t.Fatalf("GetSystemSettings: present=%t err=%v", persisted != nil, err)
+		}
+		if persisted.CodexWSBusyOverflowSlots != 5 || handler.store.CodexWSBusyOverflowSlots() != 5 || proxy.CurrentRuntimeSettings().CodexWSBusyOverflowSlots != 5 {
+			t.Fatal("invalid update changed overflow slots")
+		}
+	}
+}

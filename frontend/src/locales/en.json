@@ -4654,6 +4654,8 @@
     "codexWSBusyOverflowEnabledDesc": "When queueing outlasts the patience below, reuse or create a bounded sibling connection on the same account and send immediately, removing the fixed ~30s first-token tail. The request's prompt_cache_key is unchanged, so upstream caching is unaffected. Disabled by default.",
     "codexWSBusyPatience": "Overflow Patience",
     "codexWSBusyPatienceDesc": "Seconds to wait for the original connection to go idle before overflowing: requests finishing within a short gap still reuse it and keep connection locality. Default 2s.",
+    "codexWSBusyOverflowSlots": "Overflow Sibling Connections",
+    "codexWSBusyOverflowSlotsDesc": "Maximum overflow sibling connections per session on the same account; idle siblings are reused by later queued requests. Higher values absorb more same-session concurrency but hold more account connections. After lowering, existing extra connections are not closed immediately and are reclaimed when idle. Default 4, range 1–16. Changes apply after saving.",
     "codexOverloadPause": "Overload Auto-Pause",
     "codexOverloadPauseDesc": "Per-account stats on upstream server_is_overloaded errors: when their share within a sliding window reaches the threshold, the account is paused from scheduling and resumes automatically. Codex channel only.",
     "codexOverloadPauseEnabled": "Enable Overload Breaker",

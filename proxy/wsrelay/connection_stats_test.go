@@ -273,7 +273,7 @@ func TestConnectionStatsCountsDialAndReuseKinds(t *testing.T) {
 	finishStatelessRequest(t, manager, wc, pr, key, "", "key") // continuation reuse
 	session("")                                                // session reuse
 	for i := 0; i < 2; i++ {                                   // overflow dial, then overflow reuse
-		owc, opr, ok := manager.tryAcquireBusyOverflow(ctx, account, wsURL, "sess", http.Header{}, "")
+		owc, opr, ok := manager.tryAcquireBusyOverflow(ctx, account, wsURL, "sess", http.Header{}, "", true)
 		if !ok {
 			t.Fatalf("tryAcquireBusyOverflow #%d failed", i)
 		}
