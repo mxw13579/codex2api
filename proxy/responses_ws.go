@@ -326,6 +326,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	resetPromptRequestSecurityFrame(c)
 	resetPromptPolicyRequestCorrelationID(c)
 	resetUpstreamRequestTrace(c)
+	// realtime 路径每轮复用同一个 c；选号前出错时日志账号应为 0，不能沿用上一轮。
+	c.Set(responseContextAccountContextKey, int64(0))
 	quotaParentRequest := c.Request
 	if err := h.refreshAPIKeyModelRequestQuotaTurn(c); err != nil {
 		return writeResponsesWSErrorForContext(c, conn, apiKeyModelRequestError(err).apiErr)
@@ -723,6 +725,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if attempt > 0 {
 			clearNewAPIUpstreamCyberPolicyDecision(c)
 		}
+		c.Set(responseContextAccountContextKey, account.ID())
 
 		if compatibilityErr := selectedCodexResponsesCompatibilityError(c, account, rawBody); compatibilityErr != nil {
 			h.store.Release(account)

@@ -74,6 +74,8 @@ func withResponsesWSStreamID(payload []byte, streamID string) []byte {
 }
 
 func writeResponsesWSErrorForContext(c *gin.Context, conn *websocket.Conn, err *api.APIError) error {
+	// 每个轮次以一个错误帧结束，"上下文不可用"在此统一记一次原因码。
+	logResponsesWSContextUnavailable(c, err)
 	return writeResponsesWSErrorForStream(conn, err, c.GetString(responsesWSStreamContextKey), responsesWSWriteTimeout)
 }
 

@@ -2113,7 +2113,14 @@ func responseCachePreparationFailure(prepared responsesBodyPreparation) (status 
 	return 0, "", false
 }
 
-func sendResponseContextUnavailable(c *gin.Context, status int, reason string) {
+// sendResponseContextUnavailable 记录原因码日志后写出"上下文不可用"错误响应。
+func sendResponseContextUnavailable(c *gin.Context, status int, reason string, accountID int64) {
+	logResponseContextUnavailable(c, responseContextTransportHTTP, status, reason, accountID)
+	writeResponseContextUnavailable(c, status, reason)
+}
+
+// writeResponseContextUnavailable 只写响应，不打日志；调用方已自行记录时使用。
+func writeResponseContextUnavailable(c *gin.Context, status int, reason string) {
 	code := api.ErrCodeResponseContextUnavailable
 	errType := api.ErrorTypeInvalidRequest
 	message := "Previous response context is unavailable"
@@ -4206,7 +4213,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if searchContextErr.Code == api.ErrCodeServiceUnavailable {
 			status = http.StatusServiceUnavailable
 		}
-		sendResponseContextUnavailable(c, status, responsesWSContextReason(searchContextErr))
+		sendResponseContextUnavailable(c, status, responsesWSContextReason(searchContextErr), 0)
 		return
 	}
 	if codexResponsesBodyHasHostedWebSearch(rawBody) {
@@ -4525,10 +4532,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 			if continuationUnavailable && !relayContinuationAttempted {
+				// 已提交流与普通响应两个出口只记一次原因码。
+				logResponseContextUnavailable(c, responseContextTransportHTTP, continuationStatus, continuationReason, 0)
 				if isStream && writeCommittedResponsesRetryError(c, "Previous response context is unavailable") {
 					return
 				}
-				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
+				writeResponseContextUnavailable(c, continuationStatus, continuationReason)
 				return
 			}
 			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
@@ -4579,7 +4588,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			replayInput := searchReplay.Input()
 			if replayInput == "" {
 				h.store.Release(account)
-				sendResponseContextUnavailable(c, http.StatusConflict, responsesWSContextReason(searchReplay.err))
+				sendResponseContextUnavailable(c, http.StatusConflict, responsesWSContextReason(searchReplay.err), account.ID())
 				return
 			}
 			if attempt == 0 {
@@ -5581,6 +5590,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			shouldRetry := false
 			if retryable && safePreflight.canStart(c.Request.Context()) {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries, continuousRetryPolicy)
+			}
+			if !shouldRetry && safePreflight == nil {
+				// 不再重试时下面各出口都会把该错误作为 409 返回，只在此记一次原因码。
+				logHTTPResponsesContinuationLost(c, reqErr, account.ID())
 			}
 			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
 			// busy acquire 超时不粘滞同号：同 key 再等只会重复排队，直接换号（issue #413）
@@ -6843,7 +6856,7 @@ func (h *Handler) responsesCompactWithBadRequestRetry(c *gin.Context, badRequest
 	// Compact has no private-search replay/provenance commit path. Do not let
 	// its native-relay exception forward an unresolvable logical response ID.
 	if isCodexSearchResponseID(gjson.GetBytes(rawBody, "previous_response_id").String()) {
-		sendResponseContextUnavailable(c, http.StatusConflict, "search_context_requires_responses")
+		sendResponseContextUnavailable(c, http.StatusConflict, "search_context_requires_responses", 0)
 		return
 	}
 	// 准备上游请求体（previous_response_id 缓存按下游 API Key 隔离）
@@ -6992,7 +7005,7 @@ func (h *Handler) responsesCompactWithBadRequestRetry(c *gin.Context, badRequest
 				if !claimContinuousRetryTerminal(c, continuousRetryProtocolResponses) {
 					return
 				}
-				sendResponseContextUnavailable(c, continuationStatus, continuationReason)
+				sendResponseContextUnavailable(c, continuationStatus, continuationReason, 0)
 				return
 			}
 			account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
