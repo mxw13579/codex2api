@@ -370,7 +370,7 @@ class Release:
         if row["sessions"] or row["queued"] or not row["status"].startswith(("DRAIN", "MAINT")):
             raise ReleaseError(f"{slot} still has connections or accepts traffic; run drain first.")
 
-    def deploy(self, image, pull, timeout, drain_timeout):
+    def deploy(self, image, pull, timeout, drain_timeout, force_stop=True):
         self.require_idle_transaction()
         if not self.state["bootstrapped"]:
             raise ReleaseError("Run bootstrap first.")
@@ -382,7 +382,7 @@ class Release:
         self.compose("up", "-d", "--no-deps", target)
         self.wait_healthy(target, timeout)
         self.switch(target, timeout)
-        return self.drain(drain_timeout)
+        return self.drain(drain_timeout, force_stop)
 
     def switch(self, target, timeout):
         previous = self.state["active"]
@@ -402,6 +402,7 @@ class Release:
         self.state["pending"] = None
         self.persist()
         print(f"New requests now use {target}; existing connections stay on {previous}.")
+        self.apply_drain_modes(active=target, draining=previous)
 
     def recover(self, timeout, abort=False):
         self.require_initialized()
@@ -420,11 +421,12 @@ class Release:
             self.state["pending"] = None
             self.persist()
             print("Previous routing restored. Candidate connections are retained; run drain later.")
+            self.apply_drain_modes(active=previous, draining=target)
         else:
             self.wait_healthy(target, timeout)
             self.switch(target, timeout)
 
-    def rollback(self, timeout, drain_timeout):
+    def rollback(self, timeout, drain_timeout, force_stop=True):
         self.require_idle_transaction()
         if not self.state["bootstrapped"]:
             raise ReleaseError("Run bootstrap first.")
@@ -445,15 +447,18 @@ class Release:
             self.compose("up", "-d", "--no-deps", target)
             self.wait_healthy(target, timeout)
         self.switch(target, timeout)
-        return self.drain(drain_timeout)
+        return self.drain(drain_timeout, force_stop)
 
-    def drain(self, timeout):
+    def drain(self, timeout, force_stop=True):
         self.require_idle_transaction()
         if not self.state["bootstrapped"]:
             raise ReleaseError("Run bootstrap first.")
         old = self.inactive()
         deadline = time.monotonic() + timeout
+        signalled = False
         while True:
+            # Safety gates are re-checked on every poll, including the one that
+            # forces a stop: only an inactive, draining slot is ever stopped.
             stats = self.stats()
             row = stats[old]
             if stats[self.state["active"]]["status"] != "UP":
@@ -464,16 +469,74 @@ class Release:
                 self.compose("stop", "--timeout", "120", old)
                 print(f"{old} drained and stopped. Its image remains available for rollback.")
                 return True
+            if not signalled:
+                # Idempotent: switch() normally sent it already; a standalone
+                # drain (or one after an old switch) still releases idle upstreams.
+                self.signal_drain_mode(old, enter=True)
+                signalled = True
             if time.monotonic() >= deadline:
+                if force_stop:
+                    print(f"Drain timeout: force stopping {old} with {row['sessions']} connections and {row['queued']} queued "
+                          "(SIGTERM, then SIGKILL after 120s). Its image remains available for rollback.")
+                    self.compose("stop", "--timeout", "120", old)
+                    print(f"{old} force stopped after drain timeout.")
+                    return True
                 print(f"Drain pending: {old} has {row['sessions']} connections and {row['queued']} queued. It remains running. Run drain later.")
                 return False
             time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+    def probe_drain_mode(self, slot):
+        """Read the slot's /health the way its container health check does
+        (inside the container, no credentials). Returns (health, None) only when
+        the application explicitly reports drain_mode_supported: true, otherwise
+        (health or None, reason). Older releases register no SIGUSR1/SIGUSR2
+        handler, and Go terminates a process on an unhandled SIGUSR1."""
+        url = f"http://127.0.0.1:{self.state['app_port']}/health"
+        try:
+            text = self.compose("exec", "-T", slot, "wget", "-q", "-O", "-", url, timeout=20)
+        except ReleaseError:
+            return None, "health endpoint not readable"
+        try:
+            health = json.loads(text)
+        except ValueError:
+            return None, "health response is not JSON"
+        if not isinstance(health, dict):
+            return None, "health response is not an object"
+        if health.get("drain_mode_supported") is not True:
+            return health, "drain_mode_supported not reported (older release)"
+        return health, None
+
+    def signal_drain_mode(self, slot, enter):
+        """Best effort: a skipped or failed signal never fails the release."""
+        name = "SIGUSR1" if enter else "SIGUSR2"
+        _, reason = self.probe_drain_mode(slot)
+        if reason:
+            print(f"Drain mode {name} to {slot} skipped: {reason}.")
+            return False
+        try:
+            self.compose("kill", "-s", name, slot, timeout=30)
+        except ReleaseError:
+            print(f"Warning: sending {name} to {slot} failed; continuing.")
+            return False
+        print(f"Sent {name} to {slot} ({'enter' if enter else 'exit'} drain mode).")
+        return True
+
+    def apply_drain_modes(self, active, draining):
+        # The active slot must never stay in drain mode (e.g. rolling back to a
+        # slot drained earlier); the other slot releases its idle upstreams.
+        self.signal_drain_mode(active, enter=False)
+        self.signal_drain_mode(draining, enter=True)
 
     def status(self):
         self.require_initialized()
         result = {key: self.state.get(key) for key in ("project", "bind", "port", "active", "bootstrapped", "bootstrap_image", "pending", "slots", "previous_release")}
         if self.state["bootstrapped"]:
             result["proxy"] = self.stats()
+            # None: slot stopped/unreachable, or an older release without drain mode.
+            result["draining"] = {}
+            for slot in SLOTS:
+                health, reason = self.probe_drain_mode(slot)
+                result["draining"][slot] = None if reason else health.get("draining")
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -494,6 +557,16 @@ def locked(root):
         yield
 
 
+DRAIN_TIMEOUT = 180
+
+
+def add_drain_options(command):
+    command.add_argument("--drain-timeout", type=int, default=DRAIN_TIMEOUT,
+                         help="Seconds to wait for the old slot to reach zero connections and queue")
+    command.add_argument("--no-force-stop", dest="force_stop", action="store_false",
+                         help="After the drain timeout keep the old slot running (exit 2) instead of stopping it")
+
+
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--state-dir", default="/var/lib/codex2api-rollout")
@@ -510,17 +583,17 @@ def parser():
         command.add_argument("--pull", action="store_true", help="Pull image before pinning its local immutable ID")
         command.add_argument("--ready-timeout", type=int, default=180)
         if action == "deploy":
-            command.add_argument("--drain-timeout", type=int, default=300)
+            add_drain_options(command)
     for action in ("rollback", "recover"):
         command = sub.add_parser(action)
         command.add_argument("--ready-timeout", type=int, default=180)
         if action == "rollback":
-            command.add_argument("--drain-timeout", type=int, default=300)
+            add_drain_options(command)
         else:
             command.add_argument("--abort", action="store_true", help="Restore previous routing instead of completing the switch")
     sub.add_parser("status")
     drain = sub.add_parser("drain")
-    drain.add_argument("--drain-timeout", type=int, default=300)
+    add_drain_options(drain)
     return result
 
 
@@ -536,13 +609,13 @@ def main(argv=None):
         elif args.action == "bootstrap":
             release.bootstrap(args.image, args.pull, args.ready_timeout)
         elif args.action == "deploy":
-            return 0 if release.deploy(args.image, args.pull, args.ready_timeout, args.drain_timeout) else 2
+            return 0 if release.deploy(args.image, args.pull, args.ready_timeout, args.drain_timeout, args.force_stop) else 2
         elif args.action == "rollback":
-            return 0 if release.rollback(args.ready_timeout, args.drain_timeout) else 2
+            return 0 if release.rollback(args.ready_timeout, args.drain_timeout, args.force_stop) else 2
         elif args.action == "recover":
             release.recover(args.ready_timeout, args.abort)
         elif args.action == "drain":
-            return 0 if release.drain(args.drain_timeout) else 2
+            return 0 if release.drain(args.drain_timeout, args.force_stop) else 2
         else:
             release.status()
     return 0

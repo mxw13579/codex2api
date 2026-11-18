@@ -134,7 +134,12 @@ class IsolatedReleaseTest(unittest.TestCase):
         }
         self.running_images = {slot: SOURCE_IMAGE for slot in release.SLOTS}
         self.edge = {"Status": "running", "Running": True}
-        self.rows = {"blue": counters("UP"), "green": counters("MAINT")}
+        # Default: an older release whose /health lacks drain_mode_supported,
+        # so no drain signal may ever be sent to it.
+        self.health = {slot: {"status": "ok"} for slot in release.SLOTS}
+        self.signals = []
+        self.kill_fails = False
+        self.rows ={"blue": counters("UP"), "green": counters("MAINT")}
         self.frames = []
         self.app = release.Release(self.root)
         self.app.state = snapshot()
@@ -192,6 +197,17 @@ class IsolatedReleaseTest(unittest.TestCase):
                 if action == ("stop", "--timeout", "120", slot):
                     self.containers[slot]["Running"] = False
                     return ""
+                if action == ("exec", "-T", slot, "wget", "-q", "-O", "-", "http://127.0.0.1:8187/health"):
+                    reply = self.health[slot]
+                    if reply is None or not self.containers[slot]["Running"]:
+                        raise release.ReleaseError("Docker command failed")
+                    return reply if isinstance(reply, str) else json.dumps(reply)
+                for name in ("SIGUSR1", "SIGUSR2"):
+                    if action == ("kill", "-s", name, slot):
+                        if self.kill_fails:
+                            raise release.ReleaseError("Docker command failed")
+                        self.signals.append((slot, name))
+                        return ""
         raise AssertionError("Unexpected Docker operation in isolated fixture")
 
     def fake_control(self, command):
@@ -212,7 +228,14 @@ class IsolatedReleaseTest(unittest.TestCase):
         return json.loads((self.root / "compose.json").read_text(encoding="utf-8"))
 
     def compose_actions(self):
-        return [value for kind, value in self.events if kind == "compose"]
+        # Read-only /health probes are asserted separately (health_probes()).
+        return [value for kind, value in self.events if kind == "compose" and value[:1] != ("exec",)]
+
+    def health_probes(self):
+        return [value[2] for kind, value in self.events if kind == "compose" and value[:1] == ("exec",)]
+
+    def stops(self):
+        return [action for action in self.compose_actions() if action[0] == "stop"]
 
     def cli(self, *arguments):
         # The real Linux lock and default state path are outside this unit test.
@@ -428,28 +451,83 @@ class DrainTests(IsolatedReleaseTest):
             with self.subTest(protocol=protocol):
                 self.rows["green"] = counters("DRAIN", sessions=1)
                 started = self.clock.now
-                self.assertIs(self.app.drain(3), False)
+                self.assertIs(self.app.drain(3, force_stop=False), False)
                 self.assertEqual(self.clock.now - started, 3)
                 self.assertTrue(self.containers["green"]["Running"])
                 self.assertTrue(self.containers["blue"]["Running"])
-        self.docker.assert_not_called()
+        self.assertEqual(self.compose_actions(), [])
+        self.assertEqual(self.signals, [])
 
     def test_one_queued_request_with_zero_sessions_also_prevents_stop(self):
         self.rows["green"] = counters("MAINT", queued=1)
-        self.assertIs(self.app.drain(0), False)
+        self.assertIs(self.app.drain(0, force_stop=False), False)
         self.assertTrue(self.containers["green"]["Running"])
-        self.docker.assert_not_called()
+        self.assertEqual(self.compose_actions(), [])
 
     def test_polling_waits_for_sessions_and_queue_before_stop(self):
         self.frames = [stats_csv({"blue": counters("UP"), "green": row}) for row in (
             counters("DRAIN", sessions=1), counters("DRAIN", queued=1), counters("DRAIN"),
         )]
         self.assertIs(self.app.drain(10), True)
+        probe = ("exec", "-T", "green", "wget", "-q", "-O", "-", "http://127.0.0.1:8187/health")
         self.assertEqual(self.events, [
-            ("proxy", "show stat"), ("proxy", "show stat"), ("proxy", "show stat"),
+            ("proxy", "show stat"), ("compose", probe), ("proxy", "show stat"), ("proxy", "show stat"),
             ("compose", ("stop", "--timeout", "120", "green")),
         ])
         self.assertEqual(self.clock.sleeps, [2, 2])
+
+    def test_default_drain_timeout_is_three_minutes(self):
+        self.assertEqual(release.DRAIN_TIMEOUT, 180)
+        for arguments in (["deploy", CANDIDATE_REFERENCE], ["rollback"], ["drain"]):
+            with self.subTest(action=arguments[0]):
+                parsed = release.parser().parse_args(arguments)
+                self.assertEqual(parsed.drain_timeout, 180)
+                self.assertIs(parsed.force_stop, True)
+                parsed = release.parser().parse_args([*arguments, "--no-force-stop"])
+                self.assertIs(parsed.force_stop, False)
+
+    def test_timeout_force_stops_only_the_inactive_draining_slot(self):
+        for row in (counters("DRAIN", sessions=1), counters("MAINT", queued=2), counters("DRAIN", 3, 4)):
+            with self.subTest(row=row):
+                self.events.clear()
+                self.output.reset_mock()
+                self.containers["green"]["Running"] = True
+                self.rows["green"] = dict(row)
+                started = self.clock.now
+                self.assertIs(self.app.drain(5), True)
+                self.assertEqual(self.clock.now - started, 5)
+                self.assertEqual(self.stops(), [("stop", "--timeout", "120", "green")])
+                self.assertFalse(self.containers["green"]["Running"])
+                self.assertTrue(self.containers["blue"]["Running"])
+                printed = " ".join(str(call.args[0]) for call in self.output.call_args_list)
+                self.assertIn("force stopping green", printed)
+                self.assertIn(f"{row['sessions']} connections and {row['queued']} queued", printed)
+
+    def test_zero_timeout_with_connections_force_stops_by_default(self):
+        self.rows["green"] = counters("DRAIN", sessions=1)
+        self.assertIs(self.app.drain(0), True)
+        self.assertEqual(self.stops(), [("stop", "--timeout", "120", "green")])
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_force_stop_keeps_safety_gates(self):
+        # Timed out with connections, but the active slot is not UP or the old
+        # slot still accepts traffic: never force stop anything.
+        for active, old in (("DOWN", "DRAIN"), ("MAINT", "DRAIN"), ("UP", "UP"), ("UP", "NOLB")):
+            with self.subTest(active=active, old=old):
+                self.rows = {"blue": counters(active, sessions=1), "green": counters(old, sessions=1)}
+                with self.assertRaises(release.ReleaseError):
+                    self.app.drain(0)
+                self.assertEqual(self.stops(), [])
+                self.assertTrue(all(item["Running"] for item in self.containers.values()))
+
+    def test_force_stop_gate_rechecked_on_the_final_poll(self):
+        self.frames = [
+            stats_csv({"blue": counters("UP"), "green": counters("DRAIN", sessions=1)}),
+            stats_csv({"blue": counters("DOWN"), "green": counters("DRAIN", sessions=1)}),
+        ]
+        with self.assertRaises(release.ReleaseError):
+            self.app.drain(2)
+        self.assertEqual(self.stops(), [])
 
     def test_active_not_exactly_up_prevents_stopping_idle_old_slot(self):
         for status in ("DOWN", "DRAIN", "MAINT", "UP 1/2", ""):
@@ -733,17 +811,28 @@ class DeploymentTests(IsolatedReleaseTest):
         self.assertTrue(all(item["Running"] for item in self.containers.values()))
         self.docker.assert_not_called()
 
-    def assert_cli_pending(self, action):
+    def cli_with_old_connection(self, action, *extra):
         self.rows["blue"]["sessions"] = 1
         self.rows["green"]["sessions"] = 1 if action == "drain" else 0
         arguments = [action]
         if action == "deploy":
             arguments.append(CANDIDATE_REFERENCE)
-        arguments.extend(["--drain-timeout", "0"])
-        self.assertEqual(self.cli(*arguments), 2)
-        self.assertTrue(all(item["Running"] for item in self.containers.values()))
-        self.assertFalse(any(action[0] == "stop" for action in self.compose_actions()))
+        arguments.extend(["--drain-timeout", "0", *extra])
+        result = self.cli(*arguments)
         self.assertEqual(self.app.state["active"], "blue" if action == "drain" else "green")
+        return result
+
+    def assert_cli_pending(self, action):
+        self.assertEqual(self.cli_with_old_connection(action, "--no-force-stop"), 2)
+        self.assertTrue(all(item["Running"] for item in self.containers.values()))
+        self.assertEqual(self.stops(), [])
+
+    def assert_cli_force_stopped(self, action):
+        self.assertEqual(self.cli_with_old_connection(action), 0)
+        old = "green" if action == "drain" else "blue"
+        self.assertEqual(self.stops(), [("stop", "--timeout", "120", old)])
+        self.assertFalse(self.containers[old]["Running"])
+        self.assertTrue(self.containers["green" if old == "blue" else "blue"]["Running"])
 
     def test_deploy_cli_returns_two_when_old_connection_remains(self):
         self.assert_cli_pending("deploy")
@@ -753,6 +842,97 @@ class DeploymentTests(IsolatedReleaseTest):
 
     def test_rollback_cli_returns_two_when_old_connection_remains(self):
         self.assert_cli_pending("rollback")
+
+    def test_deploy_cli_force_stops_after_timeout_by_default(self):
+        self.assert_cli_force_stopped("deploy")
+
+    def test_drain_cli_force_stops_after_timeout_by_default(self):
+        self.assert_cli_force_stopped("drain")
+
+    def test_rollback_cli_force_stops_after_timeout_by_default(self):
+        self.assert_cli_force_stopped("rollback")
+
+
+class DrainSignalTests(IsolatedReleaseTest):
+    SUPPORTED = {"status": "ok", "drain_mode_supported": True, "draining": False}
+
+    def test_switch_skips_signals_for_release_without_drain_mode_field(self):
+        self.app.switch("green", 0)
+        self.assertEqual(self.signals, [])
+        self.assertEqual(self.health_probes(), ["green", "blue"])
+        printed = " ".join(str(call.args[0]) for call in self.output.call_args_list)
+        self.assertIn("SIGUSR1 to blue skipped", printed)
+        self.assertIn("SIGUSR2 to green skipped", printed)
+
+    def test_unreadable_or_invalid_health_never_signals(self):
+        for reply in (None, "not json", "[1]", {"status": "ok", "drain_mode_supported": "true"},
+                      {"status": "ok", "drain_mode_supported": False}):
+            with self.subTest(reply=reply):
+                self.health = {slot: reply for slot in release.SLOTS}
+                self.assertIs(self.app.signal_drain_mode("blue", enter=True), False)
+                self.assertEqual(self.signals, [])
+
+    def test_switch_signals_previous_to_enter_and_target_to_exit(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.app.switch("green", 0)
+        self.assertEqual(self.signals, [("green", "SIGUSR2"), ("blue", "SIGUSR1")])
+        # Signals follow the confirmed and persisted switch.
+        self.assertEqual(self.disk_state()["active"], "green")
+        kills = [i for i, (kind, value) in enumerate(self.events) if kind == "compose" and value[0] == "kill"]
+        drain = self.events.index(("proxy", "set server app/blue state drain"))
+        self.assertTrue(all(index > drain for index in kills))
+
+    def test_only_supported_slot_is_signalled(self):
+        self.health = {"blue": dict(self.SUPPORTED), "green": {"status": "ok"}}
+        self.app.switch("green", 0)
+        self.assertEqual(self.signals, [("blue", "SIGUSR1")])
+
+    def test_failed_signal_does_not_fail_deploy(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.kill_fails = True
+        self.assertIs(self.app.deploy(CANDIDATE_REFERENCE, False, 5, 5), True)
+        self.assertEqual(self.app.state["active"], "green")
+        self.assertEqual(self.stops(), [("stop", "--timeout", "120", "blue")])
+
+    def test_drain_resignals_old_slot_only_while_it_has_connections(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.rows["green"] = counters("DRAIN", sessions=1)
+        self.assertIs(self.app.drain(4), True)
+        self.assertEqual(self.signals, [("green", "SIGUSR1")])
+        self.signals.clear()
+        self.rows["green"] = counters("DRAIN")
+        self.containers["green"]["Running"] = True
+        self.assertIs(self.app.drain(4), True)
+        self.assertEqual(self.signals, [])
+
+    def test_unconfirmed_switch_sends_no_signal(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        both_up = stats_csv({"blue": counters("UP"), "green": counters("UP")})
+        self.frames = [both_up, both_up]
+        with self.assertRaises(release.ReleaseError):
+            self.app.switch("green", 0)
+        self.assertEqual(self.signals, [])
+
+    def test_recover_abort_signals_restored_active_to_exit_and_candidate_to_enter(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.app.state["active"] = "green"
+        self.app.state["pending"] = {"previous": "blue", "target": "green"}
+        self.app.persist()
+        self.rows = {"blue": counters("DRAIN", sessions=1), "green": counters("UP", sessions=1)}
+        self.app.recover(0, abort=True)
+        self.assertEqual(self.signals, [("blue", "SIGUSR2"), ("green", "SIGUSR1")])
+
+    def test_status_reports_draining_when_available(self):
+        self.health = {"blue": dict(self.SUPPORTED), "green": dict(self.SUPPORTED, draining=True)}
+        self.containers["green"]["Running"] = True
+        self.app.status()
+        report = json.loads(self.output.call_args.args[0])
+        self.assertEqual(report["draining"], {"blue": False, "green": True})
+        self.health = {"blue": {"status": "ok"}, "green": None}
+        self.app.status()
+        report = json.loads(self.output.call_args.args[0])
+        self.assertEqual(report["draining"], {"blue": None, "green": None})
+        self.assertEqual(self.signals, [])
 
 
 class RollbackRecoveryTests(IsolatedReleaseTest):
@@ -802,7 +982,7 @@ class RollbackRecoveryTests(IsolatedReleaseTest):
         self.rows["green"] = counters("DRAIN", sessions=1)
         self.rows["blue"]["sessions"] = 1
         before_slots = copy.deepcopy(self.app.state["slots"])
-        self.assertIs(self.app.rollback(0, 0), False)
+        self.assertIs(self.app.rollback(0, 0, force_stop=False), False)
         self.assertEqual(self.app.state["active"], "green")
         self.assertEqual(self.app.state["slots"], before_slots)
         self.assertEqual(self.compose_actions(), [])

@@ -141,8 +141,11 @@ def main():
                 connections.append(response)
                 assert response.status == 200
                 sse_next(response, "blue")
-                assert app.deploy(images[1], False, 45, 0) is False, "Must retain busy old version"
+                assert app.deploy(images[1], False, 45, 0, force_stop=False) is False, "Must retain busy old version"
                 assert app.state["active"] == "green"
+                # The fixture's /health has no drain_mode_supported (like releases
+                # before drain mode): no SIGUSR1 may be sent, or Go would exit.
+                assert json.loads(docker("inspect", name + "-blue"))[0]["State"]["Running"]
                 assert app.stats()["blue"]["sessions"] >= 2
                 assert http_get(port) == "green"
                 assert echo(conn, "after-switch") == "blue:after-switch"
@@ -157,7 +160,7 @@ def main():
                 new_conn = websocket(port)
                 connections.append(new_conn)
                 assert echo(new_conn, "before-rollback") == "green:before-rollback"
-                assert app.rollback(45, 0) is False
+                assert app.rollback(45, 0, force_stop=False) is False
                 assert http_get(port) == "blue"
                 assert echo(conn, "old") == "blue:old"
                 assert echo(new_conn, "retained") == "green:retained"
@@ -178,6 +181,13 @@ def main():
                 app.wait_proxy("green", 30)
                 assert http_get(port) == "green"
                 results.append("subsequent-release-and-proxy-restart-keep-selected-version")
+                held = websocket(port)
+                connections.append(held)
+                assert echo(held, "held") == "green:held"
+                assert app.deploy(images[0], False, 45, 0) is True, "Default drain must force stop after timeout"
+                assert http_get(port) == "blue"
+                assert not json.loads(docker("inspect", name + "-green"))[0]["State"]["Running"]
+                results.append("drain-timeout-force-stops-old-slot-with-live-connection")
             print(json.dumps({"passed": results, "production_requests": 0}, indent=2), flush=True)
         except BaseException:
             for slot in ("edge", "blue", "green"):

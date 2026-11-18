@@ -10,7 +10,7 @@
              └── green ─┴── 原 PostgreSQL / Redis
 ```
 
-**保证范围：**正常发版不重启入口；旧 HTTP/SSE 响应和已升级的 WS 连接继续由旧应用处理。脚本只有在旧后端停止接收新请求、活动连接与排队数均为零、新后端仍健康时才停止旧应用。超时保留旧应用，退出码为 `2`；已有连接不会因为部署脚本的等待期限而被强制关闭。应用自身或上游的超时仍然生效。
+**保证范围：**正常发版不重启入口；旧 HTTP/SSE 响应和已升级的 WS 连接继续由旧应用处理。脚本在旧后端停止接收新请求、新后端仍健康的前提下，等旧后端活动连接与排队数归零后停止旧应用；排空等待（默认 180 秒）超时后**默认强制停止**旧应用，此时仍未结束的连接会被断开。需要保留旧应用等待自然排空时加 `--no-force-stop`（超时退出码 `2`，旧应用继续运行）。应用自身或上游的超时仍然生效。
 
 **适用范围：**Linux Docker Engine、Docker Compose v2+、Python 3.9+，标准 codex2api 镜像中提供 BusyBox `wget`，PostgreSQL + Redis，主要服务同步 HTTP、SSE 和 Responses WebSocket。Docker socket 权限等同宿主机管理权限。脚本使用本地 Unix socket 操作 HAProxy；建议以 `sudo python3` 运行。
 
@@ -71,18 +71,45 @@ sudo python3 /opt/codex2api/deploy/rolling/release.py deploy \
   muze/codex2api:YOUR_NEXT_VERSION --pull
 ```
 
-步骤是：确认备用槽没有旧连接 → 准备新版镜像 → 只启动备用应用 → 等应用健康和代理健康检查通过 → 切换新请求 → 等旧连接排空 → 只停止旧应用。默认启动等待 `180` 秒、排空等待 `300` 秒，可用 `--ready-timeout` / `--drain-timeout` 调整。
+步骤是：确认备用槽没有旧连接 → 准备新版镜像 → 只启动备用应用 → 等应用健康和代理健康检查通过 → 切换新请求 → 让旧应用进入排空模式 → 等旧连接排空（超时则强制停止）→ 只停止旧应用。默认启动等待 `180` 秒、排空等待 `180` 秒，可用 `--ready-timeout` / `--drain-timeout` 调整。
 
-HTTP keep-alive 的后续请求可去新版；正在传输的响应留在旧版。已升级的 WS 作为一条长连接保留在旧版，包括该连接上的后续 turn。长时间不关闭的 WS 可能让旧版长期保留；此时脚本不会覆盖该槽执行下一次发布。
+HTTP keep-alive 的后续请求可去新版；正在传输的响应留在旧版。已升级的 WS 作为一条长连接保留在旧版，包括该连接上的后续 turn。长时间不关闭的 WS 不再让旧版无限期保留：排空等待到期后默认强制停止。
+
+### 排空超时与强制停止
+
+- `deploy`、`rollback`、`drain` 的 `--drain-timeout` 默认 `180` 秒。超时时旧应用仍有连接或排队，默认执行与正常路径相同的 `docker compose stop --timeout 120 <旧槽>`，打印一行 `Drain timeout: force stopping ...`（含当时剩余连接数、排队数），退出码 `0`。
+- `--no-force-stop`：保持旧行为，超时后旧应用继续运行，退出码 `2`，稍后再运行 `drain`。
+- `--drain-timeout 0`：立即检查一次。无连接时停止旧应用；**有连接时默认立即强制停止**，带 `--no-force-stop` 时退出码 `2`。以前用 `drain --drain-timeout 0` 做“只检查一次”的操作习惯，现在必须加 `--no-force-stop`。
+- 强制停止与正常停止的安全前提相同，并在每次轮询（包括最后触发强制停止的那次）重新检查：活动槽在 HAProxy 中必须是 `UP`，旧槽必须是 `DRAIN`/`MAINT`，否则报错退出、不停止任何应用。只会停止非活动槽。
+- 强制停止时在途请求的实际宽限：`compose stop` 先发 SIGTERM，应用进入优雅关闭——停止后台任务，`http.Server.Shutdown` 最多等 **10 秒** 让在途 HTTP/SSE 响应结束（已升级的 WS 不在其等待范围内），随后完成收尾并退出，进程退出时剩余连接断开。`120` 秒是 Docker 发 SIGKILL 的上限，只在关闭收尾卡住时才会用到，不是在途请求可用的时长。
+
+### 排空模式（旧槽释放上游连接）
+
+上游出口代理按账号限制并发连接数。旧槽进入 DRAIN 后若仍握着大量空闲上游 WebSocket 连接，会挤占新槽的握手名额。支持排空模式的版本收到信号后：
+
+- **SIGUSR1 进入排空模式**：立即关闭空闲的上游 WS 连接（无会话槽位、空闲保留的会话连接、溢出兄弟连接等）并清除指向它们的续链绑定；之后每个请求结束时上游 WS 连接直接关闭、不再放回池里；关闭 HTTP 上游连接池中的空闲连接；下游 HTTP 服务关闭 keep-alive（空闲 keep-alive 连接关闭，在途响应带 `Connection: close`）。在途请求和在途的下游 WS 不会被主动断开；排空模式下新到的请求照常处理，只是用完即关。
+- 例外：仍存活的下游 WS 会话（`/v1/responses` WS 入站、realtime）最近一轮产出的响应如果绑定在某条空闲上游连接上，这条连接保留，否则该会话下一轮 `previous_response_id` 续链会得到“上下文不可用”。下游 WS 断开后，后台每 30 秒一次的巡检会关闭这些连接；强制停止时一并结束。
+- **SIGUSR2 退出排空模式**：恢复正常的连接保留和下游 keep-alive；已关闭的连接不重建。回滚到曾被排空的槽时使用。
+- 进入/退出各有一行日志：`[Drain] entered closed_idle_upstream_ws=<n> kept_busy_upstream_ws=<n> kept_downstream_bound_upstream_ws=<n> http_clients_idle_closed=<n>`、`[Drain] exited`。重复信号无副作用。调度、重试、计费和降智检测、令牌刷新等后台任务在排空模式下照常运行。
+- `/health` 新增 `drain_mode_supported`（该版本已注册信号处理，恒为 `true`）和 `draining`（当前是否处于排空模式）。
+
+脚本发信号的时机：`switch` 确认切换成功后，对新的活动槽发 SIGUSR2、对旧槽发 SIGUSR1；`drain` 开始时（旧槽仍有连接）对旧槽再发一次 SIGUSR1；`recover --abort` 对恢复为活动的槽发 SIGUSR2、另一槽发 SIGUSR1。信号用 `docker compose kill -s SIGUSR1 <槽>` 发送，发送失败只打印警告，不影响发版结果。
+
+**兼容旧版本：**Go 程序收到没有注册处理函数的 SIGUSR1/SIGUSR2 会直接终止进程，而旧槽可能仍是不支持排空模式的旧版本。因此脚本发信号前先在目标容器内用与容器健康检查相同的方式读取 `/health`（`wget -q -O - http://127.0.0.1:<应用端口>/health`，不带任何凭据），只有返回 JSON 中 `drain_mode_supported` 恰为 `true` 才发信号；容器未运行、读取失败、不是 JSON 或字段不存在时一律跳过，并打印 `Drain mode SIGUSR1 to <槽> skipped: <原因>`。对旧版本而言，流程与以前相同，只是超时后会强制停止。
 
 ```bash
-# 查看当前版本、切换日志状态和每个后端的连接/队列数（不打印凭据）
+# 查看当前版本、切换日志状态、每个后端的连接/队列数和 draining（不打印凭据；
+# 槽已停止或为旧版本时 draining 为 null）
 sudo python3 /opt/codex2api/deploy/rolling/release.py status
 
-# 等稍后旧连接结束，再完成清理
-sudo python3 /opt/codex2api/deploy/rolling/release.py drain --drain-timeout 300
+# 再等最多 180 秒让旧连接结束，超时强制停止旧应用
+sudo python3 /opt/codex2api/deploy/rolling/release.py drain
 
-# 把新请求切回上一个成功版本，保留当前版本尚未结束的连接
+# 只检查一次，有连接则保留旧应用（退出码 2）
+sudo python3 /opt/codex2api/deploy/rolling/release.py drain --drain-timeout 0 --no-force-stop
+
+# 把新请求切回上一个成功版本；当前版本尚未结束的连接在排空超时后被强制停止，
+# 需要保留时加 --no-force-stop
 sudo python3 /opt/codex2api/deploy/rolling/release.py rollback
 ```
 
@@ -100,7 +127,7 @@ sudo python3 /opt/codex2api/deploy/rolling/release.py recover --abort
 
 两种恢复都保留已有连接；之后运行 `drain`。不要手动删除操作日志或独立操作 HAProxy 的后端状态。运行中的发版命令持有宿主机文件锁，避免并行发版；进程退出后锁自动释放。
 
-退出码：`0` 完成；`2` 已切流但旧连接尚未排空，旧应用保留；`1` 检查或操作失败；`130` 被中断。自动化流水线应把 `2` 识别为“等待排空”，不要据此执行 `down` 或强制删容器。
+退出码：`0` 完成（包括排空超时后强制停止旧应用）；`2` 仅在 `--no-force-stop` 时出现，表示已切流但旧连接尚未排空，旧应用保留；`1` 检查或操作失败；`130` 被中断。自动化流水线应把 `2` 识别为“等待排空”，不要据此执行 `down` 或强制删容器。
 
 ## 部署边界
 
@@ -119,7 +146,7 @@ sudo python3 /opt/codex2api/deploy/rolling/release.py recover --abort
 python3 -m unittest discover -s deploy/rolling -p 'test_release.py' -v
 ```
 
-真实容器测试仅使用合成后端，建立 SSE 和 WS 后切流、回滚，验证旧连接继续收发、新请求进入新版、活跃槽不可覆盖、零连接才停止旧版，以及代理重启后保持已选版本：
+真实容器测试仅使用合成后端，建立 SSE 和 WS 后切流、回滚，验证旧连接继续收发、新请求进入新版、活跃槽不可覆盖、`--no-force-stop` 时零连接才停止旧版、代理重启后保持已选版本，以及默认排空超时后强制停止仍有连接的旧版。合成后端的 `/health` 不报告 `drain_mode_supported`，同时验证脚本不会向不支持的版本发信号：
 
 ```bash
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /tmp/rolling-fixture ./deploy/rolling/fixture
