@@ -233,6 +233,20 @@ func recyclePooledClientForRoute(account *auth.Account, proxyURL string, account
 	}
 }
 
+// CloseIdlePooledClientConnections 关闭所有池化 HTTP 上游 Client 的空闲连接（排空模式用）。
+// Client 留在池中，在途请求不受影响；返回处理的 Client 数。
+func CloseIdlePooledClientConnections() int {
+	count := 0
+	clientPool.Range(func(_, value any) bool {
+		if entry, ok := value.(*poolEntry); ok && entry != nil && entry.client != nil {
+			entry.client.CloseIdleConnections()
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 func recyclePooledClientForAccount(account *auth.Account) {
 	if account == nil {
 		return

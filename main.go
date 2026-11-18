@@ -24,7 +24,6 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
-	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
@@ -681,28 +680,9 @@ func main() {
 	// 但账号池读锁连续超过门槛一次都拿不到时视为疑似死锁,降 503 让
 	// healthcheck 重启实例——否则死锁实例会一直以 200 留在服务里。
 	healthProbe := &healthLockProbe{}
-	r.GET("/health", func(c *gin.Context) {
-		available, total, countsComplete := store.HealthCountsNonBlocking()
-		blocked := healthProbe.observe(total >= 0, time.Now())
-		if blocked >= healthStoreLockStallThreshold {
-			c.JSON(503, gin.H{
-				"status":          "unavailable",
-				"reason":          "account store lock stalled",
-				"blocked_seconds": int(blocked / time.Second),
-				"available":       available,
-				"total":           total,
-				"counts_complete": countsComplete,
-			})
-			return
-		}
-		c.JSON(200, gin.H{
-			"status":          "ok",
-			"build_version":   version.Current(),
-			"available":       available,
-			"total":           total,
-			"counts_complete": countsComplete,
-		})
-	})
+	// 蓝绿发布排空模式：信号处理在 HTTP 服务创建后注册，/health 报告其状态。
+	drainMode := newDrainController(defaultDrainModeHooks())
+	r.GET("/health", newHealthHandler(store.HealthCountsNonBlocking, healthProbe, drainMode))
 
 	// 6.5 启动安全状态自检 banner
 	printSecurityBanner(db, cfg, settings)
@@ -744,6 +724,13 @@ func main() {
 		ReadTimeout:       10 * time.Minute,
 		IdleTimeout:       120 * time.Second,
 	}
+	// 先注册排空信号再开始服务：/health 一旦可达并报告 drain_mode_supported，
+	// SIGUSR1/SIGUSR2 就不会再走 Go 的默认处理（直接终止进程）。
+	drainMode.SetHTTPKeepAlives(srv.SetKeepAlivesEnabled)
+	// 不在关闭流程中取消注册：取消后迟到的 SIGUSR1 会按默认行为直接终止进程，打断优雅关闭。
+	drainSignals := make(chan os.Signal, 4)
+	notifyDrainSignals(drainSignals)
+	go drainMode.run(drainSignals, nil)
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务启动失败: %v", err)

@@ -319,6 +319,9 @@ type Manager struct {
 
 	// 测试钩子：连接写入池后、首个 pending/read lease 建立前触发。
 	afterConnectionStored func(wc *WsConnection)
+
+	// 排空模式（蓝绿发布旧槽）：空闲连接立即关闭，请求结束后不再保留连接。见 drain_mode.go。
+	draining atomic.Bool
 }
 
 // responseConnBinding 记录某个 response_id 由哪条连接产出。
@@ -333,6 +336,9 @@ type responseConnBinding struct {
 	apiKey     string
 	model      string
 	expiresAt  time.Time
+	// downstreamDone 产出该响应的下游 WS 会话的结束信号（非下游 WS 请求为 nil）。
+	// 排空模式据此保留仍被存活下游会话续链依赖的空闲连接。
+	downstreamDone <-chan struct{}
 }
 
 const (
@@ -422,6 +428,7 @@ func (m *Manager) evictExpired() {
 	})
 	m.evictResponseConnBindings(time.Now())
 	m.trimAllIdleChatConnections()
+	m.sweepForDrainIfActive()
 }
 
 // Stop 停止管理器

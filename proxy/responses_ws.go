@@ -274,6 +274,7 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 	}
 	conn.SetReadLimit(int64(security.MaxRequestBodySize))
 	requestCtx, messages, readPumpDone, cancel := startResponsesWSReadPump(c.Request.Context(), conn)
+	requestCtx = WithDownstreamWebsocketSession(requestCtx)
 	c.Request = c.Request.WithContext(requestCtx)
 	stopDownstreamKeepalive := startDownstreamWSKeepalive(requestCtx, conn, cancel)
 	defer func() {

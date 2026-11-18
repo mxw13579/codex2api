@@ -43,6 +43,9 @@ func (m *Manager) retainReleasedConnection(wc *WsConnection) {
 	if !exists || current != wc || !wc.IsConnected() {
 		return
 	}
+	if m.releaseForDrainLocked(wc) {
+		return
+	}
 	if connectionBudgetKind(wc) == capacityBlank && connectionLimit(capacityBlank) == 0 && wc.session.PendingCount() == 0 {
 		m.discardConnectionFor(wc, closeCapacityReclaim)
 		return

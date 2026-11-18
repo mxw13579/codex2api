@@ -1,8 +1,12 @@
 package main
 
 import (
+	"net/http"
 	"sync"
 	"time"
+
+	"github.com/codex2api/internal/version"
+	"github.com/gin-gonic/gin"
 )
 
 // healthStoreLockStallThreshold 是 /health 判定账号池疑似死锁的门槛:
@@ -31,4 +35,36 @@ func (p *healthLockProbe) observe(lockAcquired bool, now time.Time) time.Duratio
 		p.blockedSince = now
 	}
 	return now.Sub(p.blockedSince)
+}
+
+// newHealthHandler 构造 /health:只做非阻塞的尽力统计,避免账号热路径锁竞争拖死 liveness。
+// drain_mode_supported/draining 供蓝绿发布脚本判断能否安全发送排空信号。
+func newHealthHandler(counts func() (available int, total int, complete bool), probe *healthLockProbe, drain *drainController) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		available, total, countsComplete := counts()
+		blocked := probe.observe(total >= 0, time.Now())
+		draining := drain.Draining()
+		if blocked >= healthStoreLockStallThreshold {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":               "unavailable",
+				"reason":               "account store lock stalled",
+				"blocked_seconds":      int(blocked / time.Second),
+				"available":            available,
+				"total":                total,
+				"counts_complete":      countsComplete,
+				"drain_mode_supported": drainModeSignalsSupported,
+				"draining":             draining,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":               "ok",
+			"build_version":        version.Current(),
+			"available":            available,
+			"total":                total,
+			"counts_complete":      countsComplete,
+			"drain_mode_supported": drainModeSignalsSupported,
+			"draining":             draining,
+		})
+	}
 }

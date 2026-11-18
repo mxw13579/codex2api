@@ -45,7 +45,7 @@ func (r *WsResponse) bindCompletedResponse(responseID string) {
 		return
 	}
 	r.manager.bindResponseConn(responseID, responseConnBinding{conn: r.conn, sessionKey: r.sessionID,
-		accountID: r.conn.session.AccountID, apiKey: r.apiKey, model: r.model})
+		accountID: r.conn.session.AccountID, apiKey: r.apiKey, model: r.model, downstreamDone: r.downstreamDone})
 }
 
 func (m *Manager) lookupContinuationConn(input websocketContinuation) (*WsConnection, string) {

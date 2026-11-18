@@ -305,6 +305,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		upstreamUserAgent: wc.upstreamUserAgent,
 		upstreamVersion:   wc.upstreamVersion,
 		cookieTrace:       wc.cookieTrace.BeginTurn(ctx, pr.RequestID, gjson.GetBytes(wsBody, "model").String()),
+		downstreamDone:    proxy.DownstreamWebsocketSessionDone(ctx),
 	}, nil
 }
 
@@ -498,6 +499,8 @@ type WsResponse struct {
 	upstreamUserAgent string
 	upstreamVersion   string
 	cookieTrace       *proxy.UpstreamCookieTrace
+	// downstreamDone 发起本请求的下游 WS 会话结束信号（非下游 WS 请求为 nil），随续链绑定保存。
+	downstreamDone <-chan struct{}
 	// connBroken 标记读流因上游 WS 异常(非正常关闭)或下游写入失败而终止；
 	// Close() 据此销毁坏连接而非归还连接池复用。受 mu 保护。
 	connBroken bool
