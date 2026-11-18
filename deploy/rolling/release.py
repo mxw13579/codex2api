@@ -391,6 +391,10 @@ class Release:
         # Persist the desired startup routing before changing live routing. A
         # crash is journaled; recover verifies health and completes this switch.
         atomic_write(self.root / "proxy" / "haproxy.cfg", haproxy_config(self.state, target))
+        # Before it receives traffic, make sure the target is not in drain mode
+        # (rolling back to a slot drained earlier). Best effort; the SIGUSR2
+        # after the confirmed switch is sent again below.
+        self.signal_drain_mode(target, enter=False)
         self.set_server(target, "ready")
         self.wait_proxy(target, timeout)
         self.set_server(previous, "drain")
@@ -465,15 +469,22 @@ class Release:
                 raise ReleaseError("Active application is not UP; retaining the previous application for rollback.")
             if not row["status"].startswith(("DRAIN", "MAINT")):
                 raise ReleaseError("Old application is not draining; refusing to stop it.")
+            if not signalled:
+                # Idempotent and best effort. The active slot must not stay in
+                # drain mode (a SIGUSR2 skipped or lost after an earlier switch);
+                # the old slot releases its idle upstreams while it still has
+                # connections. Signalling may take tens of seconds, so these
+                # counters are stale afterwards: poll again (no sleep) and
+                # re-check every safety gate before anything is stopped.
+                self.signal_drain_mode(self.state["active"], enter=False)
+                if row["sessions"] or row["queued"]:
+                    self.signal_drain_mode(old, enter=True)
+                signalled = True
+                continue
             if row["sessions"] == 0 and row["queued"] == 0:
                 self.compose("stop", "--timeout", "120", old)
                 print(f"{old} drained and stopped. Its image remains available for rollback.")
                 return True
-            if not signalled:
-                # Idempotent: switch() normally sent it already; a standalone
-                # drain (or one after an old switch) still releases idle upstreams.
-                self.signal_drain_mode(old, enter=True)
-                signalled = True
             if time.monotonic() >= deadline:
                 if force_stop:
                     print(f"Drain timeout: force stopping {old} with {row['sessions']} connections and {row['queued']} queued "

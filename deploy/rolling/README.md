@@ -93,7 +93,7 @@ HTTP keep-alive 的后续请求可去新版；正在传输的响应留在旧版�
 - 进入/退出各有一行日志：`[Drain] entered closed_idle_upstream_ws=<n> kept_busy_upstream_ws=<n> kept_downstream_bound_upstream_ws=<n> http_clients_idle_closed=<n>`、`[Drain] exited`。重复信号无副作用。调度、重试、计费和降智检测、令牌刷新等后台任务在排空模式下照常运行。
 - `/health` 新增 `drain_mode_supported`（该版本已注册信号处理，恒为 `true`）和 `draining`（当前是否处于排空模式）。
 
-脚本发信号的时机：`switch` 确认切换成功后，对新的活动槽发 SIGUSR2、对旧槽发 SIGUSR1；`drain` 开始时（旧槽仍有连接）对旧槽再发一次 SIGUSR1；`recover --abort` 对恢复为活动的槽发 SIGUSR2、另一槽发 SIGUSR1。信号用 `docker compose kill -s SIGUSR1 <槽>` 发送，发送失败只打印警告，不影响发版结果。
+脚本发信号的时机：`switch` 在目标槽接流量前先对它发一次 SIGUSR2，确认切换成功后再对新的活动槽发 SIGUSR2、对旧槽发 SIGUSR1；`drain` 第一轮安全检查通过后对当前活动槽补发 SIGUSR2，旧槽仍有连接时再对旧槽发 SIGUSR1，发完立即重新读取 HAProxy 计数并重新检查安全前提后才可能停止旧槽；任何路径都不会对当前活动槽发 SIGUSR1；`recover --abort` 对恢复为活动的槽发 SIGUSR2、另一槽发 SIGUSR1。信号用 `docker compose kill -s SIGUSR1 <槽>` 发送，发送失败只打印警告，不影响发版结果。
 
 **兼容旧版本：**Go 程序收到没有注册处理函数的 SIGUSR1/SIGUSR2 会直接终止进程，而旧槽可能仍是不支持排空模式的旧版本。因此脚本发信号前先在目标容器内用与容器健康检查相同的方式读取 `/health`（`wget -q -O - http://127.0.0.1:<应用端口>/health`，不带任何凭据），只有返回 JSON 中 `drain_mode_supported` 恰为 `true` 才发信号；容器未运行、读取失败、不是 JSON 或字段不存在时一律跳过，并打印 `Drain mode SIGUSR1 to <槽> skipped: <原因>`。对旧版本而言，流程与以前相同，只是超时后会强制停止。
 

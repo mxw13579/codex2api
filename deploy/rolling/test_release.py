@@ -28,6 +28,8 @@ SOURCE_IMAGE = "sha256:" + "1" * 64
 CANDIDATE_IMAGE = "sha256:" + "2" * 64
 CANDIDATE_REFERENCE = "synthetic.invalid/app:candidate"
 PROXY_IMAGE = "synthetic.invalid/haproxy@sha256:" + "3" * 64
+PROBE_BLUE = ("exec", "-T", "blue", "wget", "-q", "-O", "-", "http://127.0.0.1:8187/health")
+PROBE_GREEN = ("exec", "-T", "green", "wget", "-q", "-O", "-", "http://127.0.0.1:8187/health")
 
 
 def source_inspect():
@@ -440,6 +442,7 @@ class DrainTests(IsolatedReleaseTest):
                 self.rows["green"] = counters(status)
                 self.assertIs(self.app.drain(0), True)
                 self.assertEqual(self.events, [
+                    ("proxy", "show stat"), ("compose", PROBE_BLUE),
                     ("proxy", "show stat"), ("compose", ("stop", "--timeout", "120", "green")),
                 ])
                 self.assertTrue(self.containers["blue"]["Running"])
@@ -469,12 +472,13 @@ class DrainTests(IsolatedReleaseTest):
             counters("DRAIN", sessions=1), counters("DRAIN", queued=1), counters("DRAIN"),
         )]
         self.assertIs(self.app.drain(10), True)
-        probe = ("exec", "-T", "green", "wget", "-q", "-O", "-", "http://127.0.0.1:8187/health")
+        # First poll signals (active, then old) and re-polls without sleeping.
         self.assertEqual(self.events, [
-            ("proxy", "show stat"), ("compose", probe), ("proxy", "show stat"), ("proxy", "show stat"),
+            ("proxy", "show stat"), ("compose", PROBE_BLUE), ("compose", PROBE_GREEN),
+            ("proxy", "show stat"), ("proxy", "show stat"),
             ("compose", ("stop", "--timeout", "120", "green")),
         ])
-        self.assertEqual(self.clock.sleeps, [2, 2])
+        self.assertEqual(self.clock.sleeps, [2])
 
     def test_default_drain_timeout_is_three_minutes(self):
         self.assertEqual(release.DRAIN_TIMEOUT, 180)
@@ -799,7 +803,9 @@ class DeploymentTests(IsolatedReleaseTest):
         self.assertEqual(self.app.state["active"], "blue")
         self.assertEqual(self.disk_state()["pending"], {"target": "green", "previous": "blue"})
         self.assertTrue(all(item["Running"] for item in self.containers.values()))
-        self.docker.assert_not_called()
+        # Only the read-only pre-routing capability probe of the target ran.
+        self.assertEqual(self.compose_actions(), [])
+        self.assertEqual(self.health_probes(), ["green"])
 
     def test_proxy_rejection_keeps_pending_journal_without_stopping_containers(self):
         self.control.side_effect = None
@@ -809,7 +815,8 @@ class DeploymentTests(IsolatedReleaseTest):
         self.assertEqual(self.disk_state()["active"], "blue")
         self.assertEqual(self.disk_state()["pending"], {"target": "green", "previous": "blue"})
         self.assertTrue(all(item["Running"] for item in self.containers.values()))
-        self.docker.assert_not_called()
+        self.assertEqual(self.compose_actions(), [])
+        self.assertEqual(self.health_probes(), ["green"])
 
     def cli_with_old_connection(self, action, *extra):
         self.rows["blue"]["sessions"] = 1
@@ -859,7 +866,7 @@ class DrainSignalTests(IsolatedReleaseTest):
     def test_switch_skips_signals_for_release_without_drain_mode_field(self):
         self.app.switch("green", 0)
         self.assertEqual(self.signals, [])
-        self.assertEqual(self.health_probes(), ["green", "blue"])
+        self.assertEqual(self.health_probes(), ["green", "green", "blue"])
         printed = " ".join(str(call.args[0]) for call in self.output.call_args_list)
         self.assertIn("SIGUSR1 to blue skipped", printed)
         self.assertIn("SIGUSR2 to green skipped", printed)
@@ -875,12 +882,16 @@ class DrainSignalTests(IsolatedReleaseTest):
     def test_switch_signals_previous_to_enter_and_target_to_exit(self):
         self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
         self.app.switch("green", 0)
-        self.assertEqual(self.signals, [("green", "SIGUSR2"), ("blue", "SIGUSR1")])
-        # Signals follow the confirmed and persisted switch.
+        self.assertEqual(self.signals, [("green", "SIGUSR2"), ("green", "SIGUSR2"), ("blue", "SIGUSR1")])
         self.assertEqual(self.disk_state()["active"], "green")
-        kills = [i for i, (kind, value) in enumerate(self.events) if kind == "compose" and value[0] == "kill"]
+        kills = [(i, value) for i, (kind, value) in enumerate(self.events) if kind == "compose" and value[0] == "kill"]
+        ready = self.events.index(("proxy", "set server app/green state ready"))
         drain = self.events.index(("proxy", "set server app/blue state drain"))
-        self.assertTrue(all(index > drain for index in kills))
+        # (a) SIGUSR2 to the target before it receives traffic; after the
+        # confirmed switch SIGUSR2 again, then SIGUSR1 to the previous slot.
+        self.assertLess(kills[0][0], ready)
+        self.assertEqual(kills[0][1], ("kill", "-s", "SIGUSR2", "green"))
+        self.assertTrue(all(index > drain for index, _ in kills[1:]))
 
     def test_only_supported_slot_is_signalled(self):
         self.health = {"blue": dict(self.SUPPORTED), "green": {"status": "ok"}}
@@ -898,20 +909,87 @@ class DrainSignalTests(IsolatedReleaseTest):
         self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
         self.rows["green"] = counters("DRAIN", sessions=1)
         self.assertIs(self.app.drain(4), True)
-        self.assertEqual(self.signals, [("green", "SIGUSR1")])
+        # (b) The active slot leaves drain mode first, then the old slot enters it.
+        self.assertEqual(self.signals, [("blue", "SIGUSR2"), ("green", "SIGUSR1")])
         self.signals.clear()
         self.rows["green"] = counters("DRAIN")
         self.containers["green"]["Running"] = True
         self.assertIs(self.app.drain(4), True)
+        self.assertEqual(self.signals, [("blue", "SIGUSR2")])
+
+    def test_drain_signal_failure_does_not_change_result(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.kill_fails = True
+        self.rows["green"] = counters("DRAIN", sessions=1)
+        self.assertIs(self.app.drain(0, force_stop=False), False)
+        self.assertEqual(self.stops(), [])
+        self.assertIs(self.app.drain(0), True)
+        self.assertEqual(self.stops(), [("stop", "--timeout", "120", "green")])
+        self.health = {"blue": None, "green": None}
+        self.containers["green"]["Running"] = True
+        self.rows["green"] = counters("DRAIN")
+        self.assertIs(self.app.drain(0), True)
         self.assertEqual(self.signals, [])
 
-    def test_unconfirmed_switch_sends_no_signal(self):
+    def test_pre_routing_signal_failure_does_not_block_switch(self):
+        self.health = {"blue": {"status": "ok"}, "green": None}
+        self.app.switch("green", 0)
+        self.assertEqual(self.disk_state()["active"], "green")
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.kill_fails = True
+        self.app.switch("blue", 0)
+        self.assertEqual(self.disk_state()["active"], "blue")
+        self.assertEqual(self.signals, [])
+
+    def test_active_slot_never_receives_sigusr1(self):
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.rows["green"] = counters("DRAIN", sessions=1)
+        self.assertIs(self.app.drain(0), True)              # active blue
+        self.containers["green"]["Running"] = True
+        self.app.switch("green", 0)                          # active green
+        self.containers["blue"]["Running"] = True
+        self.rows["blue"] = counters("DRAIN", sessions=1)
+        self.assertIs(self.app.drain(0), True)
+        self.app.state["pending"] = {"previous": "blue", "target": "green"}
+        self.app.persist()
+        self.containers["blue"]["Running"] = True
+        self.app.recover(0, abort=True)                      # active blue again
+        # Replay the events: whichever slot HAProxy last made ready is active.
+        active, checked = "blue", 0
+        for kind, value in self.events:
+            if kind == "proxy" and value.endswith("state ready"):
+                active = value.split("/")[1].split()[0]
+            if kind == "compose" and value[:3] == ("kill", "-s", "SIGUSR1"):
+                self.assertNotEqual(value[3], active)
+                checked += 1
+        self.assertGreaterEqual(checked, 4)
+
+    def test_signalling_time_never_force_stops_on_stale_counters(self):
+        # The active slot goes DOWN while signals are being sent (they can take
+        # tens of seconds): the forced stop must re-read counters and refuse.
+        self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
+        self.rows["green"] = counters("DRAIN", sessions=1)
+        original = release.Release.signal_drain_mode
+
+        def slow_signal(slot, enter):
+            self.clock.now += 50
+            self.rows["blue"]["status"] = "DOWN"
+            return original(self.app, slot, enter)
+
+        self.patch(self.app, "signal_drain_mode", side_effect=slow_signal)
+        with self.assertRaises(release.ReleaseError):
+            self.app.drain(0)
+        self.assertEqual(self.stops(), [])
+        self.assertTrue(all(item["Running"] for item in self.containers.values()))
+
+    def test_unconfirmed_switch_sends_no_drain_signal(self):
         self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
         both_up = stats_csv({"blue": counters("UP"), "green": counters("UP")})
         self.frames = [both_up, both_up]
         with self.assertRaises(release.ReleaseError):
             self.app.switch("green", 0)
-        self.assertEqual(self.signals, [])
+        # Only the pre-routing exit signal to the target; nobody enters drain mode.
+        self.assertEqual(self.signals, [("green", "SIGUSR2")])
 
     def test_recover_abort_signals_restored_active_to_exit_and_candidate_to_enter(self):
         self.health = {slot: dict(self.SUPPORTED) for slot in release.SLOTS}
