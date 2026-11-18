@@ -24,6 +24,7 @@ import { Select } from "../components/ui/select";
 import { useToast } from "../hooks/useToast";
 import { getErrorMessage } from "../utils/error";
 import { refreshIntelligenceBars } from "../hooks/useIntelligenceBars";
+import { createUUID } from "../lib/uuid";
 import {
   intelligenceTargetConflict,
   type IntelligenceTargetConflict,
@@ -155,6 +156,10 @@ export default function IntelligenceCheck() {
   };
   const numeric = (
     key:
+      | "pause_initial_seconds"
+      | "pause_max_seconds"
+      | "recovery_initial_seconds"
+      | "recovery_min_seconds"
       | "interval_seconds"
       | "retry_seconds"
       | "timeout_seconds"
@@ -223,6 +228,36 @@ export default function IntelligenceCheck() {
                 />,
                 "保存后生效；关闭时仍可手动检测。",
               )}
+              <div className="col-span-full space-y-3 rounded-lg border p-4">
+                <h3 className="text-sm font-medium">自动检测来源</h3>
+                <p className="text-xs text-muted-foreground">按账号来源独立控制，不按所调用的模型名称分类。保存后停止该来源的新自动检测，手动立即检测不受影响；已有账号的单独开关保留。</p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {([
+                    ["codex", "GPT / Codex"],
+                    ["claude", "Claude"],
+                    ["grok", "Grok"],
+                    ["antigravity", "Antigravity"],
+                    ["kiro", "Kiro"],
+                  ] as const).map(([channel, label]) => (
+                    <label key={channel} className="flex items-center justify-between gap-3 rounded-md bg-muted/40 px-3 py-2 text-sm">
+                      <span>{label}</span>
+                      <Switch aria-label={`${label} 自动降智检测`}
+                        checked={settings.channels?.[channel] ?? (channel === "codex" || channel === "claude")}
+                        onCheckedChange={(value) => change("channels", {
+                          codex: settings.channels?.codex ?? true,
+                          claude: settings.channels?.claude ?? true,
+                          grok: settings.channels?.grok ?? false,
+                          antigravity: settings.channels?.antigravity ?? false,
+                          [channel]: value,
+                        })} />
+                    </label>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground">Antigravity 来源的 Claude 模型仍归 Antigravity。Grok 和 Antigravity 为新增支持，默认关闭，开启前请核对检测模型。</p>
+              </div>
+              {field("Grok 检测模型", <Input value={settings.grok_model ?? "grok-4.5"} onChange={(e) => change("grok_model", e.target.value)} />)}
+              {field("Antigravity 检测模型", <Input value={settings.antigravity_model ?? "gemini-3.8-flash-medium"} onChange={(e) => change("antigravity_model", e.target.value)} />)}
+              {field("Kiro 检测模型", <Input value={settings.kiro_model ?? "claude-sonnet-4.6"} onChange={(e) => change("kiro_model", e.target.value)} />)}
               {field(
                 "GPT / Codex 模型",
                 <Input
@@ -279,7 +314,7 @@ export default function IntelligenceCheck() {
                   checked={settings.new_accounts_enabled}
                   onCheckedChange={(v) => change("new_accounts_enabled", v)}
                 />,
-                "仅支持 Codex 和 Claude；切换分组时，仅同通道新账号默认参与。已有账号不受此选项影响。",
+                "仅对已开启来源的新账号生效；切换分组时，仅同来源新账号默认参与。已有账号不受此选项影响。",
               )}
             </CardContent>
           </Card>
@@ -293,6 +328,18 @@ export default function IntelligenceCheck() {
               {numeric("timeout_seconds", "请求超时（秒）", 1, 3600)}
               {numeric("concurrency", "全局检测并发", 1, 100)}
               {numeric("retention", "每账号保留记录", 1, 10000)}
+              <div className="sm:col-span-2">
+                {field("自适应检测", <Switch aria-label="自适应检测" checked={settings.adaptive_enabled ?? false} onCheckedChange={v => change("adaptive_enabled", v)} />,
+                  "暂停后未通过则间隔翻倍；检测正常后加速确认。恢复调度后，正常检测逐步减轻历史退避。关闭时沿用固定间隔。")}
+              </div>
+              {settings.adaptive_enabled && <>
+                {numeric("pause_initial_seconds", "暂停初始间隔（秒）", 1, 2592000)}
+                {numeric("pause_max_seconds", "暂停最大间隔（秒）", 1, 2592000)}
+                {numeric("recovery_initial_seconds", "恢复确认初始间隔（秒）", 1, 2592000)}
+                {numeric("recovery_min_seconds", "恢复确认最短间隔（秒）", 1, 2592000)}
+                <p className="text-xs text-muted-foreground sm:col-span-2">恢复确认间隔逐次减半（最短间隔至少一分钟时按整分钟向下取整），直到达到下方连续通过次数。实际等待有最多 10% 的提前抖动。最大间隔越长，发现恢复可能越晚。</p>
+              </>}
+
             </CardContent>
           </Card>
           <Card>
@@ -327,10 +374,10 @@ export default function IntelligenceCheck() {
                       }
                       placeholder="选择分组"
                       options={groups
-                        .filter(g => !g.channel || g.channel === "codex" || g.channel === "claude")
+                        .filter(g => !g.channel || ["codex", "claude", "grok", "antigravity", "kiro"].includes(g.channel))
                         .map(g => ({
                           value: String(g.id),
-                          label: `${g.name}（${g.channel === "claude" ? "Claude" : "Codex"}）`,
+                          label: `${g.name}（${({ codex: "Codex", claude: "Claude", grok: "Grok", antigravity: "Antigravity", kiro: "Kiro" } as Record<string, string>)[g.channel ?? "codex"] ?? g.channel}）`,
                         }))}
                     />,
                   )}
@@ -404,7 +451,7 @@ export default function IntelligenceCheck() {
                 </div>
               )}
               <p className="text-xs leading-relaxed text-muted-foreground">
-                上游错误不打断连续次数。人工修改调度或分组优先，并重置连续次数。关闭暂停策略不会自动释放已有暂停；关闭切组策略后，已切组账号仍可按恢复阈值还原原分组。检测暂停期间继续检测。
+                上游错误不计为降智；开启自适应时会中断恢复确认。人工修改调度或分组优先，并重置连续次数。关闭暂停策略不会自动释放已有暂停；关闭切组策略后，已切组账号仍可按恢复阈值还原原分组。检测暂停期间继续检测。
               </p>
             </CardContent>
           </Card>
@@ -418,7 +465,7 @@ export default function IntelligenceCheck() {
             <Button
               variant="outline"
               onClick={() => {
-                const id = crypto.randomUUID();
+                const id = createUUID();
                 change("questions", [
                   ...settings.questions,
                   {

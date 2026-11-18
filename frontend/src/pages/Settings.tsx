@@ -9,7 +9,7 @@ import CodexClientVersionsPanel from '../components/CodexClientVersionsPanel'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { AntigravityOAuthClientSetting, AntigravitySettingsResponse, ChannelTestSettings, CodexClientVersionSyncResult, CodexClientVersionTarget, CodexUserAgentCatalog, CodexUserAgentPreview, HealthResponse, ModelInfo, SiteBranding, SystemSettings, UpstreamChannel } from '../types'
+import type { AntigravityOAuthClientSetting, AntigravitySettingsResponse, ChannelTestSettings, CodexClientVersionSyncResult, CodexClientVersionTarget, CodexUserAgentCatalog, CodexUserAgentPreview, HealthResponse, KiroSettings, ModelInfo, SiteBranding, SystemSettings, UpstreamChannel } from '../types'
 import { ANTIGRAVITY_DEFAULT_MODELS, isAntigravityDisabledModel } from '../lib/antigravityModels'
 import { countPayloadRules, PAYLOAD_RULE_GROUPS } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
@@ -21,6 +21,12 @@ import {
   findClaudeTimezoneOption,
 } from '../lib/claudeAccountOptions'
 import { buildWritableSettingsPayload } from '../lib/settingsPayload'
+import { resolveByteLimitCommit } from '../lib/byteLimitCommit'
+import {
+  mergeConfirmedSettingsValues,
+  mergeConfirmedSettingsWithVersions,
+  resolveAutoSaveRollbackValues,
+} from '../lib/settingsAutoSave'
 import {
   DEFAULT_BAD_REQUEST_RETRY_SETTINGS,
   buildBadRequestRetryEnabledPatch,
@@ -50,6 +56,18 @@ import {
   type ResponseCacheBudgetMiB,
   type ResponseCacheBudgetValidationError,
 } from '../lib/responseCacheMetrics'
+import {
+  DEFAULT_OUTPUT_GUARD_SETTINGS,
+  KIB,
+  OUTPUT_GUARD_KEYS,
+  bytesToKiB,
+  kibToBytes,
+  omitOutputGuardFields,
+  preserveConfirmedGuardFields,
+  preserveOutputGuardFields,
+  validateOutputGuardHierarchy,
+  validateOutputGuardRanges,
+} from '../lib/outputGuardSettings'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -229,7 +247,7 @@ const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   pool_mix: {},
 }
 
-type SettingsTabKey = 'codex' | 'claude' | 'antigravity' | 'grok' | 'appearance' | 'general'
+type SettingsTabKey = 'codex' | 'claude' | 'antigravity' | 'grok' | 'kiro' | 'appearance' | 'general'
 // 设置项适用渠道（按后端消费点核对）：
 //   CODEX_ONLY   仅 Codex（Responses/WS、生图存储、Tier 计费、模型清单）
 //   CODEX_CLAUDE 依赖 5h/7d 用量窗口的逻辑，Codex 与 Claude 都会写该窗口
@@ -239,7 +257,7 @@ const CHANNELS_CODEX_ONLY: readonly UpstreamChannel[] = ['codex']
 const CHANNELS_CODEX_CLAUDE: readonly UpstreamChannel[] = ['codex', 'claude']
 const CHANNELS_STREAMING: readonly UpstreamChannel[] = ['codex', 'grok', 'antigravity']
 const CHANNELS_RELAY: readonly UpstreamChannel[] = ['codex', 'antigravity']
-const SETTINGS_TAB_KEYS: readonly SettingsTabKey[] = ['codex', 'claude', 'antigravity', 'grok', 'appearance', 'general']
+const SETTINGS_TAB_KEYS: readonly SettingsTabKey[] = ['codex', 'claude', 'antigravity', 'grok', 'kiro', 'appearance', 'general']
 const DEFAULT_SETTINGS_TAB: SettingsTabKey = 'codex'
 const HIDDEN_IMAGE_DRIVER_MODELS = new Set(['gpt-5.3-codex-spark', 'codex-auto-review', 'gpt-reserve'])
 const isSettingsTabKey = (value: string | null): value is SettingsTabKey =>
@@ -260,6 +278,7 @@ const LEGACY_SECTION_TABS: Record<string, SettingsTabKey> = {
   'settings-grok': 'grok',
   'settings-claude': 'claude',
   'settings-antigravity': 'antigravity',
+  'settings-kiro': 'kiro',
   'settings-appearance': 'appearance',
 }
 // 每个 Tab 内的分区目录：多于一个分区的 Tab 渲染侧边目录并按滚动位置高亮。
@@ -275,6 +294,7 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
   claude: [{ id: 'settings-claude', labelKey: 'settings.nav.claude', icon: <ChannelLogo channel="claude" size={16} /> }],
   antigravity: [{ id: 'settings-antigravity', labelKey: 'settings.nav.antigravity', icon: <ChannelLogo channel="antigravity" size={16} /> }],
   grok: [{ id: 'settings-grok', labelKey: 'settings.nav.grok', icon: <ChannelLogo channel="grok" size={16} /> }],
+  kiro: [{ id: 'settings-kiro', labelKey: 'settings.nav.kiro', icon: <ChannelLogo channel="kiro" size={16} /> }],
   appearance: [{ id: 'settings-appearance', labelKey: 'settings.nav.appearance', icon: <Palette /> }],
   general: [
     { id: 'settings-overview', labelKey: 'settings.nav.overview', icon: <Activity /> },
@@ -288,7 +308,15 @@ const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: str
 // 分区滚动高亮的判定线：分区顶部越过视口该高度即视为当前分区（要盖过粘性 Tab 栏）。
 const SETTINGS_SECTION_SPY_OFFSET_PX = 140
 // 手动保存字段的脏检查里跳过的键：生成号是服务端只读，自定义 Prompt 规则由规则页单独保存。
-const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'prompt_filter_custom_patterns', 'codex_images_default_main_model', 'codex_egress'])
+const SETTINGS_DIRTY_IGNORED_KEYS: ReadonlySet<string> = new Set(['response_cache_config_generation', 'output_guard_config_generation', 'prompt_filter_custom_patterns', 'codex_images_default_main_model', 'codex_egress'])
+
+// 以 KiB/MiB 展示、blur 自动保存的字节上限字段：展示值是四舍五入后的整数，
+// blur 提交必须回到持久化的原始字节值判断，否则未编辑的字段也会被舍入改写。
+type ByteLimitField =
+  | 'output_guard_max_tool_argument_bytes'
+  | 'output_guard_max_channel_bytes'
+  | 'output_guard_max_request_bytes'
+  | 'models_list_read_max_bytes'
 
 const getDefaultModelMappingEntries = (): ModelMappingEntry[] =>
   Object.entries(DEFAULT_CLAUDE_MODEL_MAP) as ModelMappingEntry[]
@@ -817,8 +845,9 @@ const SETTINGS_CARD_GRID_2 = 'grid gap-4 lg:grid-cols-2 lg:items-stretch'
 // Claude / Antigravity 渠道的连通性测试卡片:独立于全局 test_model/test_content(那是
 // Codex 语义),按渠道保存默认探测模型与测活内容;留空模型 = 按账号目录自动选。
 const CLAUDE_TEST_MODEL_CHOICES = ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5', 'claude-opus-4-5', 'claude-sonnet-4-5']
+const KIRO_TEST_MODEL_CHOICES = ['claude-haiku-4.5', 'claude-sonnet-4.6', 'claude-sonnet-4.5', 'claude-opus-4.6']
 
-function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'claude' }) {
+function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'claude' | 'kiro' }) {
   const { t } = useTranslation()
   const { showToast } = useToast()
   const [settings, setSettings] = useState<ChannelTestSettings | null>(null)
@@ -867,7 +896,7 @@ function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'cl
   const modelChoices = useMemo(() => {
     const base = catalogChoices.length > 0
       ? catalogChoices
-      : channel === 'antigravity' ? [...ANTIGRAVITY_DEFAULT_MODELS] : CLAUDE_TEST_MODEL_CHOICES
+      : channel === 'antigravity' ? [...ANTIGRAVITY_DEFAULT_MODELS] : channel === 'kiro' ? KIRO_TEST_MODEL_CHOICES : CLAUDE_TEST_MODEL_CHOICES
     const current = settings?.test_model?.trim() ?? ''
     const list = current && !base.includes(current) ? [current, ...base] : base
     return [
@@ -881,7 +910,7 @@ function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'cl
   return (
     <SettingsCard
       title={t('settings.connectivityTest')}
-      description={t(channel === 'antigravity' ? 'settings.channelTest.antigravityDesc' : 'settings.channelTest.claudeDesc')}
+      description={t(channel === 'antigravity' ? 'settings.channelTest.antigravityDesc' : channel === 'kiro' ? 'settings.channelTest.kiroDesc' : 'settings.channelTest.claudeDesc')}
       icon={<Wifi className="size-4" />}
     >
       <div className="space-y-4">
@@ -924,6 +953,65 @@ function ChannelConnectivityTestCard({ channel }: { channel: 'antigravity' | 'cl
             className={cn(
               'flex min-h-[88px] w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-xs transition-colors placeholder:text-muted-foreground focus-visible:border-ring focus-visible:outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50',
             )}
+          />
+        </SettingField>
+      </div>
+    </SettingsCard>
+  )
+}
+
+// Kiro 渠道设置:上游域名(AWS 默认 / kiro.dev)与本地 prompt cache 模拟(默认关,
+// 只在上游没给精确用量时按 cache_control 断点估算 cache 读写拆分)。改动即时生效。
+function KiroSettingsCard() {
+  const { t } = useTranslation()
+  const { showToast } = useToast()
+  const [settings, setSettings] = useState<KiroSettings | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let active = true
+    void api.getKiroSettings().then((response) => {
+      if (active) setSettings(response)
+    }).catch((error) => {
+      if (active) showToast(getErrorMessage(error), 'error')
+    })
+    return () => {
+      active = false
+    }
+  }, [showToast])
+
+  const save = useCallback(async (patch: Partial<KiroSettings>) => {
+    setSaving(true)
+    try {
+      setSettings(await api.updateKiroSettings(patch))
+      showToast(t('settings.kiro.saved'), 'success')
+    } catch (error) {
+      showToast(getErrorMessage(error), 'error')
+    } finally {
+      setSaving(false)
+    }
+  }, [showToast, t])
+
+  return (
+    <SettingsCard title={t('settings.kiro.title')} description={t('settings.kiro.description')} icon={<SlidersHorizontal className="size-4" />}>
+      <div className={SETTINGS_ROW_LIST}>
+        <SettingField label={t('settings.kiro.apiDomain')} description={t('settings.kiro.apiDomainDesc')} layout="row">
+          <SegmentedPillGroup
+            value={settings?.api_domain ?? 'amazonaws'}
+            onChange={(value) => void save({ api_domain: value })}
+            disabled={settings === null || saving}
+            options={[
+              { value: 'amazonaws', label: t('settings.kiro.apiDomainAws') },
+              { value: 'kiro', label: t('settings.kiro.apiDomainKiro') },
+            ]}
+          />
+        </SettingField>
+        <SettingField label={t('settings.kiro.cacheSimulation')} description={t('settings.kiro.cacheSimulationDesc')} layout="row">
+          <Switch
+            aria-label={t('settings.kiro.cacheSimulation')}
+            checked={settings?.cache_simulation ?? false}
+            disabled={settings === null || saving}
+            onCheckedChange={(checked) => void save({ cache_simulation: checked })}
           />
         </SettingField>
       </div>
@@ -1099,6 +1187,7 @@ function AntigravityQuotaSettingsCard() {
   }, [showToast, t])
 
   const intervalMinutes = settings?.quota_refresh_interval_minutes ?? 10
+  const expiryHorizonHours = settings?.expiry_priority_horizon_hours ?? 24
 
   return (
     <SettingsCard
@@ -1114,6 +1203,7 @@ function AntigravityQuotaSettingsCard() {
               <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.refreshEnabledHint')}</p>
             </div>
             <Switch
+              aria-label={t('antigravityQuota.refreshEnabled')}
               checked={settings?.quota_refresh_enabled ?? false}
               disabled={settings === null || saving}
               onCheckedChange={(checked) => void save({ quota_refresh_enabled: checked })}
@@ -1125,17 +1215,49 @@ function AntigravityQuotaSettingsCard() {
               <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.gateEnabledHint')}</p>
             </div>
             <Switch
+              aria-label={t('antigravityQuota.gateEnabled')}
               checked={settings?.quota_gate_enabled ?? false}
               disabled={settings === null || saving}
               onCheckedChange={(checked) => void save({ quota_gate_enabled: checked })}
             />
           </div>
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 px-3 py-2.5">
+            <div className="min-w-0">
+              <div className="text-sm font-medium">{t('antigravityQuota.expiryPriority')}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">{t('antigravityQuota.expiryPriorityHint')}</p>
+            </div>
+            <Switch
+              aria-label={t('antigravityQuota.expiryPriority')}
+              checked={settings?.expiry_priority_enabled ?? false}
+              disabled={settings === null || saving}
+              onCheckedChange={(checked) => void save({ expiry_priority_enabled: checked })}
+            />
+          </div>
         </div>
+        <SettingField
+          label={t('antigravityQuota.expiryHorizon')}
+          description={t('antigravityQuota.expiryHorizonHint')}
+        >
+          <DraftNumberInput
+            aria-label={t('antigravityQuota.expiryHorizon')}
+            value={expiryHorizonHours}
+            min={1}
+            max={168}
+            integer
+            disabled={settings === null || saving || !settings?.expiry_priority_enabled}
+            className="max-w-32"
+            onValueCommit={(value) => {
+              if (value !== expiryHorizonHours) void save({ expiry_priority_horizon_hours: value })
+            }}
+            onValueChange={() => {}}
+          />
+        </SettingField>
         <SettingField
           label={t('antigravityQuota.refreshInterval')}
           description={t('antigravityQuota.refreshIntervalHint')}
         >
           <DraftNumberInput
+            aria-label={t('antigravityQuota.refreshInterval')}
             value={intervalMinutes}
             min={3}
             max={60}
@@ -2291,6 +2413,7 @@ const VISIBLE_CHANNEL_LABELS: Record<UpstreamChannel, string> = {
   claude: 'Claude',
   antigravity: 'Antigravity',
   grok: 'Grok',
+  kiro: 'Kiro',
 }
 
 // 供应商显示选择器：一排可多选的胶囊，点一下即保存；兜底渠道锁定在选中态。
@@ -2554,6 +2677,7 @@ export default function Settings() {
     { label: t('settings.schedulerModeRoundRobin'), value: 'round_robin' },
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
     { label: t('settings.schedulerModeFillFirst'), value: 'fill_first' },
+    { label: t('settings.schedulerModeReset5hFirst'), value: 'reset_5h_first' },
   ]
   const schedulerEngineOptions = [
     { label: t('settings.schedulerEngineLegacy'), value: 'legacy' },
@@ -2660,7 +2784,6 @@ export default function Settings() {
       codex_upstream_cookie_log_enabled: cacheNormalized.codex_upstream_cookie_log_enabled ?? false,
       codex_telemetry_enabled: cacheNormalized.codex_telemetry_enabled ?? false,
       codex_telemetry_timing_debug: cacheNormalized.codex_telemetry_timing_debug ?? false,
-      codex_unified_client_identity_enabled: cacheNormalized.codex_unified_client_identity_enabled ?? false,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
       first_token_mode: 'loose',
       models_list_read_max_bytes:
@@ -2716,7 +2839,6 @@ export default function Settings() {
     codex_upstream_cookie_log_enabled: false,
     codex_telemetry_enabled: false,
     codex_telemetry_timing_debug: false,
-    codex_unified_client_identity_enabled: false,
     codex_request_compression: true,
     codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
@@ -2783,6 +2905,12 @@ export default function Settings() {
     response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
     response_cache_write_policy: 'always',
     response_cache_config_generation: 0,
+    output_guard_enabled: false,
+    output_guard_max_tool_argument_bytes: 262144,
+    output_guard_max_tool_argument_deltas: 4096,
+    output_guard_max_channel_bytes: 2097152,
+    output_guard_max_request_bytes: 4194304,
+    output_guard_config_generation: 0,
     relay_model_cooldown_mode: 'off',
     relay_model_cooldown_seconds: 2,
     relay_model_cooldown_backoff_enabled: false,
@@ -2872,6 +3000,24 @@ export default function Settings() {
   const responseCacheValidationMessage = responseCacheValidationError
     ? t(`settings.responseCache.validation.${responseCacheValidationError}`)
     : ''
+  const outputGuardValidationMessage = useMemo(
+    () => validateOutputGuardRanges({
+      output_guard_max_tool_argument_bytes: settingsForm.output_guard_max_tool_argument_bytes,
+      output_guard_max_tool_argument_deltas: settingsForm.output_guard_max_tool_argument_deltas,
+      output_guard_max_channel_bytes: settingsForm.output_guard_max_channel_bytes,
+      output_guard_max_request_bytes: settingsForm.output_guard_max_request_bytes,
+    }) ?? validateOutputGuardHierarchy({
+      output_guard_max_tool_argument_bytes: settingsForm.output_guard_max_tool_argument_bytes,
+      output_guard_max_channel_bytes: settingsForm.output_guard_max_channel_bytes,
+      output_guard_max_request_bytes: settingsForm.output_guard_max_request_bytes,
+    }),
+    [
+      settingsForm.output_guard_max_tool_argument_bytes,
+      settingsForm.output_guard_max_tool_argument_deltas,
+      settingsForm.output_guard_max_channel_bytes,
+      settingsForm.output_guard_max_request_bytes,
+    ],
+  )
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -2892,6 +3038,11 @@ export default function Settings() {
   const backgroundFileInputRef = useRef<HTMLInputElement>(null)
   const persistedBrandingRef = useRef<Partial<SiteBranding> | null>(null)
   const settingsFormRef = useRef(settingsForm)
+  // 最后一次被服务器确认的设置快照（首次加载成功或自动/手动保存成功后更新）。
+  // 键入型字段在 blur 提交前已同步进 settingsFormRef，自动保存失败若按该值
+  // 回滚，会把从未被服务端接受的草稿留在界面上；回滚必须以本快照为准。
+  const confirmedSettingsRef = useRef<SystemSettings | null>(null)
+  const confirmedFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
   const autoSaveStatusTimerRef = useRef<number | null>(null)
@@ -2987,7 +3138,6 @@ export default function Settings() {
       ...previous,
       ...patch,
     })
-    const rollbackPatch = getSettingsPatchValues(previous, patchKeys)
     markPersisted(getSettingsPatchValues(optimistic, patchKeys))
     const requestedVersions: Record<string, number> = {}
 
@@ -3007,6 +3157,26 @@ export default function Settings() {
 
     try {
       const updated = await api.updateSettings(getSettingsPatchValues(optimistic, patchKeys))
+      // 本次请求提交的字段已被服务器确认；记录到快照里，"最后一次服务器确认
+      // 的设置"才能作为后续失败的可靠回滚目标。
+      // 为每个字段检查版本：若同一字段有更新版本的响应已提前到达，旧响应不应覆盖新基线。
+      const mergedConfirmedState = mergeConfirmedSettingsWithVersions(
+        confirmedSettingsRef.current,
+        confirmedFieldVersionsRef.current,
+        getSettingsPatchValues(updated, patchKeys),
+        requestedVersions,
+      )
+      const confirmedWithGeneration = mergedConfirmedState.confirmed && typeof updated.output_guard_config_generation === 'number'
+        ? {
+            ...mergedConfirmedState.confirmed,
+            output_guard_config_generation: Math.max(
+              mergedConfirmedState.confirmed.output_guard_config_generation || 0,
+              updated.output_guard_config_generation,
+            ),
+          }
+        : mergedConfirmedState.confirmed
+      confirmedSettingsRef.current = confirmedWithGeneration
+      confirmedFieldVersionsRef.current = mergedConfirmedState.confirmedVersions
       const mergeKeys = patchKeys.filter((key) => {
         const fieldKey = String(key)
         return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
@@ -3019,15 +3189,25 @@ export default function Settings() {
             updated.response_cache_config_generation,
           )
         : currentSettings.response_cache_config_generation
+      const outputGuardRequest = patchKeys.some(
+        (key) => OUTPUT_GUARD_KEYS.includes(key as (typeof OUTPUT_GUARD_KEYS)[number]),
+      )
+      const mergedOutputGuardGeneration = outputGuardRequest && typeof updated.output_guard_config_generation === 'number'
+        ? Math.max(currentSettings.output_guard_config_generation || 0, updated.output_guard_config_generation)
+        : currentSettings.output_guard_config_generation
       if (
         mergeKeys.length > 0
         || mergedResponseCacheGeneration !== currentSettings.response_cache_config_generation
+        || mergedOutputGuardGeneration !== currentSettings.output_guard_config_generation
       ) {
         commitSettingsForm({
           ...currentSettings,
           ...getSettingsPatchValues(updated, mergeKeys),
           ...(responseCacheRequest
             ? { response_cache_config_generation: mergedResponseCacheGeneration }
+            : {}),
+          ...(outputGuardRequest
+            ? { output_guard_config_generation: mergedOutputGuardGeneration }
             : {}),
         })
         markPersisted(getSettingsPatchValues(updated, mergeKeys))
@@ -3043,11 +3223,18 @@ export default function Settings() {
         return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
       })
       if (rollbackKeys.length > 0) {
+        // 回滚到最后的服务器确认值，而不是提交前的表单值：键入型字段在 blur
+        // 提交前就把草稿写进了 settingsFormRef，那个值从未被服务端接受。
+        const rollbackValues = resolveAutoSaveRollbackValues(
+          confirmedSettingsRef.current,
+          previous,
+          rollbackKeys,
+        )
         commitSettingsForm({
           ...settingsFormRef.current,
-          ...getSettingsPatchValues({ ...previous, ...rollbackPatch }, rollbackKeys),
+          ...rollbackValues,
         })
-        markPersisted(getSettingsPatchValues({ ...previous, ...rollbackPatch }, rollbackKeys))
+        markPersisted(rollbackValues)
       }
       const message = getErrorMessage(error)
       showToast(`${t('settings.autoSaveFailed')}: ${message}`, 'error')
@@ -3067,6 +3254,28 @@ export default function Settings() {
       }
     })
   }, [autoSaveSettingsPatch, badRequestRetryMaxRetriesDraft])
+
+  // 字节上限输入框的 blur 提交：展示单位值没变时不做任何写入，并保留持久化的
+  // 原始字节值，避免把 131073 这类非整倍数值舍入成 131072。基准取持久化快照
+  // 而不是当前表单值——键入时表单已经变成换算后的新字节值了。
+  const commitByteLimitField = useCallback((
+    field: ByteLimitField,
+    submittedUnits: number,
+    bytesPerUnit: number,
+  ) => {
+    const decision = resolveByteLimitCommit(
+      persistedSettings?.[field],
+      submittedUnits,
+      bytesPerUnit,
+    )
+    if (!decision.submit) {
+      if (settingsFormRef.current[field] !== decision.bytes) {
+        commitSettingsForm({ ...settingsFormRef.current, [field]: decision.bytes })
+      }
+      return
+    }
+    void autoSaveSettingsPatch({ [field]: decision.bytes })
+  }, [autoSaveSettingsPatch, commitSettingsForm, persistedSettings])
 
   const autoSaveContinuousRetryPatch = useCallback((patch: Partial<SystemSettings>) => {
     return continuousRetrySaveQueueRef.current(() => autoSaveSettingsPatch(patch))
@@ -3178,6 +3387,8 @@ export default function Settings() {
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
     setPersistedSettings(commitSettingsForm(settings))
+    // commitSettingsForm 已把归一化后的加载结果同步进 settingsFormRef。
+    confirmedSettingsRef.current = settingsFormRef.current
     const branding = {
       site_name: settings.site_name,
       site_logo: settings.site_logo,
@@ -3227,11 +3438,21 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const payload: Partial<SystemSettings> = omitBadRequestRetrySettings(buildWritableSettingsPayload(normalized))
+      const payload: Partial<SystemSettings> = omitBadRequestRetrySettings(omitOutputGuardFields(buildWritableSettingsPayload(normalized)))
       // 自定义 Prompt 规则由规则页单独保存，避免普通设置提交覆盖并发发布结果。
       delete payload.prompt_filter_custom_patterns
+      // 失控防护字段只走自动保存：整表单提交会把手动打开页面时读到的陈旧快照
+      // 连同新 generation 一起上送，可能覆盖其他管理员刚改过、甚至刚关闭的 guard。
       const updated = await api.updateSettings(payload)
-      setPersistedSettings(commitSettingsForm(updated))
+      // 手动保存成功后以服务器响应更新表单，但必须保留当前本地的 guard 字段，
+      // 防止保存期间或之前通过 autosave 生效的新 guard 值被手动响应里的旧 guard 字段冲回。
+      const safeMerged = preserveOutputGuardFields(updated, settingsFormRef.current)
+      setPersistedSettings(commitSettingsForm(safeMerged))
+      // 手动保存同样刷新"最后一次服务器确认"快照，后续自动保存失败时不会
+      // 回滚到这次手动保存之前的旧值。这里只把非 guard 字段从表单复制到确认快照；
+      // 若响应中的 generation 大于确认快照，则同步采纳服务器 guard 字段与 generation，
+      // 否则保留确认快照中已有的 guard 字段，避免把在途 autosave 的未确认 guard 值带进快照。
+      confirmedSettingsRef.current = preserveConfirmedGuardFields(settingsFormRef.current, confirmedSettingsRef.current, updated)
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -3717,6 +3938,7 @@ export default function Settings() {
         { id: 'claude', label: t('settings.nav.claude'), icon: <ChannelLogo channel="claude" size={16} /> },
         { id: 'antigravity', label: t('settings.nav.antigravity'), icon: <ChannelLogo channel="antigravity" size={16} /> },
         { id: 'grok', label: t('settings.nav.grok'), icon: <ChannelLogo channel="grok" size={16} /> },
+        { id: 'kiro', label: t('settings.nav.kiro'), icon: <ChannelLogo channel="kiro" size={16} /> },
         { id: 'appearance', label: t('settings.nav.appearance'), icon: <Palette className="size-4" /> },
         { id: 'general', label: t('settings.nav.general'), icon: <SlidersHorizontal className="size-4" /> },
       ] as const satisfies ReadonlyArray<{ id: SettingsTabKey; label: string; icon: ReactNode }>,
@@ -5079,24 +5301,6 @@ export default function Settings() {
                     </>
                   )}
                 </div>
-                <div className="mt-4 border-t border-border/60 pt-4">
-                  <SettingField
-                    label={t('settings.codexUnifiedClientIdentity')}
-                    description={t('settings.codexUnifiedClientIdentityDesc')}
-                    layout="row"
-                  >
-                    <Switch
-                      aria-label={t('settings.codexUnifiedClientIdentity')}
-                      checked={settingsForm.codex_unified_client_identity_enabled}
-                      onCheckedChange={(checked) => autoSaveBooleanField('codex_unified_client_identity_enabled', checked)}
-                    />
-                  </SettingField>
-                  {settingsForm.codex_unified_client_identity_enabled && settingsForm.client_compat_mode !== 'force' ? (
-                    <p className="mt-2 text-[11px] leading-relaxed text-amber-600 dark:text-amber-400 sm:text-xs">
-                      {t('settings.codexUnifiedClientIdentityCompatHint')}
-                    </p>
-                  ) : null}
-                </div>
               </SettingsCard>
               </SettingsSection>
 
@@ -5294,6 +5498,13 @@ export default function Settings() {
                 <ClaudeCodeSettingsCard />
               </SettingsSection>
             </>
+          ) : null}
+
+          {activeTab === 'kiro' ? (
+            <SettingsSection id="settings-kiro" title={t('settings.nav.kiro')} description={t('settings.nav.kiroDesc')} icon={<ChannelLogo channel="kiro" size={16} />}>
+              <ChannelConnectivityTestCard channel="kiro" />
+              <KiroSettingsCard />
+            </SettingsSection>
           ) : null}
 
           {activeTab === 'antigravity' ? (
@@ -6268,9 +6479,9 @@ export default function Settings() {
                     </div>
                     <SettingField
                       label={t('settings.schedulerMode')}
-                      description={t('settings.schedulerModeDesc')}
-                      warning={settingsForm.scheduler_engine !== 'legacy' ? undefined : t('settings.schedulerModeRequiresFast')}
-                      className={cn(settingsForm.scheduler_engine === 'legacy' && 'opacity-60')}
+                      description={settingsForm.scheduler_mode === 'reset_5h_first' ? t('settings.schedulerModeReset5hFirstDesc') : t('settings.schedulerModeDesc')}
+                      warning={settingsForm.scheduler_engine !== 'legacy' || settingsForm.scheduler_mode === 'reset_5h_first' ? undefined : t('settings.schedulerModeRequiresFast')}
+                      className={cn(settingsForm.scheduler_engine === 'legacy' && settingsForm.scheduler_mode !== 'reset_5h_first' && 'opacity-60')}
                     >
                       <SegmentedPillGroup
                         value={settingsForm.scheduler_mode}
@@ -6373,9 +6584,7 @@ export default function Settings() {
                             }))
                           }
                           onValueCommit={(value) =>
-                            void autoSaveSettingsPatch({
-                              models_list_read_max_bytes: mibToBytes(value),
-                            })
+                            commitByteLimitField('models_list_read_max_bytes', value, MIB)
                           }
                         />
                         <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-muted-foreground">
@@ -6749,6 +6958,151 @@ export default function Settings() {
                         <Switch
                           checked={settingsForm.prompt_filter_enabled}
                           onCheckedChange={(checked) => autoSaveBooleanField('prompt_filter_enabled', checked)}
+                        />
+                      </SettingField>
+                    </div>
+                  </div>
+                </SettingsCard>
+
+                <SettingsCard
+                  title="模型输出失控防护"
+                  description="全局实时监控工具参数持续重复、细碎 delta 泛洪与通道/请求级字节预算超限"
+                  icon={<ShieldAlert className="size-4" />}
+                  tone={settingsForm.output_guard_enabled ? 'default' : 'danger'}
+                  channels={ALL_UPSTREAM_CHANNELS}
+                  badge={
+                    <Badge variant={settingsForm.output_guard_enabled ? 'outline' : 'destructive'} className="text-[11px] gap-1">
+                      <span className={`size-1.5 rounded-full ${settingsForm.output_guard_enabled ? 'bg-emerald-400' : 'bg-red-500'}`} />
+                      {settingsForm.output_guard_enabled ? '已启用全局防护' : '已关闭 (高风险)'}
+                    </Badge>
+                  }
+                  footer={
+                    <div className="flex justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="text-xs h-7 gap-1"
+                        onClick={() => {
+                          const patch = { ...DEFAULT_OUTPUT_GUARD_SETTINGS }
+                          setSettingsForm((prev) => ({ ...prev, ...patch }))
+                          void autoSaveSettingsPatch(patch)
+                        }}
+                      >
+                        <RotateCcw className="size-3" />
+                        恢复默认防护
+                      </Button>
+                    </div>
+                  }
+                >
+                  <div className="space-y-4">
+                    {!settingsForm.output_guard_enabled && (
+                      <div className="rounded-xl border border-destructive/30 bg-destructive/10 p-3.5 text-xs text-destructive flex items-start gap-2">
+                        <ShieldAlert className="size-4 shrink-0 mt-0.5" />
+                        <div>
+                          <p className="font-semibold">高风险操作警告：失控防护已全局关闭</p>
+                          <p className="opacity-90">关闭后模型失控生成死循环、重复代码或细碎 arguments delta 时，将直接击穿代理并在下游引发 O(n²) 全量重解析雪崩。仅用于临时诊断，请尽快重新开启！</p>
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="rounded-xl border bg-muted/20 p-3.5 text-xs text-muted-foreground space-y-1.5">
+                      <p className="font-medium text-foreground">开启前请注意</p>
+                      <ul className="list-disc pl-4 space-y-1">
+                        <li><span className="font-medium text-foreground">CPU 开销</span>：开启后需对每条模型输出流做重复扫描与预算记账，会带来额外 CPU 占用（1 MiB 单流实测约 1%–2%，40 并发下的净增已落入测量噪声）。高吞吐部署建议开启后持续观察 CPU 与吞吐。</li>
+                        <li><span className="font-medium text-foreground">命中行为</span>：触发即终止本次上游生成并返回 502（错误码 <code className="font-mono">model_output_guard_triggered</code>），已下发内容不回滚；Guard 命中<b>不会自动重试</b>（确定性失控，重试只会重复消耗）。</li>
+                        <li><span className="font-medium text-foreground">与断流区分</span>：上游断流（<code className="font-mono">upstream_stream_break</code>）属瞬态故障，消息带 <code className="font-mono">status 502</code> 标记，客户端会自动重试；Guard 命中则不同。</li>
+                        <li><span className="font-medium text-foreground">生效范围</span>：全局生效（所有账号与模型），默认关闭；关闭 Guard 不会关闭 framing 硬上限（单行/事件 8 MiB、WS 48 MB）。</li>
+                        <li><span className="font-medium text-foreground">误伤处理</span>：正常超长输出被拦截时，可调高「工具参数增量上限」（≤65536）或「通道字节上限」；保存后约 5 秒内热生效，无需重启。</li>
+                        <li><span className="font-medium text-foreground">数据安全</span>：拦截原因仅记录在服务端，下游只收到稳定公开错误码与通用文案（不含模型原文、工具路径、prompt 或密钥）。</li>
+                      </ul>
+                    </div>
+
+                    {outputGuardValidationMessage ? (
+                      <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400">
+                        {outputGuardValidationMessage}
+                      </div>
+                    ) : null}
+
+                    <div className="flex items-center justify-between p-3 rounded-lg border bg-muted/20">
+                      <div>
+                        <div className="text-sm font-medium">启用失控输出防护</div>
+                        <div className="text-xs text-muted-foreground">全局实时检测持续短周期重复、细碎 arguments 泛洪与字节预算超额并前置切断</div>
+                      </div>
+                      <Switch
+                        checked={settingsForm.output_guard_enabled}
+                        onCheckedChange={(checked) => {
+                          setSettingsForm((f) => ({ ...f, output_guard_enabled: checked }))
+                          void autoSaveSettingsPatch({ output_guard_enabled: checked })
+                        }}
+                      />
+                    </div>
+
+                    <div className={SETTINGS_FIELD_GRID}>
+                      <SettingField
+                        label="工具参数字节上限 (KiB)"
+                        description="单次工具调用完整参数序列化字节硬上限（默认 256 KiB，范围 16 KiB..4096 KiB）"
+                      >
+                        <DraftNumberInput
+                          min={16}
+                          max={4096}
+                          value={bytesToKiB(settingsForm.output_guard_max_tool_argument_bytes)}
+                          onValueChange={(val) => {
+                            setSettingsForm((f) => ({ ...f, output_guard_max_tool_argument_bytes: kibToBytes(val) }))
+                          }}
+                          onValueCommit={(val) => {
+                            commitByteLimitField('output_guard_max_tool_argument_bytes', val, KIB)
+                          }}
+                        />
+                      </SettingField>
+
+                      <SettingField
+                        label="工具非空 Delta 数量上限"
+                        description="限制细碎 arguments delta 触发下游高频重解析事件的次数（默认 4096，范围 256..65536）"
+                      >
+                        <DraftNumberInput
+                          min={256}
+                          max={65536}
+                          value={settingsForm.output_guard_max_tool_argument_deltas}
+                          onValueChange={(val) => {
+                            setSettingsForm((f) => ({ ...f, output_guard_max_tool_argument_deltas: val }))
+                          }}
+                          onValueCommit={(val) => {
+                            void autoSaveSettingsPatch({ output_guard_max_tool_argument_deltas: val })
+                          }}
+                        />
+                      </SettingField>
+
+                      <SettingField
+                        label="单 Channel 字节上限 (KiB)"
+                        description="单 text/thinking 生成通道累计字节上限（默认 2048 KiB，范围 128 KiB..16384 KiB）"
+                      >
+                        <DraftNumberInput
+                          min={128}
+                          max={16384}
+                          value={bytesToKiB(settingsForm.output_guard_max_channel_bytes)}
+                          onValueChange={(val) => {
+                            setSettingsForm((f) => ({ ...f, output_guard_max_channel_bytes: kibToBytes(val) }))
+                          }}
+                          onValueCommit={(val) => {
+                            commitByteLimitField('output_guard_max_channel_bytes', val, KIB)
+                          }}
+                        />
+                      </SettingField>
+
+                      <SettingField
+                        label="单请求语义预算 (KiB)"
+                        description={`一次请求内所有 channel 消耗的总语义字节硬上限（默认 ${bytesToMiB(DEFAULT_OUTPUT_GUARD_SETTINGS.output_guard_max_request_bytes)} MiB，范围 256 KiB..65536 KiB）`}
+                      >
+                        <DraftNumberInput
+                          min={256}
+                          max={65536}
+                          value={bytesToKiB(settingsForm.output_guard_max_request_bytes)}
+                          onValueChange={(val) => {
+                            setSettingsForm((f) => ({ ...f, output_guard_max_request_bytes: kibToBytes(val) }))
+                          }}
+                          onValueCommit={(val) => {
+                            commitByteLimitField('output_guard_max_request_bytes', val, KIB)
+                          }}
                         />
                       </SettingField>
                     </div>

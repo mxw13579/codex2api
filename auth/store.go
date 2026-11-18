@@ -2,7 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -243,6 +245,8 @@ type Account struct {
 	ClaudeClientPlatformOverride string
 	ClaudeVersionPolicyOverride  string
 	ClaudeClientVersionOverride  string
+	// Kiro 是 upstream_type=kiro 账号的专有凭据投影（见 kiro_account.go）。
+	Kiro KiroCredential
 	// claudeSessionWindow 是 Claude 账号的全局默认并发会话窗口数(装载时从系统设置
 	// 快照,>0 时作为无账号级/分组覆盖时的基础并发回退)。
 	claudeSessionWindow int64
@@ -298,13 +302,14 @@ type Account struct {
 	// 客户端压缩阈值。仅内存保留：值只能在收到响应后才知道，落库也救不了首个请求。
 	grokContextWindow int64
 	// grokFreeQuota 是免费额度耗尽 429 解析出的权威用量快照，随 credentials 落库。
-	grokFreeQuota               *GrokFreeQuotaSnapshot
-	Status                      AccountStatus
-	CooldownUtil                time.Time
-	CooldownReason              string // rate_limited / rate_limited_5h / responses_rate_limited / unauthorized / 空
-	usageCooldownPersistMu      sync.Mutex
-	usageCooldownPersistPending bool
-	ErrorMsg                    string
+	grokFreeQuota                  *GrokFreeQuotaSnapshot
+	Status                         AccountStatus
+	CooldownUtil                   time.Time
+	CooldownReason                 string // rate_limited / rate_limited_5h / responses_rate_limited / unauthorized / 空
+	usageCooldownPersistMu         sync.Mutex
+	usageCooldownPersistPending    bool
+	usageCooldownClearErrorPending bool
+	ErrorMsg                       string
 
 	// 用量进度（从 Codex 响应头被动解析）
 	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
@@ -2105,6 +2110,25 @@ func (a *Account) FreshDispatchUsageLimited() bool {
 		return true
 	}
 	return a.Status == StatusCooldown && now.Before(a.CooldownUtil) && isUsageLimitCooldownReason(a.CooldownReason)
+}
+
+// QuotaAutoPaused reports whether this otherwise dispatchable account is
+// fenced only by its configured 5h/7d auto-pause threshold. The decision uses
+// valid usage windows, thresholds and reset times alone. Manually disabled or
+// paused accounts, accounts without credentials, errors, bans and plain
+// concurrency saturation are not quota pauses. Unlike a local 100% WHAM
+// observation, the threshold fence has no continuation exception: every
+// scheduler path rejects the account until its window resets.
+func (a *Account) QuotaAutoPaused() bool {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.Status == StatusError || a.healthTierLocked() == HealthTierBanned || !a.hasDispatchCredentialLocked() {
+		return false
+	}
+	return a.quotaAutoPausedLocked(time.Now())
 }
 
 func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
@@ -3974,6 +3998,7 @@ type Store struct {
 	promptRiskTrustPolicies            map[string]database.PromptRiskTrustPolicy
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
+	claudeTokenRefresh                 func(context.Context, string, string) (*ClaudeTokenData, error)
 	usageProbeCompletion               func()
 	usageProbeBatch                    atomic.Bool
 	antigravityCatalogBatch            atomic.Bool
@@ -4099,7 +4124,7 @@ type Store struct {
 	codexModelMapping             atomic.Value // Codex 模型映射 JSON 字符串
 	payloadRules                  atomic.Value // Payload 请求体重写规则 JSON 字符串
 	reasoningEffortModels         atomic.Value // 带思考强度的模型别名 JSON 数组
-	schedulerMode                 atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first"
+	schedulerMode                 atomic.Value // string: "round_robin" / "remaining_quota" / "fill_first" / "reset_5h_first"
 	affinityMode                  atomic.Value // string: "bounded" / "off" / "strict"
 	affinitySpreadEnabled         atomic.Bool  // 新亲和键按 HRW 哈希散列选号(issue #484)
 	claudeFingerprintDefault      atomic.Value // string: Claude 指纹模式全局默认（preserve/force;空=preserve）
@@ -5029,6 +5054,9 @@ func (s *Store) fastSchedulerUpdate(acc *Account) {
 	scheduler := s.getFastScheduler()
 	if scheduler != nil {
 		scheduler.Update(acc)
+	}
+	if s.GetSchedulerMode() == SchedulerModeReset5hFirst {
+		s.refreshRoutingReset5hAccount(acc)
 	}
 	s.notifySchedulerAccountAvailability(acc, true)
 }
@@ -6218,11 +6246,12 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
 	isAntigravityAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamAntigravity) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
+	isKiroAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamKiro) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
 	// Agent Identity：无 AT/RT，凭 agent_private_key 动态签名，不能被下面的空凭据 guard 拒绝。
 	isAgentIdentityAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("auth_mode")), CodexAuthModeAgentIdentity) &&
 		strings.TrimSpace(row.GetCredential("agent_runtime_id")) != "" &&
 		strings.TrimSpace(row.GetCredential("agent_private_key")) != ""
-	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isAgentIdentityAccount {
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAntigravityAccount && !isKiroAccount && !isAgentIdentityAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 		return nil
 	}
@@ -6429,6 +6458,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.RefreshToken = ""
 		account.SessionToken = ""
 		account.ExpiresAt = time.Time{}
+	}
+	if isKiroAccount {
+		account.applyKiroRowLocked(row)
 	}
 	if subExp := row.GetCredential("subscription_expires_at"); subExp != "" {
 		if parsed, err := time.Parse(time.RFC3339, subExp); err == nil {
@@ -7318,6 +7350,7 @@ func (s *Store) NextExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
+		var bestReset5h time.Time
 		var bestLoad int64 = math.MaxInt64
 		var bestLimit int64
 		maxConcurrency := s.maxConcurrency.Load()
@@ -7347,14 +7380,21 @@ func (s *Store) NextExcludingWithDispatch(apiKeyID int64, exclude map[int64]bool
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
+			var reset5h time.Time
+			resetOrder := 0
+			if s.GetSchedulerMode() == SchedulerModeReset5hFirst && policy != DispatchPolicySpark {
+				reset5h = acc.reset5hSchedulingDeadline(time.Now())
+				resetOrder = compareReset5hDeadlines(reset5h, bestReset5h)
+			}
 			if schedulerPriority > bestSchedulerPriority ||
 				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
-					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+					(priority == bestPriority && (resetOrder < 0 || resetOrder == 0 && (dispatchScore > bestDispatchScore ||
 						(dispatchScore == bestDispatchScore && load < bestLoad) ||
-						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0)))))) {
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
+				bestReset5h = reset5h
 				bestLoad = load
 				bestLimit = limit
 				best = acc
@@ -7519,6 +7559,7 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 		bestSchedulerPriority := minSchedulerPriority - 1
 		bestPriority := -1
 		bestDispatchScore := -math.MaxFloat64
+		var bestReset5h time.Time
 		var bestLoad int64 = math.MaxInt64
 		maxConcurrency := s.maxConcurrency.Load()
 
@@ -7555,14 +7596,21 @@ func (s *Store) nextExcludingWithFilterLazy(apiKeyID int64, exclude map[int64]bo
 			// 账号调度优先级严格先于健康档位与调度分（issue #358）
 			schedulerPriority := acc.schedulerPriority()
 			priority := tierPriority(tier)
+			var reset5h time.Time
+			resetOrder := 0
+			if s.GetSchedulerMode() == SchedulerModeReset5hFirst && policy != DispatchPolicySpark {
+				reset5h = acc.reset5hSchedulingDeadline(time.Now())
+				resetOrder = compareReset5hDeadlines(reset5h, bestReset5h)
+			}
 			if schedulerPriority > bestSchedulerPriority ||
 				(schedulerPriority == bestSchedulerPriority && (priority > bestPriority ||
-					(priority == bestPriority && (dispatchScore > bestDispatchScore ||
+					(priority == bestPriority && (resetOrder < 0 || resetOrder == 0 && (dispatchScore > bestDispatchScore ||
 						(dispatchScore == bestDispatchScore && load < bestLoad) ||
-						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0))))) {
+						(dispatchScore == bestDispatchScore && load == bestLoad && fastRandN(2) == 0)))))) {
 				bestSchedulerPriority = schedulerPriority
 				bestPriority = priority
 				bestDispatchScore = dispatchScore
+				bestReset5h = reset5h
 				bestLoad = load
 				best = acc
 			}
@@ -7768,6 +7816,9 @@ func (s *Store) nextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		return nil, "", SessionAffinityGuard{}
 	}
 	policy := opts.Policy
+	// 模型级配额门禁：整号门禁只在所有配额族都耗尽时才移出账号，这里按本次请求模型所在
+	// 族补一道过滤，绑定复用、续链、借用与 Fresh 选号共用同一个包装后的 filter。
+	filter = withAntigravityModelQuotaFilter(filter, opts.Model)
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy), "", SessionAffinityGuard{}
@@ -7918,7 +7969,10 @@ func (s *Store) nextAccountForFreshAffinityWithDispatch(key string, apiKeyID int
 	if acc, handled := s.selectAntigravityBalancedAccount(key, apiKeyID, exclude, filter, opts); handled {
 		return acc
 	}
-	if !s.GetSessionAffinitySpread() || strings.TrimSpace(key) == "" {
+	// Deadline priority governs fresh selection; an existing binding is handled
+	// before reaching this method and remains intact.
+	if !s.GetSessionAffinitySpread() || strings.TrimSpace(key) == "" ||
+		(s.GetSchedulerMode() == SchedulerModeReset5hFirst && policy != DispatchPolicySpark) {
 		return s.NextExcludingWithDispatch(apiKeyID, exclude, filter, policy)
 	}
 	filter = s.withUsableEgressFilter(filter)
@@ -8362,7 +8416,7 @@ func (s *Store) UsageLimitedCandidateSummary(apiKeyID int64, exclude map[int64]b
 			continue
 		}
 		cachedCooldown := s.accountHasCachedCooldown(acc)
-		usageLimited := acc.FreshDispatchUsageLimited()
+		usageLimited := acc.FreshDispatchUsageLimited() || acc.QuotaAutoPaused()
 		if policy == DispatchPolicySpark {
 			usageLimited = acc.SparkDispatchUsageLimited()
 		}
@@ -8544,8 +8598,11 @@ func (s *Store) waitForSessionAvailableWithFilter(ctx context.Context, key strin
 	if timeout <= 0 || ctx.Err() != nil {
 		return nil, "", SessionAffinityGuard{}, ctx.Err()
 	}
+	// 候选探测与选号同口径地看模型级配额门禁；选号本身由 nextForSessionWithFilter 自行
+	// 包装，这里传给它的仍是原始 filter，避免同一门禁叠两层。
+	candidateFilter := withAntigravityModelQuotaFilter(filter, opts.Model)
 	hasCandidate := func() bool {
-		return s.HasDispatchCandidate(key, apiKeyID, exclude, filter, preserveBinding, policy)
+		return s.HasDispatchCandidate(key, apiKeyID, exclude, candidateFilter, preserveBinding, policy)
 	}
 	// Indexed/shadow also wait on an empty snapshot: another replica may add
 	// an account and notify this process through the durable outbox.
@@ -9174,7 +9231,7 @@ func (s *Store) GetSchedulerMode() string {
 // SetSchedulerMode 设置调度模式并传播到 FastScheduler
 func (s *Store) SetSchedulerMode(mode string) {
 	switch mode {
-	case "round_robin", "remaining_quota", "fill_first":
+	case "round_robin", "remaining_quota", "fill_first", SchedulerModeReset5hFirst:
 		// ok
 	default:
 		mode = "round_robin"
@@ -10313,6 +10370,25 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
 	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
+	return apiKeyAllowsAccountConstraints(acc, allowedGroups, noAffinityGroups, allowedPlans, channel)
+}
+
+// APIKeyRowAllowsAccount evaluates the current database row without relying on
+// asynchronously refreshed scheduler caches.
+func APIKeyRowAllowsAccount(row *database.APIKeyRow, acc *Account) bool {
+	if row == nil || acc == nil || row.ID <= 0 || !acc.AllowsAPIKey(row.ID) {
+		return false
+	}
+	groups := int64Set(normalizeAllowedGroupIDs(row.AllowedGroupIDs))
+	noAffinity := int64Set(normalizeAllowedGroupIDs(row.Limits.NoAffinityGroupIDs))
+	plans := make(map[string]struct{})
+	for _, plan := range normalizeAllowedPlans(row.Limits.PlanAllow) {
+		plans[plan] = struct{}{}
+	}
+	return apiKeyAllowsAccountConstraints(acc, groups, noAffinity, plans, row.Limits.ResolveUpstreamChannel())
+}
+
+func apiKeyAllowsAccountConstraints(acc *Account, allowedGroups, noAffinityGroups map[int64]struct{}, allowedPlans map[string]struct{}, channel string) bool {
 	// 渠道限定是硬门：grok 渠道只允许 Grok 账号，codex 渠道排除 Grok 账号。
 	switch channel {
 	case database.UpstreamChannelGrok:
@@ -10320,7 +10396,7 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 			return false
 		}
 	case database.UpstreamChannelCodex:
-		if acc.IsGrokAPI() || acc.IsAntigravityAPI() || acc.IsClaudeOAuth() {
+		if acc.IsGrokAPI() || acc.IsAntigravityAPI() || acc.IsClaudeOAuth() || acc.IsKiro() {
 			return false
 		}
 	case database.UpstreamChannelAntigravity:
@@ -10329,6 +10405,10 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 		}
 	case database.UpstreamChannelClaude:
 		if !acc.IsClaudeOAuth() {
+			return false
+		}
+	case database.UpstreamChannelKiro:
+		if !acc.IsKiro() {
 			return false
 		}
 	}
@@ -10355,6 +10435,10 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 		// match the key derived from the entitlement tier id instead.
 		if acc.isAntigravityAPILocked() {
 			plan = acc.AntigravityPlanKey
+		}
+		// Kiro plan_type 是上游订阅标题原文，按关键词归一后再匹配。
+		if acc.isKiroLocked() {
+			plan = KiroPlanKey(acc.PlanType)
 		}
 		if _, ok := allowedPlans[plan]; !ok {
 			return false
@@ -12585,6 +12669,9 @@ func (s *Store) refreshAccountWithOptions(ctx context.Context, acc *Account, for
 	if acc.IsClaudeOAuth() {
 		return s.refreshClaudeAccount(ctx, acc, forceRefresh)
 	}
+	if acc.IsKiro() {
+		return s.refreshKiroAccount(ctx, acc, forceRefresh)
+	}
 	return s.refreshCodexAccount(ctx, acc, forceRefresh)
 }
 
@@ -12640,9 +12727,101 @@ func antigravityCredentialRotated(row *database.AccountRow, credential Antigravi
 }
 
 const (
-	antigravityIdentityRevalidationErrorPrefix    = "Antigravity credential rotated before Google identity could be reverified"
-	antigravityPermanentRefreshErrorCredentialKey = "antigravity_permanent_refresh_error"
+	antigravityIdentityRevalidationErrorPrefix         = "Antigravity credential rotated before Google identity could be reverified"
+	antigravityPermanentRefreshErrorCredentialKey      = "antigravity_permanent_refresh_error"
+	antigravityPendingRevalidationAccountCredentialKey = "antigravity_pending_revalidation_account_id"
 )
+
+// antigravityRowNeedsIdentityRevalidation 判断持久化账号行是否因换票后 /userinfo 未能
+// 完成身份复验而处于待复验隔离状态（且非永久刷新失败）。
+func antigravityRowNeedsIdentityRevalidation(row *database.AccountRow) bool {
+	if row == nil {
+		return false
+	}
+	syncErr := strings.TrimSpace(row.GetCredential("antigravity_sync_error"))
+	if !strings.HasPrefix(syncErr, antigravityIdentityRevalidationErrorPrefix) {
+		return false
+	}
+	if permanentErr := strings.TrimSpace(row.GetCredential(antigravityPermanentRefreshErrorCredentialKey)); permanentErr != "" && permanentErr == syncErr {
+		return false
+	}
+	return true
+}
+
+// antigravityRowHasPrincipalTransitionFence 判断持久化账号行是否正处于跨 Google 主体
+// 变更隔离状态（需管理端执行身份替换同步）。
+func antigravityRowHasPrincipalTransitionFence(row *database.AccountRow) bool {
+	if row == nil {
+		return false
+	}
+	syncErr := strings.ToLower(strings.TrimSpace(row.GetCredential("antigravity_sync_error")))
+	return strings.Contains(syncErr, "changed google principal")
+}
+
+// antigravityPriorSubjectID 提取账号在进入待复验或跨主体隔离前已确认的原始 Google 主体 ID。
+// 当账号处于待复验或跨主体隔离状态时，优先读取 antigravity_pending_revalidation_account_id
+// （含 "unknown" 哨兵），避免隔离期间写入的临时 account_id 在再次刷新时自证通过。
+func antigravityPriorSubjectID(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if antigravityRowNeedsIdentityRevalidation(row) || antigravityRowHasPrincipalTransitionFence(row) {
+		if pending := strings.TrimSpace(row.GetCredential(antigravityPendingRevalidationAccountCredentialKey)); pending != "" {
+			return pending
+		}
+	}
+	return firstNonEmpty(
+		row.GetCredential("account_id"),
+		row.GetCredential(antigravityPendingRevalidationAccountCredentialKey),
+	)
+}
+
+// antigravitySubjectCredentialFamilyID 按 Google 主体 ID (sub) 计算标准凭据家族哈希。
+func antigravitySubjectCredentialFamilyID(profileID string) string {
+	profileID = strings.TrimSpace(profileID)
+	if profileID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("antigravity-credential-v1\x00google-sub\x00" + profileID))
+	return "ag_" + hex.EncodeToString(sum[:])
+}
+
+// antigravityRowMatchesSubjectFamily 判断账号持久化的 credential_family_id 是否已经
+// 绑定到指定的 Google 主体 profileID。
+func antigravityRowMatchesSubjectFamily(row *database.AccountRow, profileID string) bool {
+	if row == nil {
+		return false
+	}
+	expected := antigravitySubjectCredentialFamilyID(profileID)
+	if expected == "" {
+		return false
+	}
+	familyID := firstNonEmpty(row.CredentialFamilyID, row.GetCredential("credential_family_id"))
+	return strings.EqualFold(familyID, expected)
+}
+
+// antigravityIdentityTransitionTarget 判定当前同步结果是否发生了跨主体迁移或无法确认
+// 先前主体，返回需要记录的原主体描述与是否需要转入管理端身份同步隔离。
+func antigravityIdentityTransitionTarget(row *database.AccountRow, nextID string) (string, bool) {
+	nextID = strings.TrimSpace(nextID)
+	if nextID == "" {
+		return "", false
+	}
+	previousID := antigravityPriorSubjectID(row)
+	if (previousID == "" || previousID == "unknown") && antigravityRowMatchesSubjectFamily(row, nextID) {
+		previousID = nextID
+	}
+	if previousID == "unknown" {
+		return "unknown", true
+	}
+	if previousID != "" && previousID != nextID {
+		return previousID, true
+	}
+	if previousID == "" && (antigravityRowNeedsIdentityRevalidation(row) || antigravityRowHasPrincipalTransitionFence(row)) {
+		return "unknown", true
+	}
+	return previousID, false
+}
 
 func antigravityRefreshCredentialUpdates(row *database.AccountRow, result AntigravitySyncResult, syncErr error) (map[string]any, error) {
 	credential := result.Credential
@@ -12660,15 +12839,16 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 	} else {
 		updates["expires_at"] = credential.ExpiresAt.UTC().Format(time.RFC3339)
 	}
-	previousID := strings.TrimSpace(row.GetCredential("account_id"))
+	previousID := antigravityPriorSubjectID(row)
 	nextID := strings.TrimSpace(result.Profile.ID)
-	if previousID != "" && nextID != "" && previousID != nextID {
+	if priorLabel, transitioned := antigravityIdentityTransitionTarget(row, nextID); transitioned {
 		// A rotated RT must not be lost, but it is equally unsafe to publish the
 		// new principal under the old project/catalog. Persist the new token
 		// generation in a quarantined shape; the administrative identity sync can
 		// then establish the replacement family and authoritative snapshots.
-		transitionErr := fmt.Sprintf("Antigravity refresh changed Google principal from %s to %s; administrative identity sync required", previousID, nextID)
+		transitionErr := fmt.Sprintf("Antigravity refresh changed Google principal from %s to %s; administrative identity sync required", priorLabel, nextID)
 		updates["account_id"] = nextID
+		updates[antigravityPendingRevalidationAccountCredentialKey] = priorLabel
 		updates["email"] = strings.TrimSpace(result.Profile.Email)
 		updates["name"] = strings.TrimSpace(result.Profile.Name)
 		updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
@@ -12685,13 +12865,32 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 		return updates, nil
 	}
 	if syncErr != nil {
+		if antigravityRowHasPrincipalTransitionFence(row) {
+			existingFence := strings.TrimSpace(row.GetCredential("antigravity_sync_error"))
+			updates[antigravityPendingRevalidationAccountCredentialKey] = firstNonEmpty(previousID, "unknown")
+			updates["project_id"] = ""
+			updates["plan_type"] = ""
+			updates["models"] = []string{}
+			updates["antigravity_quota"] = ""
+			updates["antigravity_permissions"] = ""
+			updates["antigravity_entitlements"] = ""
+			updates["antigravity_capabilities"] = ""
+			updates["antigravity_capability_last_probe_at"] = ""
+			updates["antigravity_catalog_source"] = ""
+			updates["antigravity_catalog_verified"] = false
+			updates["antigravity_last_synced_at"] = ""
+			updates["antigravity_sync_error"] = existingFence
+			updates["antigravity_sync_warning"] = result.Warning
+			return updates, nil
+		}
 		profileVerified := result.Profile.VerifiedEmail && strings.TrimSpace(result.Profile.ID) != "" && strings.TrimSpace(result.Profile.Email) != ""
-		if antigravityCredentialRotated(row, credential) && !profileVerified {
+		if (antigravityCredentialRotated(row, credential) && !profileVerified) || antigravityRowNeedsIdentityRevalidation(row) {
 			// A rotating refresh token may belong to a different Google principal.
 			// Keep the newly issued token durable, but never publish it with the
 			// prior subject's project, catalog, quota, or capability proof.
 			quarantineErr := antigravityIdentityRevalidationErrorPrefix + ": " + syncErr.Error()
 			updates["account_id"] = ""
+			updates[antigravityPendingRevalidationAccountCredentialKey] = firstNonEmpty(previousID, "unknown")
 			updates["email"] = ""
 			updates["name"] = ""
 			updates["avatar_url"] = ""
@@ -12723,6 +12922,7 @@ func antigravityRefreshCredentialUpdates(row *database.AccountRow, result Antigr
 		return nil, err
 	}
 	updates["account_id"] = strings.TrimSpace(result.Profile.ID)
+	updates[antigravityPendingRevalidationAccountCredentialKey] = ""
 	updates["email"] = strings.TrimSpace(result.Profile.Email)
 	updates["name"] = strings.TrimSpace(result.Profile.Name)
 	updates["avatar_url"] = strings.TrimSpace(result.Profile.Picture)
@@ -13076,7 +13276,8 @@ func (s *Store) refreshAntigravityAccountDurable(ctx context.Context, acc *Accou
 			}
 			criticalCtx := lease.CriticalContext()
 			result, syncErr := client.Sync(criticalCtx, credential)
-			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) {
+			_, principalChanged := antigravityIdentityTransitionTarget(lockedRow, result.Profile.ID)
+			if syncErr != nil && !antigravityCredentialRotated(lockedRow, result.Credential) && !principalChanged {
 				if isNonRetryable(syncErr) {
 					return s.persistAntigravityPermanentRefreshFailure(criticalCtx, acc, lockedRow, syncErr)
 				}
@@ -13125,6 +13326,11 @@ func (s *Store) refreshAntigravityAccountDurable(ctx context.Context, acc *Accou
 				s.projectAntigravityManualAccessFence(criticalCtx, current)
 			}
 			if syncErr != nil {
+				if principalChanged || antigravityRowHasPrincipalTransitionFence(current) {
+					if reason, _ := antigravityPersistedHardFence(current); reason != "" {
+						return fmt.Errorf("%s: %w", reason, syncErr)
+					}
+				}
 				return syncErr
 			}
 			if reason, _ := antigravityPersistedHardFence(current); reason != "" {

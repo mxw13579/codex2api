@@ -18,6 +18,7 @@
   - [账号管理](#账号管理) — 添加 RT / AT 账号、批量导入、导出、迁移
   - [降智检测](#降智检测) — 固定账号检测、自动处置和逐次历史
   - [Claude OAuth 与原生 Messages](#claude-oauth-与原生-messages) — 导入、采样、模型与指纹配置
+  - [Kiro 账号与渠道设置](#kiro-账号与渠道设置) — 导入导出、Social / 设备码登录、额度与模型同步
   - [用量统计](#用量统计)
   - [API Key 管理](#api-key-管理)
   - [系统设置](#系统设置)
@@ -245,8 +246,8 @@ Messages 的 `tool_use.input` 必须使用对象，因此自由文本工具输�
 | include              | array        | 否   | 包含的额外字段                                                                                     |
 | previous_response_id | string       | 否   | 上一响应 ID，用于上下文连续                                                                        |
 
-`previous_response_id` 的上下文先查当前进程的有界 L1。本地与 Redis 共享上下文的默认绝对 TTL 为 45 分钟，覆盖聊天上游连接 30 分钟空闲回收后的恢复窗口，仍受缓存容量和账号兼容性限制。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式没有共享 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 response_context_unavailable`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的原生 OpenAI Responses relay 后备，网关可保留原始 `previous_response_id` 交给其上游恢复；其他仅做协议翻译的账号不具备这一后备能力。原生 Codex HTTP 的每个非空父引用都要求当前归属的本地或共享快照证明；普通文本父轮不新增 HTTP 会话存储，应重发完整历史并省略父 ID。重叠工具历史仅在能证明完整父前缀重放时去重，否则返回 409。客户端原生 Responses WebSocket 入口在上游连接正常时保留 `previous_response_id` 并只发送当轮增量，轮次开始时保留仍有效的 L1 祖先引用，快照合并与序列化在响应成功提交后才执行并写入本地缓存，共享后端（Redis）写入在后台完成，不占首字路径。缓存会收集 `response.output_item.done`，因此最终 `response.output` 为空时也能保留消息、`phase`、工具调用/结果及 Lite `additional_tools` 声明。`response.completed` 和 `response.incomplete` 成功提交后均可写入，仍受写入策略、TTL 和容量限制约束；按需写入模式下，`store` 未显式为 `false` 的 WebSocket 会话从根轮起即有写入资格；显式 `store:false` 的原生 WS 会话（如 Codex CLI）使用隔离的完整快照及共享后端恢复，不表示网关完全不缓存历史；仍受 TTL、容量和完整性限制。续链失效、换号或转为 HTTP 时，只有能够恢复所需上下文才继续发送；缺失、超限或不可移植的加密状态返回 `response_context_unavailable` 错误帧，共享后端故障返回 `service_unavailable`，此类恢复失败终止本轮并返回错误帧，命名流附带 `stream_id`；连接仍可接收新的完整上下文请求。协议、鉴权或连接资源错误仍可关闭连接。客户端应重发完整上下文并开始新的响应链。
-祖先在轮次开始前已过期或被淘汰时，网关不会把增量伪装成完整快照；该链后续健康轮也不能自行补全历史。缓存 TTL 为 45 分钟，Memory 模式重启会丢失缓存。设置环境变量 `CODEX_WS_CONTINUATION_FAIL_OPEN=true` 可退回旧行为：上下文不可恢复时剥离 `previous_response_id` 后按原样转发，上游将看不到历史；这次有损降级产生的响应不写回放缓存，关闭逃生阀后也不会信任残缺快照。
+`previous_response_id` 的上下文先查当前进程的有界 L1。本地与 Redis 共享上下文的默认绝对 TTL 为 45 分钟，覆盖聊天上游连接 30 分钟空闲回收后的恢复窗口，仍受缓存容量和账号兼容性限制。已认证请求按 API Key ID 隔离；未配置任何 API Key、显式启用 `CODEX_ALLOW_ANONYMOUS=true` 后放行的请求共用 `anon` 命名空间。Redis 模式在 L1 未命中时可从共享后端重建；后端值未超过重建上限但超过 L1 准入预算时仍可服务本次请求，只是不提升到 L1。Memory 模式在关闭磁盘持久层时没有 response context 后备，依赖上下文被判定为超限、已淘汰或缺失时可能返回 HTTP `409 previous_response_not_found`。共享后端暂时不可用且请求依赖该上下文时可能返回 HTTP `503 service_unavailable`。如果账号池存在可用的原生 OpenAI Responses relay 后备，网关可保留原始 `previous_response_id` 交给其上游恢复；其他仅做协议翻译的账号不具备这一后备能力。原生 Codex HTTP 的每个非空父引用都要求当前归属的本地或共享快照证明；普通文本父轮不新增 HTTP 会话存储，应重发完整历史并省略父 ID。重叠工具历史仅在能证明完整父前缀重放时去重，否则返回 409。客户端原生 Responses WebSocket 入口在上游连接正常时保留 `previous_response_id` 并只发送当轮增量，轮次开始时保留仍有效的 L1 祖先引用，快照合并与序列化在响应成功提交后才执行并写入本地缓存，共享后端（Redis）写入在后台完成，不占首字路径。缓存会收集 `response.output_item.done`，因此最终 `response.output` 为空时也能保留消息、`phase`、工具调用/结果及 Lite `additional_tools` 声明。`response.completed` 和 `response.incomplete` 成功提交后均可写入，仍受写入策略、TTL 和容量限制约束；按需写入模式下，`store` 未显式为 `false` 的 WebSocket 会话从根轮起即有写入资格；显式 `store:false` 的原生 WS 会话（如 Codex CLI）使用隔离的完整快照及共享后端恢复，不表示网关完全不缓存历史；仍受 TTL、容量和完整性限制。续链失效、换号或转为 HTTP 时，只有能够恢复所需上下文才继续发送；缺失、超限或不可移植的加密状态返回 `previous_response_not_found` 错误帧，共享后端故障返回 `service_unavailable`，此类恢复失败终止本轮并返回错误帧，命名流附带 `stream_id`；连接仍可接收新的完整上下文请求。协议、鉴权或连接资源错误仍可关闭连接。客户端应重发完整上下文并开始新的响应链。
+祖先在轮次开始前已过期或被淘汰时，网关不会把增量伪装成完整快照；该链后续健康轮也不能自行补全历史。L1 缓存 TTL 为 45 分钟；Memory 模式重启会丢失原生 WebSocket 快照。设置环境变量 `CODEX_WS_CONTINUATION_FAIL_OPEN=true` 可退回旧行为：上下文不可恢复时剥离 `previous_response_id` 后按原样转发，上游将看不到历史；这次有损降级产生的响应不写回放缓存，关闭逃生阀后也不会信任残缺快照。
 
 对于原生 WebSocket 的结构化输出，`gpt-6-astra` 和 `gpt-5.6-luna` 在显式启用 Responses Lite 时保留 JSON Schema 的 `minLength` / `maxLength`。Lite 信号可来自 `client_metadata.ws_request_header_x_openai_internal_codex_responses_lite=true`、`X-OpenAI-Internal-Codex-Responses-Lite: true` 请求头，或由 Payload Rules 注入该元数据标记。该放行仅用于结构化输出；已有工具参数清洗继续使用保守规则。长度约束在入口准备阶段暂时保留，最终出站前才根据最终模型、规则改写后的 Lite 信号、账号 Lite 能力和实际传输统一处理。其他模型、最终未启用 Lite、HTTP 和 Compact 请求沿用原有清洗策略，HTTP 降级请求不会携带不适用的约束。
 
@@ -316,15 +317,17 @@ OpenAI Responses 中转账号默认仍用 HTTP POST `/v1/responses`。账号设�
 
 **端点:** `POST /v1/images/generations`
 
-**说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`、`gpt-image-2.5-flare` 或 `gpt-image-2.5-sunburst`（支持日期快照及 `-2k` / `-4k` 档位后缀），内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型默认 `gpt-5.6-luna`（优先使用「系统设置 → Codex → 生图设置」中的文本模型，未配置时沿用环境变量 `CODEX_IMAGES_MAIN_MODEL`；被上游拒绝时按 `gpt-5.5` → `gpt-5.6-terra` → `gpt-5.6-sol` → `gpt-6-astra` 顺序换驱动重试），图像模型写入 `tools[0].model`。
+**说明:** OpenAI Images 兼容入口。外部请求使用 `gpt-image-2`、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.6-flare`、`gpt-image-2.6-sunburst` 或 `gpt-image-2.6`（支持日期快照及 `-2k` / `-4k` 档位后缀），内部按 `CLIProxyAPI/` 与 `sub2api/` 的链路转换为 Codex `/responses`：主模型默认 `gpt-5.6-luna`（优先使用「系统设置 → Codex → 生图设置」中的文本模型，未配置时沿用环境变量 `CODEX_IMAGES_MAIN_MODEL`；被上游拒绝时按 `gpt-5.5` → `gpt-5.6-terra` → `gpt-5.6-sol` → `gpt-6-astra` 顺序换驱动重试），图像模型写入 `tools[0].model`。
+
+Images 入口及后台生图自动构造的 Codex 请求不强制 `reasoning.effort`，由上游选择默认值，避免显式 effort 被作为图片 complexity 拒绝。`reasoning.summary`、加密 reasoning 元数据及图片工具的 `quality` 参数保持原有语义。
 
 Codex/GPT 图片生成与编辑在 `stream=false` 或省略 `stream` 时，只返回最终 JSON，不发送 HTTP `102 Processing` 或提前提交 HTTP 200；`stream=true` 仍使用原有 SSE 心跳。`DOWNSTREAM_HTTP_KEEPALIVE_INTERVAL` 不再为这两个入口的 Codex/GPT 非流式分支提供保活。客户端和反向代理仍需给完整生成时长足够的等待/空闲超时；需要异步调用时可使用下文的图片任务接口。Grok 图片分支不受此例外影响，仍保留既有 102 行为。
 
-GPT Image 2.5 支持 `auto`、`low`、`medium`、`high`、`xhigh`、`max`。质量参数原样传给图片工具；工作台切回旧型号时会将 `xhigh` / `max` 调整为 `high`。省略模型仍默认使用 `gpt-image-2`。`-2k` / `-4k` 是本项目的尺寸与超分别名，发往上游前会剥掉该后缀。
+GPT Image 2.5 / 2.6 支持 `auto`、`low`、`medium`、`high`、`xhigh`、`max`。质量参数原样传给图片工具；工作台切回旧型号时会将 `xhigh` / `max` 调整为 `high`。省略模型仍默认使用 `gpt-image-2`。`-2k` / `-4k` 是本项目的尺寸与超分别名，发往上游前会剥掉该后缀。
 
 直接使用 `/v1/responses` 时，文本主控放在顶层 `model`，图片模型放在 `tools[].model`；显式文本主控优先于后台生图设置及 `CODEX_IMAGES_MAIN_MODEL`。顶层 `model` 直接填图像模型时，则使用后台配置的文本主控。工具模型省略时仍补为 `gpt-image-2`。
 
-Images 入口的 2.5 token 计费区分文本输入、图片输入与各自缓存：内置费率分别为 $5、$8、$1.25、$2 / 百万 token，图片输出 $30 / 百万 token（[官方价格](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)，2026-09-09 核对）。Flare/Sunburst 各有独立定价键，日期快照和尺寸别名使用对应基础型号费率；自定义覆盖优先。usage 日志新增 `image_input_tokens`、`image_output_tokens`、`cached_image_input_tokens`，是总输入/输出/缓存的子集，不重复计费。历史日志无法补回未记录的图片 token 明细。
+Images 入口的 2.5/2.6 token 计费区分文本输入、图片输入与各自缓存：内置费率分别为 $5、$8、$1.25、$2 / 百万 token，图片输出 $30 / 百万 token（[官方价格](https://developers.openai.com/api/docs/models/gpt-image-2.5-sunburst)，2026-09-09 核对）。Flare/Sunburst 各有独立定价键，日期快照和尺寸别名使用对应基础型号费率；自定义覆盖优先。usage 日志新增 `image_input_tokens`、`image_output_tokens`、`cached_image_input_tokens`，是总输入/输出/缓存的子集，不重复计费。历史日志无法补回未记录的图片 token 明细。
 
 **请求示例:**
 
@@ -1292,7 +1295,10 @@ Wrong-channel accounts return `400`; missing accounts return `404`; a concurrent
 | name          | string | 否   | 账号名称，批量时自动追加序号，默认 `account-{n}`       |
 | refresh_token | string | 是   | Refresh Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url     | string | 否   | 代理 URL                                               |
+| timezone | string | 否 | 新建账号的 IANA 时区，如 `Asia/Tokyo`。留空表示不绑定，同批次的新账号共用该值。 |
 | custom_headers | object | 否   | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
+
+时区在账号首次入池前生效。重复导入和重新授权会保留已有账号的时区。Agent Identity 单条及批量新增接口也接受相同的 `timezone` 字段。
 
 同一份 RT 可以分别以“默认工作区”和多个 `Chatgpt-Account-Id` 路由加入账号池。额度、冷却、调度和统计按账号记录独立维护；同一登录身份下的相同目标工作区仍会去重。
 
@@ -1362,6 +1368,7 @@ curl -X POST http://localhost:8080/api/admin/accounts \
 | name         | string | 否   | 账号名称，批量时自动追加序号，默认 `at-account-{n}`   |
 | access_token | string | 是   | Access Token，多个用 `\n` 换行分隔（单次最多 100 个） |
 | proxy_url    | string | 否   | 代理 URL                                              |
+| timezone | string | 否 | 新建账号的 IANA 时区，如 `Asia/Tokyo`。留空表示不绑定，同批次的新账号共用该值。 |
 | custom_headers | object | 否 | 自定义上游请求头；`Chatgpt-Account-Id` 用于指定目标工作区 |
 
 同一个 AT 可以按不同目标工作区保存为多条独立路由。对于无法从 AT 解析登录身份的情况，系统至少会按“AT 原文 + 目标工作区”避免同一路由重复写入。
@@ -1522,6 +1529,7 @@ data: {"type":"diagnostics","codex_diagnostics":{"model":"gpt-5.5","http_status"
 | file         | file   | 是   | 上传文件（最大 20MB，JSON 格式支持多文件） |
 | format       | string | 否   | 文件格式：`txt`（默认）、`json`、`at_txt`  |
 | proxy_url    | string | 否   | 代理 URL                                   |
+| timezone | string | 否 | 新建账号的 IANA 时区，如 `Asia/Tokyo`。留空表示不绑定，同批次的新账号共用该值。 |
 | import_proxy | bool   | 否   | 采用文件内携带的代理，并注册进代理池       |
 
 **import_proxy 说明:**
@@ -1761,6 +1769,52 @@ data: {"type":"complete","current":3,"total":3,"success":2,"failed":1}
   "trend": [{ "timestamp": "2024-01-01T00:00:00Z", "added": 5, "deleted": 0 }]
 }
 ```
+
+### Kiro 账号与渠道设置
+
+以下接口都挂在 `/api/admin` 鉴权中间件下，需要管理密钥。完整说明见 [KIRO.md](KIRO.md)。
+
+#### POST /api/admin/accounts/kiro/import
+
+自动识别 kiro.rs `credentials.json`、Kiro IDE `kiro-auth-token.json` 与 Kiro Account Manager 导出三种格式，逐个换票、补全 profile ARN、额度与模型目录后入库；单项失败不影响其他项。
+
+```json
+{ "content": "<JSON 字符串或对象>", "name": "可选", "proxy_url": "可选", "use_proxy_pool": false }
+```
+
+```json
+{ "imported": 1, "failed": 0, "results": [{ "index": 0, "id": 12, "email": "user@example.com" }] }
+```
+
+#### GET /api/admin/accounts/kiro/export
+
+`format=kam`（默认，Kiro Account Manager 格式）或 `format=kiro-rs`（kiro.rs `credentials.json` 数组）；`ids=1,2` 可选。响应含明文令牌，带 `Content-Disposition: attachment` 与 `Cache-Control: no-store, max-age=0`，可原样导回。
+
+#### POST /api/admin/accounts/kiro/social/auth-url 与 /social/exchange
+
+`auth-url` 返回 `{ "auth_url", "session", "redirect_uri" }`。用户在浏览器完成 Google / GitHub 登录后，把地址栏里的 localhost 回调 URL 提交给 `exchange`：
+
+```json
+{ "session": "<auth-url 返回的 session>", "callback_url": "http://127.0.0.1:3128/oauth/callback?code=...&state=..." }
+```
+
+#### POST /api/admin/accounts/kiro/device/start 与 /device/poll
+
+`start` 默认走 AWS Builder ID；Enterprise 传 `{ "start_url": "https://d-xxxx.awsapps.com/start", "region": "us-east-1" }`。返回 `{ "session", "user_code", "verification_uri_complete", "interval", "expires_at" }`。`poll` 传 `{ "session" }`，未授权时返回 `{ "status": "pending" }`，完成后返回 `{ "status": "completed", "id", "email" }`。
+
+#### POST /api/admin/accounts/:id/kiro/sync 与 /accounts/kiro/sync
+
+同步单个或全部启用的 Kiro 账号的额度快照与模型目录。单号返回 `{ "usage": {...}, "models": [...] }`，全量返回 `{ "refreshed", "failed" }`。后台每 30 分钟自动执行一次全量同步。
+
+#### GET / PUT /api/admin/settings/kiro
+
+```json
+{ "api_domain": "amazonaws", "cache_simulation": false }
+```
+
+`api_domain` 只能是 `amazonaws`（`q.{region}.amazonaws.com`）或 `kiro`（`*.kiro.dev`）；`cache_simulation` 开启后，上游未给精确用量时按 `cache_control` 断点估算 cache 读写拆分。PUT 只更新出现的字段，保存后立即生效。
+
+Kiro 渠道的连通性测试默认模型、测活内容与并发在 `PUT /api/admin/settings/channel-tests` 的 `kiro` 字段里配置；账号列表、启停、删除、测连、质量测试、降智检测、分组与代理沿用通用账号接口，渠道参数为 `channel=kiro`。
 
 ### 用量统计
 
@@ -2153,7 +2207,6 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "continuous_retry_error_codes": [],
   "continuous_retry_max_duration_seconds": 600,
   "codex_fingerprint_default_mode": "off",
-  "codex_unified_client_identity_enabled": false,
   "scheduler_mode": "round_robin",
   "allow_remote_migration": false,
   "database_driver": "postgres",
@@ -2201,7 +2254,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
 
 `codex_fingerprint_default_mode`（`off`/`device`/`session`/`full`，默认 `off`）是新导入或新建 Codex 账号默认盖上的设备指纹收敛档位，只影响之后新加入的账号；已有账号档位不变，入库后仍可在账号级单独调整。非法取值返回 HTTP 400。
 
-`codex_unified_client_identity_enabled`（默认 `false`）控制网关自发的 Codex 维护请求是否与对话请求使用同一份客户端身份。开启后，wham 用量查询、重置券查询与消耗、每日用量、token 明细、订阅同步（Codex 形态）、模型清单（含下游透传）以及 OpenAI Responses 中转账号的模型发现，都改用与对话出站相同的解析：按 `codex_user_agent_config` 生成（号池模式按账号抽取画像），`Originator` 跟随生成的 UA，最后套用账号自定义头里的 `User-Agent` / `Originator` / `Version`。模型清单的 `client_version` 查询参数、`Version` 头与 UA 版本段取同一版本；中转账号的 installation id 改为按中转凭据派生，对话请求体与模型发现请求头取同一值。维护请求不会新增原本不发送的头（例如 wham 探针不补 `Version` 或 `X-Codex-Installation-Id`）。订阅同步被挑战时的浏览器形态回退、邀请接口与外部版本/指纹库同步不受影响。配置身份解析失败（如 `auto` 模式下版本低于最低要求）时回退内置 `codex-tui` 身份并限频记日志。该开关不改变对话请求的身份选择：`client_compat_mode` 不是 `force` 时，官方 Codex 客户端的对话请求仍透传其自身 UA，要让账号对上游只呈现一份身份需同时使用 `force`。
+Codex 维护请求默认与对话请求共用客户端身份解析和账号自定义身份头，设置中不再提供单独开关。模型清单版本与解析出的客户端版本保持一致；身份解析失败时返回错误，不回退固定身份。维护请求仅设置各端点所需的头，不额外添加会话标识或 attestation。订阅同步的浏览器协议回退保持独立。兼容模式允许官方客户端透传时，后台请求使用配置身份，不追踪或复用某个下游客户端的实时身份。
 
 `max_retries`、`max_rate_limit_retries` 与 `codex_ws_silent_max_retries` 是有限重试预算：管理界面和 API 中，`max_rate_limit_retries` 的范围为 `0` 到 `100`，`max_retries` 与 `codex_ws_silent_max_retries` 仍为 `0` 到 `10`（`0` 禁用对应预算）。429 预算为 `100` 时，纯 429 错误链最多进行初次请求加 100 次重试；较大预算会增加等待时间和上游请求量，客户端取消、已输出内容等停止条件仍然生效。需要持续重试时使用独立的 `continuous_retry_enabled` 开关；它不会改变这些有限预算的含义。开关打开后，可在 `continuous_retry_categories` 选择 `transport`、`http_429`、`http_4xx`、`http_5xx`、`stream_error`、`response_failed`、`context_error`，并用 `continuous_retry_status_codes`（例如 `[403,404,501]`）或 `continuous_retry_error_codes`（例如 `["rate_limited","context_length_exceeded"]`）精确追加匹配。类别、状态码、错误代码任一命中即可进入持续重试；403、404、上下文错误及“全部 `response.failed`”默认不选中（501 已由默认的 `http_5xx` 类别覆盖）。普通自选模式不会把结构化安全策略拒绝升级为无限重试。永久额度/余额错误（如 `insufficient_quota`、`quota_exceeded`、`billing_hard_limit`、`billing_limit_reached`、`spend_limit`、`credit_balance`、`insufficient_balance`、`usage_limited`）不会因为通用类别进入无限循环；只有管理员明确选择对应额度错误代码，或明确启用下述超级开关时，才会进入持续重试。
 
@@ -2688,6 +2741,7 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 | 参数         | 类型   | 必填 | 说明                         |
 | ------------ | ------ | ---- | ---------------------------- |
 | proxy_url    | string | 否   | 账号使用的代理 URL           |
+| timezone | string | 否 | 新建账号的 IANA 时区。生成授权链接时选定，手动兑换和自动回调均沿用该值。 |
 | redirect_uri | string | 否   | 回调地址，默认为系统内置地址 |
 
 **响应:**
@@ -2803,7 +2857,7 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 | account_pool_concurrency_saturated | 匹配账号的并发窗口已满 | 稍后重试，或提高单账号并发上限 |
 | account_pool_usage_limit_reached | 账号池额度耗尽   | 等待冷却或添加新账号             |
 | rate_limit_exceeded              | 限流触发         | 降低请求频率                     |
-| response_context_unavailable     | `previous_response_id` 所需上下文不可用 | 重新发送完整上下文或开始新的响应链 |
+| previous_response_not_found      | `previous_response_id` 所需上下文不可用 | 重新发送完整上下文或开始新的响应链 |
 | service_unavailable              | 依赖的共享上下文后端暂时不可用 | 退避后重试并检查 Redis 状态 |
 
 ### Responses 上下文不可用
@@ -2816,8 +2870,8 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 ```json
 {
   "error": {
-    "code": "response_context_unavailable",
-    "message": "Previous response context is unavailable",
+    "code": "previous_response_not_found",
+    "message": "Previous response not found; resend the full conversation input without previous_response_id",
     "type": "invalid_request_error",
     "details": {
       "field": "previous_response_id",
@@ -2839,6 +2893,16 @@ curl -X DELETE http://localhost:8080/api/admin/images/jobs/1 \
 
 - `global_rpm = 0`: 无限流
 - `global_rpm > 0`: 启用 RPM 限流
+
+### API Key 自助账号用量与重置卡
+
+管理员可在 API Key 页面设置全局账号查看、重置权限，并选择单个 Key 进一步收紧。两个全局开关默认关闭；Key 的默认设置继承全局，不能突破全局限制。查看关闭时重置也不可用。
+
+- `GET /api/admin/key-usage-account-permissions/:id` / `PUT /api/admin/key-usage-account-permissions/:id`：需要管理鉴权；`id=0` 为全局，其他值为 API Key ID。PUT 的 JSON 为 `{"view_enabled":true,"reset_enabled":false}`，两个字段均必填。
+- `GET /api/key-usage/accounts`：使用自助页的 API Key 鉴权，返回当前允许范围内的账号、套餐、状态、用量窗口、更新时间和缓存的重置卡数量；不返回上游凭据、代理或自定义请求头。未装载到运行池的账号显示为 `unavailable`，用量未知且不能重置；当这类账号的渠道或套餐权限无法确定时不予返回。已删除账号不在列表中。页面或查看权限关闭返回 404。
+- `POST /api/key-usage/accounts/:id/reset-credits`：使用同一 API Key 鉴权，必须传入每次操作唯一的 `Idempotency-Key` UUID；同一请求 ID 再次提交返回 409，不重复调用上游。需要查看和重置权限，并重新校验 Key、账号分组、渠道、套餐和账号反向授权。过期 Key 不能重置。只允许支持的 Codex 账号。操作消耗该账号的上游重置卡，会影响共享同一工作区的其他用户；近期已提交重置的工作区会暂时拒绝重复操作。网络异常后请先检查账号状态，勿盲目重试。
+
+自助账号列表的 5h/长窗口是账号运行态缓存，可能滞后；未知值为 `null`，不是 0。`long_window_seconds` 给出长窗口的实际上游周期（未知为 0）；部分套餐可能是月窗口，而非 7 天。API Key 的金额与请求预算和上游账号用量是不同的额度。空的 API Key 分组限制表示不限分组；公开账号信息之前，管理员应检查 Key 的授权范围。
 
 ### API Key 级窗口限额
 
@@ -2994,3 +3058,7 @@ Retry-After: 3600
 ### 可选的持久化生图队列
 
 设置 `IMAGE_JOB_WORKERS=2` 可启用固定并发的数据库任务队列。启用后创建接口只返回 `job.id` 和 `job.status`；参考图在任务执行时读取。数据库增量迁移、内存限制、重启恢复及兼容性详见 [图片任务队列](IMAGE_JOB_QUEUE.md)。
+
+### 自适应降智检测配置
+
+`PUT /api/admin/intelligence-check/settings` 支持 `adaptive_enabled`、`pause_initial_seconds`、`pause_max_seconds`、`recovery_initial_seconds`、`recovery_min_seconds`。仍需提交当前 `revision` 和完整设置。字段语义、边界与兼容规则见 [自适应降智检测](INTELLIGENCE_BACKOFF.md)。检测 bars 增加 `probe_phase`、`next_interval_seconds`、`passed_streak`、`next_due_at`，用于展示退避或恢复确认进度。账号限流或额度耗尽、自动检测正在等待恢复时，`probe_phase` 为 `quota_wait` 且不返回 `next_due_at`。

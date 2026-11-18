@@ -63,7 +63,11 @@
 
 - [统一 attestation 平台规则与 Live 会话](CODEX_ATTESTATION.md)
 
-### 10. 号池部署与代码交接
+### 10. Codex 官方请求格式兼容
+
+- [固定账号安装 ID、请求字段保留与源码构建](CODEX_OFFICIAL_REQUESTS.md)
+
+### 11. 号池部署与代码交接
 
 - [当前发布状态、未上线改动、操作边界与后续工作](POOL_DEPLOYMENT_HANDOFF.md)
 

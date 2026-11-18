@@ -1295,6 +1295,9 @@ func isResponsesMessageInputItem(item map[string]any) bool {
 }
 
 func normalizeResponsesInputItemIDs(body map[string]any) bool {
+	if preserveCodexOfficialInputFields(body) {
+		return false
+	}
 	inputItems, ok := body["input"].([]any)
 	if !ok {
 		return false
@@ -1321,6 +1324,9 @@ const responsesInputInternalMetadataField = "internal_chat_message_metadata_pass
 // stripResponsesInputInternalMetadata 只删 input[] 顶层项上的内部元数据字段，
 // 不碰 content/arguments 里恰好同名的用户内容。
 func stripResponsesInputInternalMetadata(body map[string]any) bool {
+	if preserveCodexOfficialInputFields(body) {
+		return false
+	}
 	inputItems, ok := body["input"].([]any)
 	if !ok {
 		return false
@@ -2602,7 +2608,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	// Responses Lite 把工具声明搬进 input[] 的 additional_tools 载体项；顶层
 	// tools[] 的清洗必须同样覆盖那里，否则坏 schema 绕过全部修正直达上游。
 	normalizeResponsesAdditionalToolSchemas(body)
-	if shouldAutoInjectResponsesImageGenerationTool(body) {
+	// Official clients supply their own tool declarations. Avoid inventing a
+	// default image tool and its bridge instructions for the preserved shape.
+	// Explicit tools still receive the normal schema and transport handling.
+	if !preserveCodexOfficialInputFields(body) && shouldAutoInjectResponsesImageGenerationTool(body) {
 		ensureResponsesImageGenerationTool(body)
 	}
 	moveTopLevelResponsesImageOptions(body)
@@ -2948,7 +2957,7 @@ func convertMessagesToInputSlice(messages []openAIMessage) []any {
 				})
 			}
 
-		case "system":
+		case "system", "developer":
 			input = append(input, map[string]any{
 				"type":    "message",
 				"role":    "developer",
@@ -4644,6 +4653,14 @@ func extractUsageFromResult(usage gjson.Result) *UsageInfo {
 	result.ImageInputTokens = min(max(0, int(usage.Get("input_tokens_details.image_tokens").Int())), max(0, inputTokens))
 	result.ImageOutputTokens = min(max(0, int(usage.Get("output_tokens_details.image_tokens").Int())), max(0, outputTokens))
 	result.CachedImageInputTokens = min(max(0, int(usage.Get("input_tokens_details.cached_tokens_details.image_tokens").Int())), min(result.ImageInputTokens, max(0, cachedTokens)))
+	// OpenAI Responses 的缓存写入按保留时长拆分（GPT-6.2 起）：
+	// ttl_30m_tokens → 短保留（5m 槽）、ttl_12h_tokens → 长保留（1h 槽）。
+	// Anthropic 的 cache_creation 细分走 claude_usage_semantics 路径，互不影响。
+	write30m := int(usage.Get("input_tokens_details.cache_write_tokens_details.ttl_30m_tokens").Int())
+	write12h := int(usage.Get("input_tokens_details.cache_write_tokens_details.ttl_12h_tokens").Int())
+	result.CacheWrite5mTokens = write30m
+	result.CacheWrite1hTokens = write12h
+	result.CacheWriteTokens = write30m + write12h
 	return result
 }
 

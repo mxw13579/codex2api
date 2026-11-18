@@ -382,7 +382,9 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
+	if err := applyCodexMaintenanceHeaders(req, account); err != nil {
+		return nil, nil, err
+	}
 	// 用 EffectiveAccountID:自定义头覆盖了工作区 ID 时,额度必须查覆盖后的空间,
 	// 否则进度条/自动暂停/智能配速统计的是与实际流量不同的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
@@ -495,7 +497,9 @@ func queryWhamResetCreditsWithURL(ctx context.Context, account *auth.Account, pr
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "application/json")
-	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
+	if err := applyCodexMaintenanceHeaders(req, account); err != nil {
+		return nil, nil, err
+	}
 	// 与 wham 查询一致,重置券按自定义头覆盖后的空间查询。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -581,7 +585,9 @@ func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxy
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	ResolveCodexMaintenanceIdentity(account, nil).Apply(req.Header)
+	if err := applyCodexMaintenanceHeaders(req, account); err != nil {
+		return nil, nil, err
+	}
 	// 与 wham 查询一致,重置额度也作用于自定义头覆盖后的空间。
 	if accountID := account.EffectiveAccountID(); accountID != "" {
 		req.Header.Set("chatgpt-account-id", accountID)
@@ -734,7 +740,13 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 
 	// premium 5h 限流标记
 	if usageApplied && result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
-		if store != nil {
+		// 重置时刻已知且已经过去：这条 100% 快照属于上一个已翻新的窗口，
+		// 不能据此重新武装 5h 冷却（否则会把已恢复的账号再压满 5 小时）。
+		// reset 时刻缺失时保留原 fallback 行为（markPremium5hRateLimited
+		// 内部按 now+5h 兜底武装）。
+		if !result.Reset5hAt.IsZero() && !result.Reset5hAt.After(observedAt) {
+			// 已过期重置：跳过冷却标记，不做任何判罚。
+		} else if store != nil {
 			result.Premium5hRateLimited = store.MarkPremium5hRateLimitedAt(account, result.Reset5hAt, observedAt)
 		} else {
 			result.Premium5hRateLimited = true

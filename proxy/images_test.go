@@ -461,6 +461,11 @@ func TestNormalizeImageToolModelAliases(t *testing.T) {
 		{name: "2.5 sunburst 4k", model: "gpt-image-2.5-sunburst-4k", want: "gpt-image-2.5-sunburst", wantSize: defaultImages4KSize},
 		{name: "2.5 dated snapshot passthrough", model: "gpt-image-2.5-flare-2026-09-08", want: "gpt-image-2.5-flare-2026-09-08", wantSize: defaultImages1KSize},
 		{name: "2.5 dated snapshot 4k", model: "gpt-image-2.5-sunburst-2026-09-08-4k", want: "gpt-image-2.5-sunburst-2026-09-08", wantSize: defaultImages4KSize},
+		{name: "2.6 flare", model: "gpt-image-2.6-flare", want: "gpt-image-2.6-flare", wantSize: defaultImages1KSize},
+		{name: "2.6 flare 2k", model: "gpt-image-2.6-flare-2k", want: "gpt-image-2.6-flare", wantSize: defaultImages2KSize},
+		{name: "2.6 sunburst 4k", model: "gpt-image-2.6-sunburst-4k", want: "gpt-image-2.6-sunburst", wantSize: defaultImages4KSize},
+		{name: "2.6 base", model: "gpt-image-2.6", want: "gpt-image-2.6", wantSize: defaultImages1KSize},
+		{name: "2.6 base 4k", model: "gpt-image-2.6-4k", want: "gpt-image-2.6", wantSize: defaultImages4KSize},
 		{name: "uppercase alias", model: "GPT-Image-2-4K", want: "gpt-image-2", wantSize: defaultImages4KSize},
 		{name: "empty defaults", model: "", want: "gpt-image-2", wantSize: defaultImages1KSize},
 	}
@@ -1171,6 +1176,40 @@ func TestShouldRetryImageStreamErrorDoesNotRetryOutputPolicyFailure(t *testing.T
 	}
 }
 
+func handleImageRetryFixtureMetrics(w http.ResponseWriter, r *http.Request) bool {
+	// Background metrics share the Resin endpoint but are not image attempts.
+	if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/https/ab.chatgpt.com/otlp/v1/metrics") {
+		return false
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
+func TestImageRetryFixtureMetricsIsolation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		method  string
+		path    string
+		handled bool
+	}{
+		{"metrics", http.MethodPost, "/fixture/https/ab.chatgpt.com/otlp/v1/metrics", true},
+		{"image", http.MethodPost, "/fixture/https/chatgpt.com/backend-api/codex/responses", false},
+		{"wrong_method", http.MethodGet, "/fixture/https/ab.chatgpt.com/otlp/v1/metrics", false},
+		{"wrong_host", http.MethodPost, "/fixture/https/other.example/otlp/v1/metrics", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			handled := handleImageRetryFixtureMetrics(recorder, httptest.NewRequest(tc.method, tc.path, nil))
+			if handled != tc.handled {
+				t.Fatalf("handled = %v, want %v", handled, tc.handled)
+			}
+			if handled && recorder.Code != http.StatusNoContent {
+				t.Fatalf("metrics status = %d, want 204", recorder.Code)
+			}
+		})
+	}
+}
+
 func TestForwardImagesCatchAllRetriesBeyondOrdinaryAttemptCap(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	previousRuntime := CurrentRuntimeSettings()
@@ -1184,7 +1223,10 @@ func TestForwardImagesCatchAllRetriesBeyondOrdinaryAttemptCap(t *testing.T) {
 	ApplyRuntimeSettings(nextRuntime)
 
 	var calls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handleImageRetryFixtureMetrics(w, r) {
+			return
+		}
 		attempt := calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		if attempt <= maxImageAttempts {
@@ -1235,7 +1277,10 @@ func TestForwardImagesCatchAllDiscardsPartialImageFromFailedAttempt(t *testing.T
 	ApplyRuntimeSettings(nextRuntime)
 
 	var calls atomic.Int32
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if handleImageRetryFixtureMetrics(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		if calls.Add(1) == 1 {
 			_, _ = fmt.Fprint(w, `data: {"type":"response.image_generation_call.partial_image","partial_image_b64":"ZmFpbGVkLXBhcnRpYWw=","partial_image_index":0}`+"\n\n")
@@ -1330,7 +1375,7 @@ func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
 	usage := &UsageInfo{InputTokens: 12, OutputTokens: 3, TotalTokens: 15, PromptTokens: 12, CompletionTokens: 3}
 	imageLogInfo := imageUsageLogInfo{Count: 1, Width: 1024, Height: 1024, Bytes: 2048, Format: "png", Size: "1024x1024"}
 
-	logInput := buildImageErrorUsageLog(account, "/v1/images/generations", "gpt-image-2", "gpt-image-2", false, 1500, 1, true, readErr, usage, imageLogInfo)
+	logInput := buildImageErrorUsageLog(account, "/v1/images/generations", "gpt-image-2", "gpt-image-2", "gpt-image-2", false, 1500, 1, true, readErr, usage, imageLogInfo)
 
 	if logInput.AccountID != 42 {
 		t.Fatalf("AccountID = %d, want 42", logInput.AccountID)
@@ -1515,6 +1560,11 @@ func TestImageUpscalePlanForRequestHonorsSuffixOnAnyImageModel(t *testing.T) {
 		{model: "gpt-image-2.5-flare-4k", scale: imageproc.Upscale4K},
 		{model: "gpt-image-2.5-sunburst-2k", scale: imageproc.Upscale2K},
 		{model: "gpt-image-2.5-flare", scale: ""},
+		{model: "gpt-image-2.6-flare-4k", scale: imageproc.Upscale4K},
+		{model: "gpt-image-2.6-sunburst-2k", scale: imageproc.Upscale2K},
+		{model: "gpt-image-2.6-flare", scale: ""},
+		{model: "gpt-image-2.6-4k", scale: imageproc.Upscale4K},
+		{model: "gpt-image-2.6", scale: ""},
 		{model: "gpt-image-2", scale: ""},
 	}
 	for _, test := range tests {

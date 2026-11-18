@@ -83,7 +83,7 @@ func TestResponseContextUnavailableHTTPLogsReasonOnce(t *testing.T) {
 	}
 	body := recorder.Body.String()
 	if gjson.Get(body, "error.code").String() != string(api.ErrCodeResponseContextUnavailable) ||
-		gjson.Get(body, "error.message").String() != "Previous response context is unavailable" ||
+		gjson.Get(body, "error.message").String() != responseContextUnavailableMessage ||
 		gjson.Get(body, "error.details.field").String() != "previous_response_id" ||
 		gjson.Get(body, "error.details.message").String() != "missing_required_call_context" {
 		t.Fatalf("response body changed: %s", body)

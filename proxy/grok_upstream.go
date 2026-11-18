@@ -628,6 +628,9 @@ func ExecuteRelayStyleRequest(ctx context.Context, account *auth.Account, reques
 	if account.IsGrokAPI() {
 		return ExecuteGrokRequest(ctx, account, requestBody, proxyOverride, headers)
 	}
+	if account.IsKiro() {
+		return ExecuteKiroResponsesRequest(ctx, account, requestBody, proxyOverride, headers)
+	}
 	return ExecuteOpenAIResponsesRequest(ctx, account, requestBody, proxyOverride, headers)
 }
 
@@ -761,6 +764,12 @@ func (h *Handler) applyGrokCooldownForModel(account *auth.Account, statusCode in
 		return codex429Decision{}
 	}
 	return applyGrokCooldown(h.store, account, statusCode, body, resp, model)
+}
+
+// ApplyGrokCooldown shares Grok's HTTP authentication and quota mapping with internal probes.
+// Stream failures continue to use their existing terminal-event handling.
+func ApplyGrokCooldown(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	return applyGrokCooldown(store, account, statusCode, body, resp, model)
 }
 
 // applyGrokCooldown 把 Grok 上游错误映射到调度状态，并在免费额度耗尽时落权威用量快照。

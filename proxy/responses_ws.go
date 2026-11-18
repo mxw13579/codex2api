@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
+	"github.com/codex2api/security/outputguard"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -266,6 +267,9 @@ func (h *Handler) ResponsesWebSocket(c *gin.Context) {
 	conn, err := responsesWSUpgrader.Upgrade(c.Writer, c.Request, newAPIPolicyWebSocketUpgradeHeaders())
 	if err != nil {
 		log.Printf("Responses WebSocket upgrade failed: %v", err)
+		return
+	}
+	if outputGuardHTTPGateArmed() && !RequireOutputGuardReadyWS(conn) {
 		return
 	}
 	conn.SetReadLimit(int64(security.MaxRequestBodySize))
@@ -527,6 +531,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
 	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
+	reqGuard := outputguard.NewRequestGuard(nativeGuardCoreConfig())
+
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
 	silentRetryEnabled := wsRetrySettings.CodexWSSilentRetry
@@ -586,6 +592,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	continuationPinned := turnContinuation && turnHasBinding && !searchContinuation
 	continuationDegraded := false
 	continuationContextLost := false
+	quotaFailover := false
 	if err := waitNativeWSCommit(c.Request.Context(), lookupOwner, gjson.GetBytes(codexBody, "previous_response_id").String()); err != nil {
 		return writeResponsesWSErrorForContext(c, conn, nativeResponsesWSContextError(responsesWSContextUnavailable(http.StatusServiceUnavailable, "context_commit_pending")))
 	}
@@ -660,6 +667,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			account, stickyProxyURL, affinityGuard = h.nextAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, selectionOpts)
 		} else if !sameBadRequestAccount && !retainedHTTPFallback {
 			affinityGuard = auth.SessionAffinityGuard{}
+			quotaAffinityReleased := false
+			if preserveContinuationBinding() {
+				if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
+					if limited := h.quotaBlockedContinuationAccount(boundID); limited != nil {
+						replayRaw, replayBody, contextErr := responsesWSQuotaReplayBody(rawBody, codexBody, turnReplay)
+						if contextErr != nil {
+							logQuotaFailoverRejected(c, "websocket", limited.ID(), attempt+1, rawBody, contextErr)
+							return writeResponsesWSRecoveryErrorForContext(c, conn, nativeResponsesWSContextError(contextErr))
+						}
+						rawBody, codexBody = replayRaw, replayBody
+						turnReplay = newResponsesWSReplaySourceFromRecovery(responsesInputRaw(replayBody), turnReplay)
+						continuationPinned = false
+						continuationDegraded = true
+						quotaFailover = true
+						quotaAffinityReleased = true
+						h.store.UnbindSessionAffinity(affinityKey, limited.ID())
+						log.Printf("[quota-failover] complete WebSocket context admitted; releasing exhausted account affinity (account=%d, attempt=%d, encrypted_reasoning=%d)", limited.ID(), attempt+1, quotaFailoverEncryptedReasoning(rawBody))
+					}
+				}
+			}
 			if !continuationPinned && hasPreviousResponse && !continuationDegraded && !searchContinuation {
 				// 绑定账号已被本次请求硬排除（上一轮 429/5xx 等）时不必再等它 30s：
 				// 排除在本请求内不会解除，直接剥离 previous_response_id 换号。
@@ -681,7 +708,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			} else if continuationPinned {
 				// 续链重试同样传 SelectionOptions，避免重试把渠道上下文丢掉。
 				account, stickyProxyURL, selectionErr = h.nextRetryAccountForContinuationWithSelection(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
-			} else {
+			} else if !quotaAffinityReleased || h.quotaFailoverHasCandidate(affinityKey, apiKeyID, retryExclusions.ForSelection(), accountFilter, dispatchPolicy) {
 				account, stickyProxyURL, affinityGuard, selectionErr = h.nextRetryAccountForSessionWithDispatchGuard(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter, selectionOpts)
 			}
 		}
@@ -765,6 +792,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 		downstreamHeaders := c.Request.Header.Clone()
+		if quotaFailover {
+			downstreamHeaders.Del(codexTurnStateHeader)
+		}
 
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
@@ -1153,7 +1183,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		preserveAffinity := preserveContinuationBinding()
 		allowContinuationDegrade := canDegradeContinuation()
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, lineageScope, attemptReplay, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, affinityGuard, preserveAffinity, allowContinuationDegrade, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, lineageScope, attemptReplay, start, ttftGuard, retryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, continuousRetryPolicy, reqGuard, upstreamCancel); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) && useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				// The stream helper leaves this lease acquired for HTTP fallback.
@@ -1287,6 +1317,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	fallbackAttempt int,
 	options *responsesWSForwardOptions,
 	continuousRetryPolicy database.ContinuousRetryPolicy,
+	reqGuard *outputguard.RequestGuard,
+	upstreamCancel context.CancelFunc,
 ) error {
 	upstreamEndpoint := "/v1/responses"
 	account.Mu().RLock()
@@ -1329,6 +1361,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	if continuousRetryBuffersAttempts(continuousRetryPolicy) {
 		wsReplay = h.newContinuousRetryWSReplay()
 	}
+	guardCoord := NewGuardTerminationCoordinator(reqGuard, upstreamCancel, resp.Body)
+	responsesProjector := NewResponsesProjector()
 	finishContextCommit := func() {}
 	finishLineageCommit := func() {}
 	defer func() { finishContextCommit(); finishLineageCommit() }()
@@ -1381,6 +1415,22 @@ func (h *Handler) streamResponsesWSUpstream(
 		}
 		if multiAgentV2State != nil && multiAgentV2State.isOptimizedFor(account.ID()) {
 			data = restoreCodexMultiAgentV2Response(data, multiAgentV2State)
+		}
+		// [OutputGuard 前置检查] 必须早于 provenance、collector、replay 与 downstream 写路径
+		if err := ObserveEvent(reqGuard, responsesProjector, normalizedUpstreamSSEEventType(sseEvent, data), data); err != nil {
+			gotTerminal = true
+			guardCoord.HandleTripped(reqGuard.TrippedReason(), func() {
+				if wsReplay != nil {
+					_ = wsReplay.Close()
+					wsReplay = nil
+				}
+				pendingFirstTokenMessages = nil
+				pendingFirstTokenBytes = 0
+				completedResponsePayload = nil
+			})
+			_ = sendResponsesWSGuardTerminal(conn, c.GetString(responsesWSStreamContextKey), reqGuard.TrippedReason())
+			clientGone = true
+			return false
 		}
 		if wsReplay == nil {
 			h.recordCompactionProvenanceFromPayload(context.Background(), account, data)
@@ -1543,10 +1593,16 @@ func (h *Handler) streamResponsesWSUpstream(
 			(!isResponsesTerminalEvent(eventType) || awaitingResponsesWSInterruptAck(c.Request.Context())) &&
 			!(gotTerminal && isResponsesWSInterruptAck(eventType))
 	})
-	if err := failPendingResponsesWSInterrupt(c.Request.Context(), conn); err != nil {
-		writeErr = err
+	// clientGone（guard 命中或下游写失败）后抑制未决 interrupt 的失败确认帧：
+	// guard 终态帧必须是连接关闭前的最后一帧，不得在终态后再下发 response.interrupt.failed。
+	if !clientGone {
+		if err := failPendingResponsesWSInterrupt(c.Request.Context(), conn); err != nil {
+			writeErr = err
+		}
 	}
-	if writeErr == nil && outputBuffer != nil && wsReplay == nil {
+	// guard 命中（或写失败）后 clientGone 已置位：guard 终态帧是连接关闭前的
+	// 最后一帧，命中后不得再把 outputBuffer 中残留的消息补写到下游。
+	if writeErr == nil && !clientGone && outputBuffer != nil && wsReplay == nil {
 		remaining, err := outputBuffer.Flush()
 		if err != nil {
 			writeErr = err
@@ -1572,6 +1628,7 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	totalDuration := int(time.Since(start).Milliseconds())
 	outcome := classifyStreamOutcome(continuousRetryContextError(c.Request.Context()), readErr, writeErr, gotTerminal)
+	outcome = OverlayGuardOutcome(outcome, reqGuard)
 	outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 	var candidatePromoted bool
 	terminalFailurePayload, candidatePromoted = resolvePreContentRetryErrorCandidate(terminalFailurePayload, preContentErrorCandidate, contentTokenSeen, wroteAnyBody, gotTerminal, readErr, c.Request.Context().Err(), writeErr)
@@ -1614,6 +1671,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			outcome.failureMessage = upstreamCyberPolicyResponseMessage(c)
 		}
 	}
+	outcome = OverlayGuardOutcome(outcome, reqGuard)
 	outcome = overlayContinuousRetryLocalFailure(outcome, readErr, writeErr)
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
@@ -1787,6 +1845,11 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.ReleaseForSessionWithGuard(account, affinityKey, affinityGuard)
 	} else {
 		h.store.Release(account)
+	}
+	if outcome.guardTripped {
+		// Guard 命中终态统一走 1013：与 primitive（error 帧 + CloseTryAgainLater）
+		// 及 HTTP/502 语义一致，下游可将本次中止识别为可重试而非客户端违规。
+		return newResponsesWSCloseError(websocket.CloseTryAgainLater, outcome.failureMessage, errModelOutputGuardTriggered)
 	}
 	if outcome.terminalLocal {
 		apiErr := api.NewAPIError(api.ErrCodeServerError, continuousRetryLocalFailureMessage, api.ErrorTypeServer)

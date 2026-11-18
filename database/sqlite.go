@@ -111,6 +111,10 @@ func (db *DB) configureSQLite(ctx context.Context) error {
 func (db *DB) migrateSQLite(ctx context.Context) error {
 	statements := []string{
 		codexClientVersionCacheSchema,
+		`CREATE TABLE IF NOT EXISTS key_usage_account_permissions (key_id INTEGER PRIMARY KEY, view_enabled BOOLEAN NOT NULL DEFAULT 0, reset_enabled BOOLEAN NOT NULL DEFAULT 0);`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_attempts (request_id TEXT PRIMARY KEY, key_id INTEGER NOT NULL, account_id INTEGER NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_leases (scope TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at BIGINT NOT NULL);`,
+		`CREATE TABLE IF NOT EXISTS key_usage_reset_cooldowns (scope TEXT PRIMARY KEY, expires_at BIGINT NOT NULL);`,
 		`CREATE TABLE IF NOT EXISTS accounts (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
@@ -288,6 +292,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					visible_channels_config TEXT DEFAULT '{}',
 					channel_test_config TEXT DEFAULT '{}',
 					antigravity_config TEXT DEFAULT '{}',
+					kiro_config TEXT DEFAULT '{}',
 					max_concurrency INTEGER DEFAULT 2,
 				global_rpm INTEGER DEFAULT 0,
 				test_model TEXT DEFAULT 'gpt-5.5',
@@ -316,7 +321,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 				reasoning_effort_models TEXT DEFAULT '[]',
 				allow_remote_migration INTEGER DEFAULT 0,
 				client_compat_mode TEXT DEFAULT 'preserve',
-				codex_min_cli_version TEXT DEFAULT '0.160.0',
+				codex_min_cli_version TEXT DEFAULT '0.170.0',
 				codex_user_agent_config TEXT DEFAULT '{}',
 				codex_images_main_model TEXT DEFAULT '',
 				usage_log_mode TEXT DEFAULT 'full',
@@ -388,7 +393,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					ignore_usage_limit_status INTEGER DEFAULT 0,
 					auto_reset_credits_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_on_exhaustion_enabled INTEGER DEFAULT 0,
-					codex_unified_client_identity_enabled INTEGER DEFAULT 0,
 					auto_reset_credits_before_expiry_min INTEGER DEFAULT 60,
 					auto_activate_5h_window_enabled INTEGER DEFAULT 0,
 					utls_shutdown_timeout_minutes INTEGER DEFAULT 30,
@@ -404,7 +408,13 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 					oauth_model_cooldown_mode TEXT NOT NULL DEFAULT 'adaptive',
 					oauth_model_cooldown_seconds INTEGER NOT NULL DEFAULT 300,
 					oauth_model_cooldown_backoff_enabled INTEGER NOT NULL DEFAULT 1,
-					oauth_unsupported_model_cooldown_seconds INTEGER NOT NULL DEFAULT 1800
+					oauth_unsupported_model_cooldown_seconds INTEGER NOT NULL DEFAULT 1800,
+					output_guard_enabled INTEGER DEFAULT 0,
+					output_guard_max_tool_argument_bytes INTEGER NOT NULL DEFAULT 262144,
+					output_guard_max_tool_argument_deltas INTEGER NOT NULL DEFAULT 4096,
+					output_guard_max_channel_bytes INTEGER NOT NULL DEFAULT 2097152,
+					output_guard_max_request_bytes INTEGER NOT NULL DEFAULT 4194304,
+					output_guard_config_generation INTEGER NOT NULL DEFAULT 1
 				);`,
 		modelCapabilitiesSchema,
 		daybreakSchema,
@@ -656,6 +666,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "visible_channels_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "channel_test_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "antigravity_config", "TEXT DEFAULT '{}'"},
+		{"system_settings", "kiro_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "test_content", "TEXT DEFAULT 'hi'"},
 		{"system_settings", "pg_max_conns", "INTEGER DEFAULT 50"},
 		{"system_settings", "redis_pool_size", "INTEGER DEFAULT 30"},
@@ -721,7 +732,6 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "ignore_usage_limit_status", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_on_exhaustion_enabled", "INTEGER DEFAULT 0"},
-		{"system_settings", "codex_unified_client_identity_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "auto_reset_credits_before_expiry_min", "INTEGER DEFAULT 60"},
 		{"system_settings", "auto_activate_5h_window_enabled", "INTEGER DEFAULT 0"},
 		{"system_settings", "utls_shutdown_timeout_minutes", "INTEGER DEFAULT 30"},
@@ -738,6 +748,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "oauth_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 300"},
 		{"system_settings", "oauth_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"system_settings", "oauth_unsupported_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 1800"},
+		{"system_settings", "output_guard_enabled", "INTEGER DEFAULT 0"},
+		{"system_settings", "output_guard_max_tool_argument_bytes", "INTEGER NOT NULL DEFAULT 262144"},
+		{"system_settings", "output_guard_max_tool_argument_deltas", "INTEGER NOT NULL DEFAULT 4096"},
+		{"system_settings", "output_guard_max_channel_bytes", "INTEGER NOT NULL DEFAULT 2097152"},
+		{"system_settings", "output_guard_max_request_bytes", "INTEGER NOT NULL DEFAULT 4194304"},
+		{"system_settings", "output_guard_config_generation", "INTEGER NOT NULL DEFAULT 1"},
 		{"system_settings", "max_retries", "INTEGER DEFAULT 2"},
 		{"system_settings", "max_rate_limit_retries", "INTEGER DEFAULT 1"},
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
@@ -784,7 +800,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"prompt_filter_logs", "request_protocol", "TEXT DEFAULT ''"},
 		{"prompt_filter_logs", "request_provider", "TEXT DEFAULT ''"},
 		{"system_settings", "client_compat_mode", "TEXT DEFAULT 'preserve'"},
-		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.160.0'"},
+		{"system_settings", "codex_min_cli_version", "TEXT DEFAULT '0.170.0'"},
 		{"system_settings", "codex_user_agent_config", "TEXT DEFAULT '{}'"},
 		{"system_settings", "codex_images_main_model", "TEXT DEFAULT ''"},
 		{"system_settings", "usage_log_mode", "TEXT DEFAULT 'full'"},
@@ -972,64 +988,31 @@ func (db *DB) sqliteTableColumns(ctx context.Context, table string) (map[string]
 	return result, rows.Err()
 }
 
-func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, error) {
+func (db *DB) loadTrafficSecondsSQLite(ctx context.Context, since time.Time, buckets *trafficSecondBuckets) error {
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT created_at, total_tokens
 		FROM usage_logs
 		WHERE created_at >= $1
 		  AND TRIM(COALESCE(internal_reason, '')) = ''
-	`, db.timeArg(time.Now().Add(-5*time.Minute)))
+	`, db.timeArg(since))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer rows.Close()
-
-	perSecondRequests := make(map[int64]float64)
-	perSecondTokens := make(map[int64]float64)
-	now := time.Now()
-	windowStart := now.Add(-10 * time.Second).Unix()
 
 	for rows.Next() {
 		var createdRaw interface{}
 		var totalTokens int64
 		if err := rows.Scan(&createdRaw, &totalTokens); err != nil {
-			return nil, err
+			return err
 		}
 		createdAt, err := parseDBTimeValue(createdRaw)
 		if err != nil || createdAt.IsZero() {
 			continue
 		}
-		sec := createdAt.Unix()
-		perSecondRequests[sec]++
-		perSecondTokens[sec] += float64(totalTokens)
+		buckets.add(createdAt.Unix(), 1, float64(totalTokens))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	result := &TrafficSnapshot{}
-	var qpsPeak float64
-	var tpsPeak float64
-	var qpsWindow float64
-	var tpsWindow float64
-	for sec, reqCount := range perSecondRequests {
-		if reqCount > qpsPeak {
-			qpsPeak = reqCount
-		}
-		tokenCount := perSecondTokens[sec]
-		if tokenCount > tpsPeak {
-			tpsPeak = tokenCount
-		}
-		if sec >= windowStart {
-			qpsWindow += reqCount
-			tpsWindow += tokenCount
-		}
-	}
-	result.QPS = qpsWindow / 10.0
-	result.TPS = tpsWindow / 10.0
-	result.QPSPeak = qpsPeak
-	result.TPSPeak = tpsPeak
-	return result, nil
+	return rows.Err()
 }
 
 func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int, channel string) (*ChartAggregation, error) {

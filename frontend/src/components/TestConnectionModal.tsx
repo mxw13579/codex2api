@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Activity,
+  CalendarClock,
   CheckCircle,
   ChevronDown,
   CircleAlert,
@@ -43,6 +44,7 @@ import { cn } from "@/lib/utils";
 import { useToast } from "../hooks/useToast";
 import Modal from "./Modal";
 import ModelDetectorModal from "./ModelDetectorModal";
+import ScheduledConnectionTestsModal from "./ScheduledConnectionTestsModal";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
@@ -114,6 +116,7 @@ export default function TestConnectionModal({
   const [headersOpen, setHeadersOpen] = useState(false);
   const [rawOpen, setRawOpen] = useState(false);
   const [detectorOpen, setDetectorOpen] = useState(false);
+  const [activationOpen, setActivationOpen] = useState(false);
   const [testContent, setTestContent] = useState("hi");
   // 跨重测保留:同步后自动重测仍被拒时,据此提示"已同步仍失败"而不是再次引导同步。
   const [versionSync, setVersionSync] = useState<{
@@ -143,7 +146,9 @@ export default function TestConnectionModal({
   );
   // 白名单为空的 Grok 账号以上游模型目录为准，不能只读 account.models。
   const isGrokAccount = Boolean(account.grok_api);
-  const isCodexOAuthAccount = !isClaudeAccount && !isOpenAIResponsesAccount && !isAntigravityAccount;
+  // Kiro 用账号自己的模型目录，测试模型优先取 Kiro 渠道测连设置。
+  const isKiroAccount = Boolean(account.kiro_api);
+  const isCodexOAuthAccount = !isClaudeAccount && !isOpenAIResponsesAccount && !isAntigravityAccount && !isKiroAccount;
   const supportsModelDetector = isCodexOAuthAccount || isClaudeAccount || Boolean(account.openai_responses_api && !account.grok_api);
 
   const modelSelectOptions = useMemo(
@@ -151,12 +156,12 @@ export default function TestConnectionModal({
       uniqueTestModels(
         modelOptions,
         isAntigravityAccount && !modelOptions.includes(selectedModel) ? undefined : selectedModel,
-        !isOpenAIResponsesAccount && !isClaudeAccount && !isAntigravityAccount,
+        isCodexOAuthAccount,
       ).filter((item) => !isAntigravityAccount || !isAntigravityDisabledModel(item)).map((item) => ({
         label: item,
         value: item,
       })),
-    [isAntigravityAccount, isClaudeAccount, isOpenAIResponsesAccount, modelOptions, selectedModel],
+    [isAntigravityAccount, isCodexOAuthAccount, modelOptions, selectedModel],
   );
 
   useEffect(() => {
@@ -178,6 +183,28 @@ export default function TestConnectionModal({
           const ordered = orderAntigravityTestModels(account.models ?? [], preferred, account.antigravity_quota);
           setModelOptions(ordered);
           setSelectedModel((current) => resolveAntigravityTestModelSelection(ordered, current));
+          return;
+        }
+
+        if (isKiroAccount) {
+          let preferred = "";
+          try {
+            const channelSettings = await api.getChannelTestSettings();
+            if (!active) return;
+            preferred = channelSettings.kiro?.test_model ?? "";
+            setTestContent(channelSettings.kiro?.test_content || channelSettings.default_test_content || "hi");
+          } catch {
+            /* 渠道测试设置读不到就按目录自动选 */
+          }
+          if (!active) return;
+          const kiroModels = uniqueTestModels(account.models ?? [], undefined, false);
+          const pick =
+            kiroModels.find((item) => item.toLowerCase() === preferred.toLowerCase()) ??
+            kiroModels.find((item) => item.toLowerCase().includes("haiku")) ??
+            kiroModels[0];
+          const nextModels = uniqueTestModels(kiroModels, pick, false);
+          setModelOptions(nextModels);
+          setSelectedModel((current) => current || nextModels[0] || "");
           return;
         }
 
@@ -272,6 +299,10 @@ export default function TestConnectionModal({
           const fallbackModels = uniqueTestModels(grokConnectionTestModels(account), undefined, false);
           setModelOptions(fallbackModels);
           setSelectedModel((current) => current || fallbackModels[0] || "");
+        } else if (isKiroAccount) {
+          const fallbackModels = uniqueTestModels(account.models ?? [], undefined, false);
+          setModelOptions(fallbackModels);
+          setSelectedModel((current) => current || fallbackModels[0] || "");
         } else if (isOpenAIResponsesAccount) {
           const accountModels = (account.models ?? []).filter(
             isConnectionTestModel,
@@ -304,7 +335,7 @@ export default function TestConnectionModal({
     return () => {
       active = false;
     };
-  }, [account.antigravity_quota, account.claude_api, account.grok_models, account.model_mapping, account.models, isAntigravityAccount, isClaudeAccount, isGrokAccount, isOpenAIResponsesAccount]);
+  }, [account.antigravity_quota, account.claude_api, account.grok_models, account.model_mapping, account.models, isAntigravityAccount, isClaudeAccount, isGrokAccount, isKiroAccount, isOpenAIResponsesAccount]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
 
@@ -663,6 +694,12 @@ export default function TestConnectionModal({
                 {t("accounts.detectorOpen")}
               </Button>
             ) : null}
+            {!restoreOnSuccess && (isCodexOAuthAccount || Boolean(account.openai_responses_api)) ? (
+              <Button type="button" variant="ghost" size="sm" disabled={running || !modelOptionsReady || !selectedModel} onClick={() => setActivationOpen(true)}>
+                <CalendarClock className="size-3.5" />
+                {t("accounts.activationTitle")}
+              </Button>
+            ) : null}
           </div>
           <Button
             variant="outline"
@@ -1015,6 +1052,9 @@ export default function TestConnectionModal({
         )}
       </div>
     </Modal>
+    {activationOpen ? (
+      <ScheduledConnectionTestsModal account={account} models={modelSelectOptions.map((option) => option.value)} defaultModel={selectedModel} defaultContent={testContent} onClose={() => setActivationOpen(false)} />
+    ) : null}
     {detectorOpen ? (
       <ModelDetectorModal
         account={account}

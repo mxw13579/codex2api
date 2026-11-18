@@ -188,7 +188,7 @@ test('queued saves capture the submitted draft before starting, including repeat
 
 test('settings UI wires the independent controls and documents their safety boundary', () => {
   const source = readFileSync(new URL('../pages/Settings.tsx', import.meta.url), 'utf8')
-  assert.match(source, /omitBadRequestRetrySettings\(buildWritableSettingsPayload\(normalized\)\)/)
+  assert.match(source, /omitBadRequestRetrySettings\(omitOutputGuardFields\(buildWritableSettingsPayload\(normalized\)\)\)/)
   assert.match(source, /autoSaveBadRequestRetryPatch\(buildBadRequestRetryEnabledPatch\(checked\)\)/)
   assert.match(source, /autoSaveBadRequestRetryPatch\(buildBadRequestRetrySwitchAccountPatch\(checked\)\)/)
   assert.match(source, /autoSaveBadRequestRetryPatch\(buildBadRequestRetryMaxRetriesPatch\(event.target.value\)\)/)

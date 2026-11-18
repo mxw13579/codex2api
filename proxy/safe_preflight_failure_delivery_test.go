@@ -1108,7 +1108,7 @@ func TestSafePreflightReviewFixPostContentStreamBreakDelivery(t *testing.T) {
 // Freeze the pre-existing payload bytes independently of the shared builder.
 // The dynamic timestamp is supplied explicitly; no upstream terminal is forged.
 func TestSafePreflightReviewFixStreamBreakPayloadCompatibility(t *testing.T) {
-	want := `{"type":"response.failed","response":{"created_at":1700000000,"status":"failed","error":{"code":"upstream_stream_break","message":"Upstream stream ended prematurely; safe to retry"}}}`
+	want := `{"type":"response.failed","response":{"created_at":1700000000,"status":"failed","error":{"code":"upstream_stream_break","message":"Upstream stream ended prematurely; safe to retry (status 502)"}}}`
 	if got := responsesStreamBreakPayload(1700000000); string(got) != want {
 		t.Error("local stream-break payload changed the legacy byte structure")
 	}

@@ -40,7 +40,7 @@ func responseContextUnavailableReason(apiErr *api.APIError) (string, bool) {
 		return "", false
 	}
 	switch apiErr.Code {
-	case api.ErrCodeResponseContextUnavailable, api.ErrorCode("previous_response_not_found"), api.ErrCodeServiceUnavailable:
+	case api.ErrCodeResponseContextUnavailable, api.ErrCodeServiceUnavailable: // ErrCodeResponseContextUnavailable 即 previous_response_not_found
 	default:
 		return "", false
 	}

@@ -1,11 +1,15 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,6 +233,37 @@ func TestScopedModelsIncludeAntigravityAccounts(t *testing.T) {
 	}
 }
 
+func TestScopedModelsLogsRedactedReasonWhenClaudeAccountIsFiltered(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	const secret = "super-secret-claude-token"
+	account := &auth.Account{
+		DBID: 867, UpstreamType: auth.UpstreamClaude, AccessToken: secret, RefreshToken: "refresh-secret",
+		Status: auth.StatusReady, Models: []string{"claude-sonnet-4-5"},
+	}
+	store.AddAccount(account)
+	store.MarkCooldownWithError(account, time.Hour, "unauthorized", "upstream 401 "+secret)
+	atomic.StoreInt32(&account.Disabled, 1)
+	handler := NewHandler(store, nil, nil, nil)
+	catalogEmptyLogMu.Lock()
+	delete(catalogEmptyLogAt, 8)
+	catalogEmptyLogMu.Unlock()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 8, Limits: database.APIKeyLimits{UpstreamChannel: database.UpstreamChannelClaude}})
+	if len(models) != 0 {
+		t.Fatalf("filtered Claude account still published models: %+v", models)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "model catalog empty") || !strings.Contains(logged, "id=867") || !strings.Contains(logged, "disabled_banned") {
+		t.Fatalf("diagnostic log = %q", logged)
+	}
+	if strings.Contains(logged, secret) || strings.Contains(logged, "refresh-secret") {
+		t.Fatalf("diagnostic log leaked credentials: %s", logged)
+	}
+}
+
 func TestScopedModelsClaudeOnlyKeyDoesNotExposeCodexAliases(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
 	defer store.Stop()
@@ -270,5 +305,40 @@ func TestScopedModelsDeclaredListCannotOverrideCatalogVisibility(t *testing.T) {
 	}
 	if relayAccountSupportsModel(account, "declared-only") || relayAccountSupportsModel(account, "hidden") {
 		t.Fatal("request admission bypassed catalog visibility")
+	}
+}
+
+// issue #826: 账号文本白名单不应隐藏图片模型。Images 路径按 imageCapableAccountFilter
+// 调度、不看白名单,因此同一 Key 能生图却在 /v1/models 发现不到图片型号。
+func TestScopedModelsTextAllowlistDoesNotHideCodexImageModels(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
+	codex := &auth.Account{DBID: 1, AccessToken: "codex", PlanType: "plus", Models: []string{"gpt-5.5"}}
+	store.AddAccount(codex)
+	handler := NewHandler(store, nil, nil, nil)
+
+	models := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1})
+	if _, _, ok := scopedModelByID(models, "gpt-5.5"); !ok {
+		t.Fatalf("allowlisted text model missing: %+v", models)
+	}
+	if _, _, ok := scopedModelByID(models, "gpt-5.5-codex"); ok {
+		t.Fatalf("text allowlist no longer narrows text models: %+v", models)
+	}
+	for _, id := range []string{"gpt-image-2", "gpt-image-2-2k", "gpt-image-2-4k"} {
+		if _, _, ok := scopedModelByID(models, id); !ok {
+			t.Fatalf("image model %q hidden by text-only allowlist: %+v", id, models)
+		}
+	}
+
+	// Key 级 allow/deny 仍然生效:发现端点不能无条件向所有 Key 返回图片型号。
+	denied := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1, Limits: database.APIKeyLimits{ModelDeny: []string{"gpt-image-2"}}})
+	if _, _, ok := scopedModelByID(denied, "gpt-image-2"); ok {
+		t.Fatalf("key ModelDeny did not hide image model: %+v", denied)
+	}
+	if _, _, ok := scopedModelByID(denied, "gpt-5.5"); !ok {
+		t.Fatalf("ModelDeny on image model removed text model: %+v", denied)
+	}
+	allowOnly := listScopedModelsForTest(t, handler, &database.APIKeyRow{ID: 1, Limits: database.APIKeyLimits{ModelAllow: []string{"gpt-5.5"}}})
+	if len(allowOnly) != 1 || allowOnly[0].ID != "gpt-5.5" {
+		t.Fatalf("key ModelAllow must still gate image models: %+v", allowOnly)
 	}
 }

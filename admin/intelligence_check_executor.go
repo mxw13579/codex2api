@@ -19,18 +19,35 @@ import (
 const intelligenceOutputLimit = 256 * 1024
 
 type intelligenceExecution struct {
-	Output           string
-	Error            string
-	Complete         bool
-	Interrupted      bool
-	DurationMS       int64
-	ResponseModel    string
-	InputTokens      int
-	OutputTokens     int
-	ReasoningTokens  int
-	CachedTokens     int
-	terminalPayload  []byte
-	EffectiveContext map[string]string
+	CredentialRejected bool
+	Output             string
+	Error              string
+	Complete           bool
+	Interrupted        bool
+	DurationMS         int64
+	ResponseModel      string
+	InputTokens        int
+	OutputTokens       int
+	ReasoningTokens    int
+	CachedTokens       int
+	terminalPayload    []byte
+	EffectiveContext   map[string]string
+}
+
+// intelligenceAccountChannel classifies the account source, not the requested model family.
+func intelligenceAccountChannel(account *auth.Account) string {
+	switch {
+	case account.IsAntigravityAPI():
+		return "antigravity"
+	case account.IsGrokAPI():
+		return "grok"
+	case account.IsClaudeOAuth():
+		return "claude"
+	case account.IsKiro():
+		return "kiro"
+	default:
+		return "codex"
+	}
 }
 
 // Uses the same outbound executors as generation, with no browser request context
@@ -38,15 +55,19 @@ type intelligenceExecution struct {
 // The detector context freezes the measurement prompt and model against user
 // payload rules; identity/fingerprint/timezone still apply.
 func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Account, model, effort, prompt string) (result intelligenceExecution) {
-	if account == nil || account.IsGrokAPI() || account.IsAntigravityAPI() {
+	if account == nil {
 		return intelligenceExecution{Interrupted: true, Error: "配置错误：该账号渠道不支持降智检测"}
 	}
 	claude := account.IsClaudeOAuth()
-	if claude {
+	if claude || account.IsGrokAPI() || account.IsAntigravityAPI() || account.IsKiro() {
 		effort = ""
 	}
 	if err := h.validateQualityTestForAccount(ctx, account, qualityTestRequest{Model: model, ReasoningEffort: effort}); err != nil {
 		return intelligenceExecution{Interrupted: true, Error: "配置错误：" + err.Error()}
+	}
+	if err := h.ensureKiroBearer(ctx, account); err != nil {
+		// 只有上游明确拒绝凭据才封住本代凭据的自动检测；网络或 5xx 之类的临时故障保持可重试。
+		return intelligenceExecution{Error: "Kiro 账号令牌刷新失败: " + err.Error(), CredentialRejected: auth.IsPermanentRefreshFailure(err)}
 	}
 	payload := map[string]any{"model": model, "stream": true}
 	security := h.store.ClaudeSecurityConfig()
@@ -111,6 +132,10 @@ func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Ac
 	switch {
 	case claude:
 		resp, err = proxy.ExecuteClaudeMessagesRequest(ctx, account, body, proxyURL, make(http.Header), fingerprint, security)
+	case account.IsAntigravityAPI():
+		resp, err = h.executeAntigravityConnectionTest(ctx, account, model, body, proxyURL, true)
+	case account.IsGrokAPI():
+		resp, err = proxy.ExecuteGrokProtocolRequest(ctx, account, proxy.GrokProtocolResponses, nil, body, proxyURL, nil)
 	case account.IsRelayStyle():
 		resp, err = proxy.ExecuteRelayStyleRequest(ctx, account, body, proxyURL, nil)
 	default:
@@ -125,6 +150,7 @@ func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Ac
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		result.Error = fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(raw), 4096))
+		result.CredentialRejected = intelligenceCredentialRejected(raw) || (account.IsAntigravityAPI() || account.IsKiro()) && resp.StatusCode == http.StatusUnauthorized
 		h.applyIntelligenceUpstreamFailure(account, resp, model, raw)
 		return
 	}
@@ -134,11 +160,12 @@ func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Ac
 		proxy.SyncCodexUsageState(h.store, account, resp)
 	}
 	result = readIntelligenceStream(resp.Body, claude)
+	result.CredentialRejected = intelligenceCredentialRejected(result.terminalPayload)
 	if ctx.Err() != nil {
 		result.Complete = false
 		result.Error = ctx.Err().Error()
 	}
-	if !claude && result.Error != "" && len(result.terminalPayload) > 0 {
+	if !claude && !account.IsAntigravityAPI() && result.Error != "" && len(result.terminalPayload) > 0 {
 		h.applyResponsesUsageLimitFailure(account, resp, model, result.terminalPayload)
 	}
 	// Never mark an account successful/reset its authentication or quota state here.
@@ -150,8 +177,25 @@ func (h *Handler) executeIntelligenceCheck(ctx context.Context, account *auth.Ac
 	return
 }
 
+// applyIntelligenceUpstreamFailure preserves each source's native HTTP failure policy.
 func (h *Handler) applyIntelligenceUpstreamFailure(account *auth.Account, resp *http.Response, model string, raw []byte) {
 	detail := truncate(sanitizeCodexTestText(string(raw), codexTestSecrets(account)), 500)
+	if account.IsAntigravityAPI() {
+		// The dedicated executor already attempted OAuth refresh. Record the final
+		// authentication failure without a Codex ban or account-wide quota cooldown.
+		if resp.StatusCode == http.StatusUnauthorized {
+			h.store.MarkError(account, detail)
+		}
+		return
+	}
+	if account.IsGrokAPI() {
+		proxy.ApplyGrokCooldown(h.store, account, resp.StatusCode, raw, resp, model)
+		return
+	}
+	if account.IsKiro() {
+		proxy.ApplyKiroCooldown(h.store, account, resp.StatusCode, raw)
+		return
+	}
 	if account.IsClaudeOAuth() {
 		syncClaudeTestUsageState(h.store, account, model, resp, raw)
 		if resp.StatusCode == http.StatusUnauthorized {
@@ -363,4 +407,14 @@ func readIntelligenceStream(body io.Reader, claude bool) (result intelligenceExe
 		result.Error = "上游流已中断，未收到成功终态"
 	}
 	return
+}
+
+func intelligenceCredentialRejected(payload []byte) bool {
+	for _, path := range []string{"error.code", "response.error.code"} {
+		switch gjson.GetBytes(payload, path).String() {
+		case "token_revoked", "account_deactivated", "workspace_deactivated", "organization_deactivated":
+			return true
+		}
+	}
+	return false
 }

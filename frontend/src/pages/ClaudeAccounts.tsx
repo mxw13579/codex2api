@@ -76,6 +76,11 @@ import {
 } from "../lib/accountProxyBinding";
 import ChipInput from "../components/ChipInput";
 import { formatCustomHeadersText, parseCustomHeadersText } from "../lib/accountQuickConfig";
+import {
+  autoPauseThresholdPercentToRatio,
+  formatAutoPauseThresholdPercent,
+  isAutoPauseThresholdPercentInvalid,
+} from "../lib/autoPauseThreshold";
 import { AccountGroupManagerModal, ACCOUNT_GROUP_COLORS } from "../components/AccountGroupManagerModal";
 import { Select } from "../components/ui/select";
 import ChannelLogo from "../components/ChannelLogo";
@@ -109,6 +114,7 @@ import { useToast } from "../hooks/useToast";
 import { useConfirmDialog } from "../hooks/useConfirmDialog";
 import { getErrorMessage } from "../utils/error";
 import { getAccountStatusBadgeStatus } from "../lib/usageFormat";
+import { scheduleAccountStatsPoll } from "../lib/accountStatsPoll";
 import {
   CLAUDE_TIMEZONE_CUSTOM,
   CLAUDE_TIMEZONE_OPTIONS,
@@ -598,6 +604,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
   const [domains, setDomains] = useState<AccountEmailDomainFacet[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [statsState, setStatsState] = useState<"ready" | "stale" | "warming">("warming");
+  const [disabledSorts, setDisabledSorts] = useState<string[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
   // 代理池开关 + 全局代理:代理徽章要靠这两个才能把"未自绑"的账号判成继承池/全局/直连。
@@ -758,6 +766,8 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
       setTags(res.facets?.tags ?? []);
       setDomains(res.facets?.email_domains ?? []);
       setTotal(res.total ?? rows.length);
+      setStatsState(res.stats_state ?? "ready");
+      setDisabledSorts(res.disabled_sorts ?? []);
       if (res.page && res.page !== page) setPage(res.page);
       // 累积已知套餐,供套餐 Tab 使用。
       setKnownPlans((prev) => {
@@ -794,6 +804,32 @@ export default function ClaudeAccounts({ headerSlot }: { headerSlot?: ReactNode 
     void reload();
     return () => reloadAbortRef.current?.abort();
   }, [reload]);
+
+  // Request-count pills are filled by a detached usage_logs scan. Keep polling
+  // until stats_state is ready so a slow scan does not leave them at zero.
+  // A hidden tab keeps the same delay and retry budget, then reloads once visible.
+  const statsStaleRetriesRef = useRef(0);
+  const statsReloadRef = useRef(reload);
+  useEffect(() => {
+    if (statsReloadRef.current !== reload) {
+      statsReloadRef.current = reload;
+      statsStaleRetriesRef.current = 0;
+    }
+    if (loading) return undefined;
+    if (statsState === "ready") {
+      statsStaleRetriesRef.current = 0;
+      return undefined;
+    }
+    const maxStatsRetries = disabledSorts.includes("requests") ? 60 : 20;
+    if (statsStaleRetriesRef.current >= maxStatsRetries) return undefined;
+    // loadError is a dep so a failed silent reload re-runs this effect and
+    // rearms the one-shot poll; otherwise the pills stay stale until another
+    // action reloads the page.
+    return scheduleAccountStatsPoll(3000, () => {
+      statsStaleRetriesRef.current += 1;
+      void reload({ silent: true });
+    });
+  }, [accounts, disabledSorts, loadError, loading, reload, statsState]);
 
   // 导入接口只负责入队，首轮 native Messages 采样在后台完成。对仍未
   // 采样的 Claude 账号做有限次数静默轮询，让页面自动显示采样结果，同时
@@ -2981,12 +3017,9 @@ function EditAccountModal({
   const [concurrency, setConcurrency] = useState(
     account.base_concurrency_override != null ? String(account.base_concurrency_override) : "",
   );
-  const [pause5h, setPause5h] = useState(
-    account.auto_pause_5h_threshold != null ? String(account.auto_pause_5h_threshold) : "",
-  );
-  const [pause7d, setPause7d] = useState(
-    account.auto_pause_7d_threshold != null ? String(account.auto_pause_7d_threshold) : "",
-  );
+  // 自动暂停阈值后端存 0..1 比例,输入框按百分比展示/输入(issue #843)。
+  const [pause5h, setPause5h] = useState(() => formatAutoPauseThresholdPercent(account.auto_pause_5h_threshold));
+  const [pause7d, setPause7d] = useState(() => formatAutoPauseThresholdPercent(account.auto_pause_7d_threshold));
   const [fpMode, setFpMode] = useState<"" | "preserve" | "force">(
     (account.claude_fingerprint_mode as "" | "preserve" | "force") ?? "",
   );
@@ -3043,6 +3076,10 @@ function EditAccountModal({
       }
       apiKeyCustomHeaders = parsed.value;
     }
+    if (!isAPIKeyAccount && (isAutoPauseThresholdPercentInvalid(pause5h) || isAutoPauseThresholdPercentInvalid(pause7d))) {
+      showToast(t("accounts.autoPauseThresholdRange"), "error");
+      return;
+    }
     setBusy(true);
     try {
       await api.updateAccountScheduler(account.id, {
@@ -3052,8 +3089,8 @@ function EditAccountModal({
         score_bias_override: parseNum(scoreBias),
         base_concurrency_override: parseNum(concurrency),
         ...(!isAPIKeyAccount ? {
-        auto_pause_5h_threshold: parseNum(pause5h),
-        auto_pause_7d_threshold: parseNum(pause7d),
+        auto_pause_5h_threshold: autoPauseThresholdPercentToRatio(pause5h),
+        auto_pause_7d_threshold: autoPauseThresholdPercentToRatio(pause7d),
         claude_fingerprint_mode: fpMode,
         claude_client_platform: clientPlatform || null,
         claude_version_policy: versionPolicy || null,
@@ -3252,8 +3289,8 @@ function EditAccountModal({
             {t("claude.editSectionAutoPause")}
           </div>
           <div className="grid grid-cols-2 gap-3">
-            {field(t("claude.autoPause5hLabel"), <Input value={pause5h} onChange={(e) => setPause5h(e.target.value)} placeholder="90" inputMode="numeric" />)}
-            {field(t("claude.autoPause7dLabel"), <Input value={pause7d} onChange={(e) => setPause7d(e.target.value)} placeholder="90" inputMode="numeric" />)}
+            {field(t("claude.autoPause5hLabel"), <Input value={pause5h} onChange={(e) => setPause5h(e.target.value)} placeholder="90" inputMode="decimal" />)}
+            {field(t("claude.autoPause7dLabel"), <Input value={pause7d} onChange={(e) => setPause7d(e.target.value)} placeholder="90" inputMode="decimal" />)}
           </div>
         </div>
 

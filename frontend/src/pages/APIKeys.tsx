@@ -11,6 +11,8 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router-dom";
 import { api } from "../api";
 import APIKeyConcurrencyBadge, { useAPIKeyConcurrency } from "../components/APIKeyConcurrencyBadge";
+import KeyUsageAccountPermissions from "../components/KeyUsageAccountPermissions";
+import APIKeyChannelBadge from "../components/APIKeyChannelBadge";
 import APIKeyTokenUsagePanel from "../components/APIKeyTokenUsagePanel";
 import APIKeyModelRequestLimitsEditor from "../components/APIKeyModelRequestLimitsEditor";
 import APIKeyModelRequestUsageCard from "../components/APIKeyModelRequestUsage";
@@ -148,7 +150,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity" | "claude";
+type UpstreamChannel = "auto" | "codex" | "grok" | "antigravity" | "claude" | "kiro";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -371,6 +373,7 @@ export default function APIKeys() {
         grok_models?: string[];
         antigravity_models?: string[];
         claude_models?: string[];
+        kiro_models?: string[];
       }>,
       api.getSettings().catch((): SystemSettings | null => null),
       api.getPromptFilterNewAPIBindings().catch(() => ({ bindings: [] as PromptFilterNewAPIBinding[] })),
@@ -382,6 +385,7 @@ export default function APIKeys() {
       grokModelOptions: modelsResponse.grok_models ?? [],
       antigravityModelOptions: modelsResponse.antigravity_models ?? [],
       claudeModelOptions: modelsResponse.claude_models ?? [],
+      kiroModelOptions: modelsResponse.kiro_models ?? [],
       settings: settingsResponse,
       promptBindings: promptBindingsResponse.bindings ?? [],
     };
@@ -394,6 +398,7 @@ export default function APIKeys() {
     grokModelOptions: string[];
     antigravityModelOptions: string[];
     claudeModelOptions: string[];
+    kiroModelOptions: string[];
     settings: SystemSettings | null;
     promptBindings: PromptFilterNewAPIBinding[];
   }>({
@@ -404,6 +409,7 @@ export default function APIKeys() {
       grokModelOptions: [],
       antigravityModelOptions: [],
       claudeModelOptions: [],
+      kiroModelOptions: [],
       settings: null,
       promptBindings: [],
     },
@@ -460,9 +466,10 @@ export default function APIKeys() {
       if (channel === "antigravity") return antigravityModelOptions;
       if (channel === "codex") return modelOptions;
       if (channel === "claude") return claudeModelOptions;
+      if (channel === "kiro") return data.kiroModelOptions;
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
       const merged = [...modelOptions];
-      for (const candidate of [...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions]) {
+      for (const candidate of [...grokModelOptions, ...antigravityModelOptions, ...claudeModelOptions, ...data.kiroModelOptions]) {
         if (!seen.has(candidate.toLowerCase())) {
           seen.add(candidate.toLowerCase());
           merged.push(candidate);
@@ -470,7 +477,7 @@ export default function APIKeys() {
       }
       return merged;
     },
-    [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions],
+    [modelOptions, grokModelOptions, antigravityModelOptions, claudeModelOptions, data.kiroModelOptions],
   );
   const createSelectableGroups = useMemo(
     () =>
@@ -1569,7 +1576,7 @@ export default function APIKeys() {
                                     status={getAPIKeyStatus(keyRow)}
                                     t={t}
                                   />
-                                  <KeyChannelBadge keyRow={keyRow} t={t} />
+                                  <APIKeyChannelBadge channel={keyRow.limits?.upstream_channel} />
                                   <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                   <KeyScopeBudgetBadge
                                     items={scopeSummary[String(keyRow.id)]}
@@ -1782,7 +1789,7 @@ export default function APIKeys() {
                                         status={getAPIKeyStatus(keyRow)}
                                         t={t}
                                       />
-                                      <KeyChannelBadge keyRow={keyRow} t={t} />
+                                      <APIKeyChannelBadge channel={keyRow.limits?.upstream_channel} />
                                       <APIKeyPromptPolicyBadge binding={promptBindingsByKey.get(keyRow.id)} />
                                       <KeyScopeBudgetBadge
                                         items={scopeSummary[String(keyRow.id)]}
@@ -2017,6 +2024,7 @@ export default function APIKeys() {
                     <p className="text-sm leading-relaxed text-muted-foreground">
                       {t("apiKeys.keyAuthNote")}
                     </p>
+                    <KeyUsageAccountPermissions />
                     <div className="flex flex-col gap-3 rounded-xl border border-border/80 bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0">
                         <div className="text-sm font-semibold text-foreground">
@@ -2449,6 +2457,11 @@ export default function APIKeys() {
                 error={modelRequestUsageError}
               />
 
+              {/* Keep pending permission saves mounted while switching edit tabs. */}
+              <div hidden={editTab !== "basic"}>
+                <KeyUsageAccountPermissions key={editingKey.id} keyID={editingKey.id} />
+              </div>
+
               {editTab === "basic" ? (
                 <>
                   <div className="grid gap-4 sm:grid-cols-2">
@@ -2782,6 +2795,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
       limits.upstream_channel === "grok" ||
       limits.upstream_channel === "antigravity"
       || limits.upstream_channel === "claude"
+      || limits.upstream_channel === "kiro"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2877,10 +2891,15 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelClaude"),
       icon: <ChannelLogo channel="claude" size={18} />,
     },
+    {
+      key: "kiro",
+      label: t("apiKeys.limits.upstreamChannelKiro"),
+      icon: <ChannelLogo channel="kiro" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-5 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1 sm:grid-cols-6">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}
@@ -3207,76 +3226,6 @@ function KeyScopeBudgetBadge({
         percent: Math.min(100, Math.round(tightest.ratio * 100)),
         window: tightest.window || "-",
       })}
-    </Badge>
-  );
-}
-
-// KeyChannelBadge 展示该 Key 的上游渠道限定（auto/codex/grok），一眼区分 Key 用途。
-function KeyChannelBadge({
-  keyRow,
-  t,
-}: {
-  keyRow: APIKeyRow;
-  t: Translator;
-}) {
-  const channel = keyRow.limits?.upstream_channel;
-  if (channel === "grok") {
-    return (
-      <Badge
-        variant="outline"
-        title={t("apiKeys.limits.upstreamChannelGrok")}
-        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
-      >
-        <ChannelLogo channel="grok" size={12} />
-        Grok
-      </Badge>
-    );
-  }
-  if (channel === "antigravity") {
-    return (
-      <Badge
-        variant="outline"
-        title={t("apiKeys.limits.upstreamChannelAntigravity")}
-        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
-      >
-        <ChannelLogo channel="antigravity" size={12} />
-        Antigravity
-      </Badge>
-    );
-  }
-  if (channel === "codex") {
-    return (
-      <Badge
-        variant="outline"
-        title={t("apiKeys.limits.upstreamChannelCodex")}
-        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
-      >
-        <ChannelLogo channel="codex" size={12} />
-        Codex
-      </Badge>
-    );
-  }
-  if (channel === "claude") {
-    return (
-      <Badge
-        variant="outline"
-        title={t("apiKeys.limits.upstreamChannelClaude")}
-        className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-foreground"
-      >
-        <ChannelLogo channel="claude" size={12} />
-        Claude
-      </Badge>
-    );
-  }
-  // auto：路由图标表示"不限渠道，按模型自动路由"
-  return (
-    <Badge
-      variant="outline"
-      title={t("apiKeys.limits.upstreamChannelHint.auto")}
-      className="gap-1 border-transparent bg-muted/70 px-1.5 py-0 text-[11px] font-semibold text-muted-foreground"
-    >
-      <Waypoints className="size-3" />
-      {t("apiKeys.limits.upstreamChannelAutoTab")}
     </Badge>
   );
 }
@@ -3985,6 +3934,16 @@ const CLAUDE_PLAN_FILTER_OPTIONS = [
   "business",
 ] as const;
 
+// Kiro 套餐键由后端按订阅标题关键词归一（auth.KiroPlanKey）。
+const KIRO_PLAN_FILTER_OPTIONS = [
+  "kiro free",
+  "kiro pro",
+  "kiro pro+",
+  "kiro max",
+  "kiro power",
+  "kiro student",
+] as const;
+
 // Antigravity 套餐键由 Google tier id 折叠而来(g1-pro-tier → pro,
 // g1-ultra-tier → ultra,standard-tier → standard);API Key 账号为 api。
 const ANTIGRAVITY_PLAN_FILTER_OPTIONS = [
@@ -4001,6 +3960,7 @@ const PLAN_FILTER_OPTIONS: readonly string[] = Array.from(
     ...GROK_PLAN_FILTER_OPTIONS,
     ...CLAUDE_PLAN_FILTER_OPTIONS,
     ...ANTIGRAVITY_PLAN_FILTER_OPTIONS,
+    ...KIRO_PLAN_FILTER_OPTIONS,
   ]),
 );
 
@@ -4009,6 +3969,7 @@ function planOptionsForChannel(channel: UpstreamChannel): readonly string[] {
   if (channel === "grok") return GROK_PLAN_FILTER_OPTIONS;
   if (channel === "claude") return CLAUDE_PLAN_FILTER_OPTIONS;
   if (channel === "antigravity") return ANTIGRAVITY_PLAN_FILTER_OPTIONS;
+  if (channel === "kiro") return KIRO_PLAN_FILTER_OPTIONS;
   return PLAN_FILTER_OPTIONS;
 }
 
