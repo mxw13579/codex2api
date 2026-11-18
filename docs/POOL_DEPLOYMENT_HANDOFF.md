@@ -4,7 +4,7 @@
 
 - 旧槽不再必须自然归零：`deploy`/`rollback`/`drain` 的排空等待默认 **180 秒**，超时后**默认强制停止**旧槽（同样是 `compose stop --timeout 120`，退出码 0），打印当时剩余连接与排队数。要沿用“超时保留旧槽、退出码 2”的旧行为，加 `--no-force-stop`。
 - **`release.sh drain --drain-timeout 0` 的含义变了**：有连接时默认立即强制停止。以前用它“只检查一次”的操作（见下方 1.0.16 记录）今后必须写成 `release.sh drain --drain-timeout 0 --no-force-stop`。
-- 强制停止仍要求活动槽 `UP`、旧槽 `DRAIN`/`MAINT`，只停非活动槽。在途请求实际只有应用优雅关闭的约 10 秒（`http.Server.Shutdown` 等待上限），120 秒只是 SIGKILL 上限。
+- 强制停止仍要求活动槽 `UP`、旧槽 `DRAIN`/`MAINT`，只停非活动槽。SIGTERM 后应用停止接受新连接，在途 HTTP/SSE 最多再跑约 110 秒（`http.Server.Shutdown` 等待上限，常量 `httpShutdownGracePeriod`），已升级的下游 WS 不被等待、到进程退出为止；120 秒是 SIGKILL 上限，留约 10 秒收尾。默认参数下旧槽最晚约在切流后 180 + 110 秒左右停止。
 - 新版应用支持排空模式：切流后脚本对旧槽发 SIGUSR1，旧槽立即关闭空闲上游 WS 连接、之后用完即关，并关闭下游 keep-alive，避免旧槽空闲连接挤占出口代理的每号连接名额。发信号前先读该槽 `/health`，只有 `drain_mode_supported: true` 才发；1.0.21 及更早版本没有该字段，不会收到信号（未注册处理函数的 SIGUSR1 会直接终止 Go 进程）。详见 `deploy/rolling/README.md`。
 - 下方历史记录中“自然归零”“不得为了结束发布强制删除”是当时流程的描述；新流程下排空超时后的强制停止由 release 工具执行，仍然不要绕过工具手动删除容器。
 

@@ -34,6 +34,10 @@ import (
 //go:embed frontend/dist/*
 var frontendFS embed.FS
 
+// httpShutdownGracePeriod 是收到 SIGTERM 后等待在途 HTTP/SSE 请求结束的上限。
+// 必须小于发布脚本 `compose stop --timeout 120` 的 120 秒，为之后的收尾步骤留出时间，避免被 SIGKILL。
+const httpShutdownGracePeriod = 110 * time.Second
+
 func migrateOnlyEnabled() bool {
 	value := strings.TrimSpace(os.Getenv("CODEX_MIGRATE_ONLY"))
 	return value == "1" || strings.EqualFold(value, "true")
@@ -744,7 +748,7 @@ func main() {
 	log.Println("正在关闭...")
 	// 先停止会产生新副作用的后台任务，再等待现有 HTTP 请求排空。
 	cancelBackground()
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), httpShutdownGracePeriod)
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
