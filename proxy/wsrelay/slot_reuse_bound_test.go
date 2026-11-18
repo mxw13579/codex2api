@@ -71,17 +71,18 @@ func TestSlotReuseBoundKeepsHandshakesWithinSlots(t *testing.T) {
 	account := &auth.Account{DBID: 501, DynamicConcurrencyLimit: 4}
 
 	runSequentialStatelessRequests(t, manager, account, wsURL, 2, 100)
-	if got := handshakes.Load(); got > 2 {
-		t.Fatalf("handshakes = %d, want at most 2 (one per slot)", got)
+	// 串行请求下已有槽位总是空闲（只是带绑定），先接管后新建，只需一条槽位连接。
+	if got := handshakes.Load(); got != 1 {
+		t.Fatalf("handshakes = %d, want 1 (bound idle slot reused before dialing a free slot)", got)
 	}
 	line := statsLineFor(t, manager.connectionStatsLines(time.Now()), account.ID())
-	for _, want := range []string{"slot_fallback=0 ", "dial_kind=slot:2,oneshot:0,"} {
+	for _, want := range []string{"slot_fallback=0 ", "dial_kind=slot:1,oneshot:0,"} {
 		if !strings.Contains(line, want) {
 			t.Fatalf("stats line %q missing %q", line, want)
 		}
 	}
-	if !strings.Contains(line, "slot_bound:98,") {
-		t.Fatalf("stats line %q: want 98 bound-slot reuses", line)
+	if !strings.Contains(line, "slot_bound:99,") {
+		t.Fatalf("stats line %q: want 99 bound-slot reuses", line)
 	}
 }
 
@@ -381,7 +382,7 @@ func TestSlotReuseBoundConcurrentWithContinuation(t *testing.T) {
 		t.Fatalf("handshakes = %d, want at most slots(%d) + one-shot fallbacks(%d) = %d (closes=%v)", got, slots, fallbacks, limit, closes)
 	}
 	if boundReuses == 0 {
-		t.Fatal("no stateless request took over a bound slot; the third pass was not exercised")
+		t.Fatal("no stateless request took over a bound slot; the bound-slot takeover was not exercised")
 	}
 	if continuationHits.Load() == 0 {
 		t.Fatal("no continuation request ever won a connection; the race was not exercised")
@@ -400,10 +401,10 @@ func keyLockRefs(manager *Manager, key string) int {
 	return 0
 }
 
-// TestSlotReuseBoundProbeInterleavedWithContinuation 固定一种交错：第三遍在探活中
+// TestSlotReuseBoundProbeInterleavedWithContinuation 固定一种交错：接管带绑定槽位的第二遍在探活中
 // 阻塞（持有 pool-key 锁），同时续链请求争用同一条连接，然后放行探活。正确实现下
 // 两者互斥：恰好一方拿到连接，连接保持可用，续链方以 ResponsesContinuationLostError
-// 结束，而不是拿到连接或销毁第三遍已占位的连接。
+// 结束，而不是拿到连接或销毁第二遍已占位的连接。
 func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
@@ -416,7 +417,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	release := make(chan struct{})
 	laterProbe := make(chan struct{}, 8)
 	var calls atomic.Int32
-	// 第一遍遇到带绑定的槽位不探活，因此第一次探活来自第三遍。
+	// 第一遍遇到带绑定的槽位不探活，因此第一次探活来自第二遍（接管）。
 	manager.probeFunc = func(*WsConnection) bool {
 		if calls.Add(1) == 1 {
 			close(entered)
@@ -439,7 +440,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("third pass never probed the bound slot")
+		t.Fatal("bound-slot takeover never probed the bound slot")
 	}
 	baseRefs := keyLockRefs(manager, key)
 
@@ -453,7 +454,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	}()
 	// 正确实现下续链方随后取得同一把 pool-key 锁的引用并阻塞在该锁上，既不探活
 	// 也不返回。若续链方绕过了互斥（探活或直接返回），先等它完成取连，再放行
-	// 第三遍，使竞争输家必然出现。
+	// 第二遍，使竞争输家必然出现。
 	var cont result
 	contFinished := false
 	deadline := time.After(5 * time.Second)
@@ -493,7 +494,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	t.Logf("slot err=%v same=%v; continuation err=%v same=%v; connected=%v pending=%d",
 		slot.err, slot.wc == wc, cont.err, cont.wc == wc, wc.IsConnected(), wc.session.PendingCount())
 	if owners > 1 {
-		t.Fatal("third pass and continuation both own the same connection")
+		t.Fatal("bound-slot takeover and continuation both own the same connection")
 	}
 	if !wc.IsConnected() {
 		t.Fatal("connection was destroyed by the acquisition race")
@@ -502,7 +503,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 		t.Fatalf("connection has %d in-flight requests, want at most 1", pending)
 	}
 	if slot.err != nil || slot.wc != wc {
-		t.Fatalf("third pass = (%p, %v), want the bound slot", slot.wc, slot.err)
+		t.Fatalf("bound-slot takeover = (%p, %v), want the bound slot", slot.wc, slot.err)
 	}
 	var lost *proxy.ResponsesContinuationLostError
 	if !errors.As(cont.err, &lost) {
@@ -511,7 +512,7 @@ func TestSlotReuseBoundProbeInterleavedWithContinuation(t *testing.T) {
 	wc.session.RemovePendingRequest(slot.pr.RequestID)
 }
 
-// TestSlotReuseBoundStopsOnCanceledContext 验证第三遍在候选之间检查 ctx：
+// TestSlotReuseBoundStopsOnCanceledContext 验证接管带绑定槽位的第二遍在候选之间检查 ctx：
 // 已取消时返回 ctx.Err()，不接管槽位，也不落到一次性拨号。
 func TestSlotReuseBoundStopsOnCanceledContext(t *testing.T) {
 	manager := NewManager()

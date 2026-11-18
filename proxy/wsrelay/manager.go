@@ -738,11 +738,13 @@ func (m *Manager) AcquireConnection(
 //  2. allowCreate 为真且有空槽位时在第一个空槽位新建兄弟连接。新建失败（容量满/
 //     拨号/租约失败）即放弃，不再转去接管带绑定的连接。
 //  3. 没有空槽位或不允许新建时（CODEX_WS_SLOT_REUSE_BOUND，默认开启），按 lastUsed
-//     从旧到新接管空闲但带续链绑定的兄弟连接并放弃其旧绑定，与无会话槽位第三遍共用
+//     从旧到新接管空闲但带续链绑定的兄弟连接并放弃其旧绑定，与无会话槽位第二遍（接管带绑定槽位）共用
 //     acquireBoundReusableSlot，加锁约定与续链取连互斥方式相同。
 //
-// 顺序与 AcquireReusableConnection 一致：接管会让该连接上刚完成响应的续链必然丢失，
-// 有空槽位时宁可多握手一次也不付这个代价。
+// 同会话溢出保持"先新建、后接管"：接管会让该连接上刚完成响应的续链必然丢失，
+// 有空槽位时宁可多握手一次也不付这个代价。无会话槽位（AcquireReusableConnection）
+// 则改为先接管、后新建，因为每个完成的响应都会绑定连接，先新建会让槽位在空闲
+// 保留池的 LRU 回收下循环重建。
 //
 // 正在处理请求的兄弟连接一律跳过。账号容量满或拨号/租约失败即放弃，调用方回落到
 // 继续等待原连接——失败路径不会比不开启 overflow 更差。兄弟连接正常入池，由既有的
@@ -886,8 +888,8 @@ const maxCreateLeaseAttempts = 3
 const newConnectionReadFailureGrace = 5 * time.Millisecond
 
 // AcquireReusableConnection 在固定槽位内复用或创建连接，返回实际使用的 session key。
-// 第一遍只复用已存在、空闲且无续链绑定的连接；第二遍在空槽位新建持久连接；第三遍
-// （CODEX_WS_SLOT_REUSE_BOUND，默认开启）接管空闲但带续链绑定的槽位并放弃旧绑定；
+// 第一遍只复用已存在、空闲且无续链绑定的连接；第二遍（CODEX_WS_SLOT_REUSE_BOUND，
+// 默认开启）接管空闲但带续链绑定的槽位并放弃旧绑定；第三遍才在空槽位新建持久连接；
 // 仍不成功时回退到 fallbackKey 的临时连接。空白预热共用账号空白预算；聊天收尾后按空闲上限保留。
 func (m *Manager) AcquireReusableConnection(
 	ctx context.Context,
@@ -907,11 +909,11 @@ func (m *Manager) AcquireReusableConnection(
 	}
 	accountLock, releaseAccountLock := m.accountLock(account.ID())
 	defer releaseAccountLock()
-	// 第一遍顺带记录槽位状态：空闲但带续链绑定的连接是第三遍的候选，
+	// 第一遍顺带记录槽位状态：空闲但带续链绑定的连接是第二遍的候选，
 	// 两类计数用于兜底统计，不额外扫描连接表。
 	var boundSlots []boundReusableSlot
 	busySlots := 0
-	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第二遍可以补位）
+	// 第一遍：复用空闲连接（探活失败或已断开的顺手清理，让第三遍可以补位）
 	for i := 0; i < slots; i++ {
 		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
 		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
@@ -958,7 +960,21 @@ func (m *Manager) AcquireReusableConnection(
 		}
 		lock.Unlock()
 	}
-	// 第二遍：在空槽位新建持久连接
+	// 第二遍：先按 lastUsed 从旧到新接管空闲但带续链绑定的槽位并放弃其旧绑定，
+	// 已有槽位只要有空闲的就复用，不在空槽位新建。否则空闲保留池满时，新建会触发
+	// LRU 回收其他未被使用的槽位，形成"回收 → 空槽位 → 新建 → 再回收"的循环握手。
+	// 第一遍逐槽位加锁后都已解锁（defer 只归还锁引用），这里不持有任何 pool-key 锁
+	// 或账号锁；候选在接管函数内于 keyLock → accountLock 下复验。
+	if slotReuseBoundEnabled() && len(boundSlots) > 0 {
+		wc, pr, slotSession, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSlots, accountLock, reuseKindSlotBound)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		if ok {
+			return wc, pr, slotSession, nil
+		}
+	}
+	// 第三遍：已有槽位全忙（或接管均失败）时，在空槽位新建持久连接
 	for i := 0; i < slots; i++ {
 		slotSession := fmt.Sprintf("%s#%d", baseKey, i)
 		key := m.poolKey(account.ID(), wsURL, slotSession, proxyURL)
@@ -1012,17 +1028,6 @@ func (m *Manager) AcquireReusableConnection(
 		}
 		return wc, pr, slotSession, nil
 	}
-	// 第三遍：没有空槽位时，按 lastUsed 从旧到新接管空闲但带续链绑定的槽位，
-	// 放弃其旧绑定，避免每个请求都落到一次性连接上重新握手。
-	if slotReuseBoundEnabled() && len(boundSlots) > 0 {
-		wc, pr, slotSession, ok, err := m.acquireBoundReusableSlot(ctx, account, kind, boundSlots, accountLock, reuseKindSlotBound)
-		if err != nil {
-			return nil, nil, "", err
-		}
-		if ok {
-			return wc, pr, slotSession, nil
-		}
-	}
 	// 槽位全忙：回退一次性连接
 	m.connStats.recordSlotFallback(account.ID(), len(boundSlots), busySlots)
 	wc, pr, err := m.AcquireConnection(ctx, account, wsURL, fallbackKey, headers, proxyOverride)
@@ -1040,7 +1045,7 @@ type boundReusableSlot struct {
 // acquireBoundReusableSlot 依次尝试接管带续链绑定的空闲槽位（lastUsed 最旧优先），
 // 第一个成功的即返回，成功时按 reuseKind 记复用统计（无会话槽位记 slot_bound，busy
 // overflow 兄弟连接记 overflow）。调用方持有 accountLock 的引用但未加锁。每个候选开始前检查
-// ctx：已取消时返回 ctx.Err()，与第二遍取消时直接返回错误一致，不再落到一次性拨号。
+// ctx：已取消时返回 ctx.Err()，与新建槽位连接时取消直接返回错误一致，不再落到一次性拨号。
 //
 // 与续链取连（acquirePreferredConnection）互斥依赖同一把 pool-key 锁：续链取连在
 // keyLock(wc.PoolKey) 内完成"复验绑定 + 复验无在途 + 占位"，这里在同一把 keyLock
@@ -1269,7 +1274,7 @@ func (m *Manager) removeResponseConnBindings(wc *WsConnection) {
 }
 
 // dropResponseConnBindings 放弃指向 wc 的全部续链绑定，但不禁止之后的新绑定：
-// 连接被第三遍槽位复用接管后，新请求完成时照常绑定。调用方持有 wc 的 pool-key 锁。
+// 连接被无会话槽位接管（第二遍）后，新请求完成时照常绑定。调用方持有 wc 的 pool-key 锁。
 func (m *Manager) dropResponseConnBindings(wc *WsConnection) {
 	m.respConnMu.Lock()
 	defer m.respConnMu.Unlock()

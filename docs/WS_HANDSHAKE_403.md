@@ -96,6 +96,46 @@
 4. 出现异常时可在后台调低保留数，无需回滚版本。注意：调低保留数会在 30 秒内（下一次后台巡检）按 LRU 批量关闭超出的空闲连接，这些会话随后都要重新握手，应分步调低（例如 512 → 256 → 128），每步观察 `[WS-Stats]` 后再继续。
 5. 槽位接管（第三遍）出现问题时，设置 `CODEX_WS_SLOT_REUSE_BOUND=0` 并重启即可恢复改动前行为。
 
+## 后续改动：无会话槽位“先复用、后新建”（2026-11-16）
+
+### 发现：槽位被 LRU 回收后循环重建
+
+- 每个完成的响应都会给连接加 30 分钟续链绑定，所以第一遍（复用无绑定的空闲槽位）几乎从不命中：线上一小时 `reuse_kind.slot` 合计 10，`slot_bound` 合计 13,585。
+- 原顺序下只要有空槽位，第二遍就新建连接，带绑定的空闲槽位要等到没有空槽位时才被接管。
+- 槽位连接与对话连接共用每账号的空闲保留池（`codex_ws_downstream_keepalive_slots`，线上 128；`trimIdleChatConnections` 纯 LRU）。池子满时形成循环：某个槽位被回收而空出 → 下一个无会话请求在空槽位新建 → 新建后的收尾触发 LRU 回收 → 其他槽位因为请求都去新建而没被使用，成为最久未用而被回收 → 又空出槽位。
+- 账号 722 的对照：连接数未满时，槽位新建 37 次就填满；满了之后 6 分钟内槽位新建 74 次（全部握手成功），同期非 LRU 关闭只有 7 次，可见至少 67 条槽位连接是被 `idle_chat_lru` 回收后重建的。
+- 全池一小时槽位握手 5,460 次，占全部握手尝试的 37%；上游按出口的握手频率返回 403，这部分握手直接推高了 403。
+
+### 改动后的取槽位顺序（`AcquireReusableConnection`）
+
+1. 第一遍不变：复用空闲且无绑定的槽位，同时收集带绑定的空闲槽位、统计在忙槽位、清理失效连接。
+2. `CODEX_WS_SLOT_REUSE_BOUND` 开启（默认）且有带绑定的空闲槽位时，先按 `lastUsed` 从旧到新接管（`acquireBoundReusableSlot`，计 `reuse_kind.slot_bound`），放弃其旧绑定。这一步原来排在第三遍。
+3. 接管没有成功（没有候选，或候选在复验时已被占用或失效）时，才在空槽位新建（`dial_kind.slot`）。
+4. 仍不成功时回退一次性连接，`slot_fallback` 的统计口径不变。
+
+- 第一遍逐个槽位加锁并在本槽位处理完后解锁，进入接管时不持有任何 pool-key 锁或账号锁；接管函数内部按 keyLock → accountLock 复验“连接仍在池中、仍是同一条、无在途请求”后才占位，占位成功后才删除旧绑定。加锁顺序、复验与 ctx 取消时直接返回错误的行为都没有改。
+- 结果：已有槽位只要有空闲的就复用，只有全部在忙时才新建；槽位数按并发需要增长到上限，不再因为回收而反复重建。
+- 代价：带绑定的槽位被接管后，旧响应 ID 的续链会得到 `ResponsesContinuationLostError`（上文“结论”中已说明的影响面），现在在有空槽位时也会发生。
+- `CODEX_WS_SLOT_REUSE_BOUND=0` 时行为与改动前完全一致：第一遍 → 在空槽位新建 → 一次性连接。
+- 同会话溢出（`tryAcquireBusyOverflow`）仍是先新建、后接管，未改。空闲保留池的回收规则、`codex_ws_stateless_slots` 和 `codex_ws_downstream_keepalive_slots` 的含义都未改。
+- 上文中“第三遍”指接管带绑定槽位这一步，本次改动后它排在第二步。
+
+### 上线后观察
+
+- `dial_kind.slot` 应明显下降（热门账号满池后不再每分钟重建十几条槽位）。
+- `reuse_kind.slot_bound` 上升，`reuse_kind.slot` 仍接近 0 属于正常。
+- 热门账号 `idle_chat_lru` 关闭中槽位连接的比例下降。
+- `handshake_403` 次数与 HTTP 降级（握手 403 后降级 HTTP 的日志）次数下降。
+- `slot_fallback` 不应上升；若并发高的账号 `slot_fallback_busy` 接近槽位数，说明槽位确实不够用，与本次改动无关。
+
+### 同期改动：记录“上下文不可用”的原因码
+
+- 向客户端返回 409 `Previous response context is unavailable` 或 503 `Previous response context backend is temporarily unavailable` 时，打一行容器日志：
+  `[ResponseContext] unavailable status=<409|503> reason=<原因码> endpoint=<入站路径> transport=<http|ws> account=<账号ID或0>`
+- 不打印 `previous_response_id`、请求内容、API Key 或用户标识。返回给客户端的状态码、错误码、文案和 `details` 不变。
+- 这些路径在返回错误前都没有向上游发送请求，原本就不写 `usage_logs`，本次也没有新增写库，原因码只在容器日志里。
+- 排查方式：`docker logs <容器> 2>&1 | grep '\[ResponseContext\] unavailable' | grep -o 'reason=[a-z_]*' | sort | uniq -c`。
+
 ## 暂缓：403 后按账号暂停新握手
 
 记录在案，待 512 保留上线并有统计数据后再决定是否实施。
