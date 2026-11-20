@@ -191,7 +191,8 @@ func TestParseMaxDepth(t *testing.T) {
 		"2000000": DefaultMaxDepth,
 		"64":      64,
 		" 20000 ": 20000,
-		"1000000": 1000000,
+		"20001":   DefaultMaxDepth, // 超过 MaxAllowedDepth
+		"1000000": DefaultMaxDepth,
 	}
 	for raw, want := range cases {
 		if got := parseMaxDepth(raw); got != want {
@@ -200,10 +201,86 @@ func TestParseMaxDepth(t *testing.T) {
 	}
 }
 
-func TestLargeLimitAllocatesStack(t *testing.T) {
-	data := nestedArrays(20001)
-	if !Within(data, 20001) || Within(data, 20000) {
-		t.Fatalf("custom limit above default must work")
+func TestLimitUpToMaxAllowedDepth(t *testing.T) {
+	data := nestedArrays(MaxAllowedDepth)
+	if !Within(data, MaxAllowedDepth) || Within(data, MaxAllowedDepth-1) {
+		t.Fatalf("custom limit up to MaxAllowedDepth must work")
+	}
+	// 超过 MaxAllowedDepth 的 limit 被钳到 MaxAllowedDepth。
+	if Within(nestedArrays(MaxAllowedDepth+1), MaxAllowedDepth+5) {
+		t.Fatalf("limit must be clamped to MaxAllowedDepth")
+	}
+	if allocs := testing.AllocsPerRun(5, func() { _ = Within(data, MaxAllowedDepth) }); allocs != 0 {
+		t.Fatalf("Within allocated %v times", allocs)
+	}
+}
+
+// 第 2 条：顶层不是容器时，其后全部括号都计入（gjson.Get 顶层会跳进字符串内容）。
+func TestTopLevelNonContainerCountsAllBrackets(t *testing.T) {
+	limit := 16
+	deep := strings.Repeat("[", 100)
+	closed := deep + strings.Repeat("]", 100)
+	cases := []string{
+		`"` + closed + `"`,
+		`"` + deep,
+		`  "` + deep + `"`,
+		`1 ` + deep,
+		`true` + deep,
+		`null ` + closed,
+		`x` + deep,
+		"\x0c{\"a\":" + deep, // 非 JSON 空白的控制字节开头
+		"\x00" + closed,
+	}
+	for _, c := range cases {
+		if got := CheckLimit([]byte(c), limit); got != StatusUnverifiable {
+			t.Fatalf("%.30q: status=%v want StatusUnverifiable", c, got)
+		}
+		if ValidBytes([]byte(c)) && Check([]byte(c)) != StatusOK {
+			t.Fatalf("ValidBytes must be false when Check fails")
+		}
+	}
+	// 直接验证 gjson.Get 顶层进入字符串内容的行为，说明这条规则的必要性。
+	if got := gjson.Get(`"[[[1]]]"`, "0.0.0").Int(); got != 1 {
+		t.Fatalf("gjson.Get behaviour changed: %d", got)
+	}
+	for _, c := range []string{`"abc"`, `123`, `true`, `"` + strings.Repeat("x", 100) + `"`} {
+		if CheckLimit([]byte(c), limit) != StatusOK {
+			t.Fatalf("top-level scalar without brackets must pass: %.30q", c)
+		}
+	}
+}
+
+// 第 4 条：开头的 UTF-8 BOM 按空白处理（深度）但仍不是合法 JSON（与 gjson 一致）。
+func TestLeadingBOM(t *testing.T) {
+	limit := 16
+	bom := "\xef\xbb\xbf"
+	shallow := bom + `{"a":[` + strings.Repeat(`"x",`, 50) + `1]}`
+	if CheckLimit([]byte(shallow), limit) != StatusOK {
+		t.Fatalf("BOM + shallow JSON must pass the depth check")
+	}
+	if ValidBytes([]byte(shallow)) || gjson.ValidBytes([]byte(shallow)) {
+		t.Fatalf("BOM-prefixed JSON is not valid for gjson nor for ValidBytes")
+	}
+	if got := CheckLimit([]byte(bom+strings.Repeat("[", 100)), limit); got != StatusTooDeep {
+		t.Fatalf("BOM + deep arrays: status=%v want StatusTooDeep", got)
+	}
+	// gjson.Get 跳过 BOM 后看到的结构与严格扫描一致；gjson.Parse 直接返回空结果。
+	if gjson.Get(shallow, "a.#").Int() != 51 || gjson.Parse(shallow).Exists() {
+		t.Fatalf("gjson BOM handling changed")
+	}
+}
+
+// 第 4 条：区分两种拒绝原因。
+func TestCheckDistinguishesTooDeepAndUnverifiable(t *testing.T) {
+	limit := 16
+	if got := CheckLimit([]byte(strings.Repeat("[", 100)+strings.Repeat("]", 100)), limit); got != StatusTooDeep {
+		t.Fatalf("valid deep: %v", got)
+	}
+	if got := CheckLimit([]byte(`{"x":01,"m":`+strings.Repeat("[", 100)), limit); got != StatusUnverifiable {
+		t.Fatalf("invalid prefix: %v", got)
+	}
+	if got := CheckLimit([]byte(`{"x":1,"m":`+strings.Repeat("[", 10)+`]]]]]]]]]]}`), limit); got != StatusOK {
+		t.Fatalf("valid shallow: %v", got)
 	}
 }
 
@@ -259,6 +336,14 @@ func exerciseRecursiveParsers(data []byte) {
 	}
 	walk(root, 1<<30)
 	_ = json.Valid(data)
+	// gjson.Get 顶层会跳过任意字节直到第一个 '{'/'['（含进入顶层字符串内容），
+	// 再对取到的子结果做递归展开。
+	s := string(data)
+	for _, path := range []string{"0", "a", "0.0", "#", "@this"} {
+		_ = gjson.Get(s, path).Value()
+	}
+	root.ForEach(func(_, v gjson.Result) bool { _ = v.Value(); return true })
+	_ = ValidBytes(data)
 }
 
 const (
@@ -338,6 +423,10 @@ func FuzzWithinValidJSONAgreesWithReference(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if !json.Valid(data) {
+			return
+		}
+		// 顶层不是容器时按包注释第 3 条保守统计全部括号，与结构深度无关，单独测试。
+		if trimmed := bytes.TrimLeft(data, " \t\r\n"); len(trimmed) == 0 || (trimmed[0] != '{' && trimmed[0] != '[') {
 			return
 		}
 		d := refDepth(t, data)

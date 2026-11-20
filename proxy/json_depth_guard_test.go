@@ -162,11 +162,15 @@ func TestJSONDepthGuardRejectsDeepBodiesBeforeHandlers(t *testing.T) {
 				if rt.anthropic {
 					if gjson.GetBytes(respBody, "type").String() != "error" ||
 						gjson.GetBytes(respBody, "error.type").String() != "invalid_request_error" ||
-						!strings.Contains(gjson.GetBytes(respBody, "error.message").String(), "maximum nesting depth of 10000") {
+						!strings.Contains(gjson.GetBytes(respBody, "error.message").String(), "10000") {
 						t.Fatalf("%s %s: anthropic error body = %s", rt.path, name, respBody)
 					}
 				} else {
-					const want = `{"error":{"code":"json_nesting_too_deep","message":"Request JSON exceeds the maximum nesting depth of 10000","type":"invalid_request_error"}}`
+					message := jsonDepthTooDeepMessage
+					if strings.Contains(name, "invalid prefix") || strings.Contains(name, "tonum") {
+						message = jsonDepthUnverifiableMessage
+					}
+					want := `{"error":{"code":"json_nesting_too_deep","message":"` + message + `","type":"invalid_request_error"}}`
 					if strings.TrimSpace(string(respBody)) != want {
 						t.Fatalf("%s %s: body = %s, want %s", rt.path, name, respBody, want)
 					}

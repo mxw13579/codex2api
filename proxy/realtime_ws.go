@@ -120,10 +120,10 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 			_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrCodeInvalidRequest, "unsupported websocket message type", api.ErrorTypeInvalidRequest))
 			continue
 		}
-		if jsondepth.TooDeep(payload) {
+		if depthStatus := jsondepth.Check(payload); depthStatus != jsondepth.StatusOK {
 			// 在任何解析之前拦截；与其他非法帧一样回错误事件并保留连接。
 			frameMemory.Release()
-			_ = writeResponsesWSError(conn, api.NewJSONNestingTooDeepError())
+			_ = writeResponsesWSError(conn, api.NewJSONDepthError(depthStatus))
 			continue
 		}
 		payload, forwardedEventID := stripNewAPIPolicyWebSocketEventID(payload)

@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -89,6 +91,8 @@ func kiroRestoreChatControls(body, chat []byte) []byte {
 	return body
 }
 
+var errKiroJSONTooDeep = errors.New("Responses request JSON is nested too deeply")
+
 // kiroResponsesToMessages 把 Responses 请求翻成 Anthropic Messages 请求体。
 func kiroResponsesToMessages(body []byte, headers http.Header) (*kiroResponsesTranslation, error) {
 	root := gjson.ParseBytes(body)
@@ -99,14 +103,26 @@ func kiroResponsesToMessages(body []byte, headers http.Header) (*kiroResponsesTr
 	out.config.parallelToolCalls = !root.Get("parallel_tool_calls").Exists() || root.Get("parallel_tool_calls").Bool()
 	out.config.toolChoice = "auto"
 	if choice := root.Get("tool_choice"); choice.Exists() {
+		// Value 是无深度上限的递归，先对实际展开的子结果做深度预检（入口之外的第二道防线）。
+		if jsondepth.TooDeepString(choice.Raw) {
+			return nil, errKiroJSONTooDeep
+		}
 		out.config.toolChoice = choice.Value()
 	}
 	var declared []gjson.Result
+	var depthErr error
 	root.Get("tools").ForEach(func(_, tool gjson.Result) bool {
+		if jsondepth.TooDeepString(tool.Raw) {
+			depthErr = errKiroJSONTooDeep
+			return false
+		}
 		declared = append(declared, tool)
 		out.config.tools = append(out.config.tools, tool.Value())
 		return true
 	})
+	if depthErr != nil {
+		return nil, depthErr
+	}
 	var system []string
 	if instructions := root.Get("instructions").String(); strings.TrimSpace(instructions) != "" {
 		system = append(system, instructions)
@@ -135,6 +151,10 @@ func kiroResponsesToMessages(body []byte, headers http.Header) (*kiroResponsesTr
 		switch item.Get("type").String() {
 		case "additional_tools":
 			item.Get("tools").ForEach(func(_, tool gjson.Result) bool {
+				if jsondepth.TooDeepString(tool.Raw) {
+					conversionErr = errKiroJSONTooDeep
+					return false
+				}
 				declared = append(declared, tool)
 				out.config.tools = append(out.config.tools, tool.Value())
 				return true
@@ -287,8 +307,11 @@ func kiroConvertResponsesTools(entries []gjson.Result, kinds kiroToolKinds, name
 				continue
 			}
 			schema := map[string]any{}
-			if params, ok := fn.Get("parameters").Value().(map[string]any); ok {
-				schema = params
+			// 过深的 parameters 按“不是对象”的现有分支处理（空 schema），不做递归展开。
+			if paramsResult := fn.Get("parameters"); !jsondepth.TooDeepString(paramsResult.Raw) {
+				if params, ok := paramsResult.Value().(map[string]any); ok {
+					schema = params
+				}
 			}
 			flat := kiroFlatToolName(namespace, name)
 			kinds[flat] = kiroDeclaredTool{name: name, namespace: namespace}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
@@ -228,10 +229,10 @@ func (h *Handler) runResponsesWSMultiplex(c *gin.Context, conn *websocket.Conn, 
 				_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrCodeInvalidRequest, "unsupported websocket message type", api.ErrorTypeInvalidRequest))
 				return
 			}
-			if message.tooDeep {
+			if message.depthStatus != jsondepth.StatusOK {
 				// 与“不是 JSON 对象”的非法帧相同：回错误帧并保留连接。
 				message.releaseQueueBudget()
-				_ = writeResponsesWSError(conn, api.NewJSONNestingTooDeepError())
+				_ = writeResponsesWSError(conn, api.NewJSONDepthError(message.depthStatus))
 				continue
 			}
 			eventType, eventErr := responsesWSClientEventType(message.payload)

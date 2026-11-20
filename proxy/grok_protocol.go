@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -283,6 +285,10 @@ func responsesToolsToChat(tools gjson.Result) []any {
 		if tool.Get("type").String() != "function" {
 			return true
 		}
+		if jsondepth.TooDeepString(tool.Raw) {
+			// 下面的 Value 是无深度上限的递归；过深的工具按“无法转换”跳过（入口之外的第二道防线）。
+			return true
+		}
 		fn := map[string]any{"name": tool.Get("name").String()}
 		if fn["name"] == "" {
 			fn["name"] = tool.Get("function.name").String()
@@ -414,6 +420,9 @@ func responsesTextFormatToChat(format gjson.Result) (any, error) {
 		if name == "" || !schema.IsObject() {
 			return nil, fmt.Errorf("Responses text.format json_schema requires name and schema")
 		}
+		if jsondepth.TooDeepString(schema.Raw) {
+			return nil, errGrokJSONTooDeep
+		}
 		jsonSchema := map[string]any{"name": name, "schema": schema.Value()}
 		if strict := format.Get("strict"); strict.Exists() {
 			jsonSchema["strict"] = strict.Bool()
@@ -440,6 +449,9 @@ func responsesTextFormatToMessages(format gjson.Result) (any, error) {
 		if name == "" || !schema.IsObject() {
 			return nil, fmt.Errorf("Responses text.format json_schema requires name and schema")
 		}
+		if jsondepth.TooDeepString(schema.Raw) {
+			return nil, errGrokJSONTooDeep
+		}
 		jsonSchema := map[string]any{"name": name, "schema": schema.Value()}
 		if strict := format.Get("strict"); strict.Exists() {
 			jsonSchema["strict"] = strict.Bool()
@@ -452,6 +464,9 @@ func responsesTextFormatToMessages(format gjson.Result) (any, error) {
 
 // convertResponsesToChatRequest preserves the ordered Responses input. Unknown
 // item types with meaningful content are rejected rather than silently lost.
+// errGrokJSONTooDeep：要做 Value 递归展开的子结果过深（入口深度检查之外的第二道防线）。
+var errGrokJSONTooDeep = errors.New("Responses request JSON is nested too deeply")
+
 func convertResponsesToChatRequest(body []byte) ([]byte, error) {
 	root := gjson.ParseBytes(body)
 	if !root.IsObject() {
@@ -561,6 +576,9 @@ func convertResponsesToChatRequest(body []byte) ([]byte, error) {
 	}
 	for _, field := range []string{"temperature", "top_p", "max_output_tokens", "max_tokens", "max_completion_tokens", "stop", "seed", "presence_penalty", "frequency_penalty"} {
 		if value := root.Get(field); value.Exists() {
+			if jsondepth.TooDeepString(value.Raw) {
+				return nil, errGrokJSONTooDeep
+			}
 			name := field
 			if field == "max_output_tokens" || field == "max_tokens" {
 				name = "max_completion_tokens"
@@ -724,7 +742,8 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 	if tools := root.Get("tools"); tools.IsArray() {
 		var converted []any
 		tools.ForEach(func(_, tool gjson.Result) bool {
-			if tool.Get("type").String() == "function" {
+			// 过深的 parameters 按“无法转换”跳过，不做无深度上限的 Value 递归展开。
+			if tool.Get("type").String() == "function" && !jsondepth.TooDeepString(tool.Get("parameters").Raw) {
 				converted = append(converted, map[string]any{"name": tool.Get("name").String(), "description": tool.Get("description").String(), "input_schema": tool.Get("parameters").Value()})
 			}
 			return true
@@ -758,7 +777,7 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 	if stop := root.Get("stop"); stop.Exists() {
 		if stop.Type == gjson.String {
 			out["stop_sequences"] = []string{stop.String()}
-		} else if stop.IsArray() {
+		} else if stop.IsArray() && !jsondepth.TooDeepString(stop.Raw) {
 			out["stop_sequences"] = stop.Value()
 		} else {
 			return nil, fmt.Errorf("Responses stop must be a string or string array for Messages")
@@ -766,6 +785,9 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 	}
 	for _, field := range []string{"temperature", "top_p"} {
 		if value := root.Get(field); value.Exists() {
+			if jsondepth.TooDeepString(value.Raw) {
+				return nil, errGrokJSONTooDeep
+			}
 			out[field] = value.Value()
 		}
 	}

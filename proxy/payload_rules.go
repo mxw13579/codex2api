@@ -474,6 +474,10 @@ func payloadValueEquals(result gjson.Result, want any) bool {
 	if !result.Exists() {
 		return want == nil && result.Type == gjson.Null
 	}
+	if jsondepth.TooDeepString(result.Raw) {
+		// Value 是无深度上限的递归；过深的值不可能等于配置值，直接按不匹配处理。
+		return false
+	}
 	return reflect.DeepEqual(result.Value(), want)
 }
 

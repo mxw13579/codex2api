@@ -115,8 +115,8 @@ type responsesWSInboundMessage struct {
 	err           error
 	queuedBytes   *atomic.Int64
 	requestMemory *security.RequestMemoryReservation
-	// tooDeep 由读泵在任何解析之前用线性扫描判定；消费方据此直接回错误帧。
-	tooDeep bool
+	// depthStatus 由读泵在任何解析之前用线性扫描判定；未通过时消费方直接回错误帧。
+	depthStatus jsondepth.Status
 }
 
 type responsesWSInboundObserver func(responsesWSInboundMessage)
@@ -197,13 +197,13 @@ func startResponsesWSReadPump(ctx context.Context, conn *websocket.Conn, observe
 				turn:          turn,
 				queuedBytes:   &queuedBytes,
 				requestMemory: reservation,
-				tooDeep:       jsondepth.TooDeep(payload),
+				depthStatus:   jsondepth.Check(payload),
 			}
 			// Observers must stay non-blocking. Realtime uses this hook to signal a
 			// response.cancel while the serial consumer is waiting on an upstream
 			// retry; the read pump remains the connection's only reader.
 			for _, observer := range observers {
-				if observer != nil && !message.tooDeep {
+				if observer != nil && message.depthStatus == jsondepth.StatusOK {
 					observer(message)
 				}
 			}

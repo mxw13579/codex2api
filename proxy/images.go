@@ -989,6 +989,10 @@ func stripImageGenerationToolsFromArray(tools []gjson.Result) ([]interface{}, bo
 			removed = true
 			continue
 		}
+		if jsondepth.TooDeepString(tool.Raw) {
+			// Value 是无深度上限的递归：过深时放弃改写（按“未移除”处理，请求体原样保留）。
+			return nil, false
+		}
 		kept = append(kept, tool.Value())
 	}
 	return kept, removed

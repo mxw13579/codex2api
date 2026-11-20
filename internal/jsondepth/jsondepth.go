@@ -1,20 +1,30 @@
-// Package jsondepth 提供线性、非递归的 JSON 嵌套深度检查。
+// Package jsondepth 提供线性、非递归的 JSON 嵌套深度检查与（带深度上限的）JSON 合法性校验。
 //
 // 背景：gjson.Valid/ValidBytes 以及 gjson.Result.Value/Array/Map 等解析路径用无深度
-// 上限的递归实现，客户端或上游送来几百万层的 `[[[[...` 会让 goroutine 栈超过 1GB，
-// 触发 runtime 的 fatal error: stack overflow，整个进程退出（recover 拦不住）。
+// 上限的递归实现，客户端或上游送来几百万层的 `[[[[...` 会让 goroutine 栈溢出，触发
+// runtime 的 fatal error: stack overflow，整个进程退出（recover 拦不住）。
 //
-// 本包的 Within 保证：返回 true 时，任何“按 JSON 语义识别括号”的解析器（包括 gjson
-// 的校验器与宽松解析器）在该输入上的容器嵌套深度都不超过 limit。做法：
+// 不变量：Check 返回 StatusOK 时，任何解析器（包括 gjson 的校验器、gjson.Parse/Get 的
+// 宽松解析与 Result.Value 的递归展开）在该输入或其任意子串结果上的容器嵌套深度都不超过
+// limit。做法：
 //
 //  1. 用严格的 RFC 8259 语法逐字节迭代校验，显式维护容器栈（位图，不递归）；合法前缀
-//     内的嵌套深度一旦超过 limit 立即判为过深。
+//     内的嵌套深度一旦超过 limit 即判为 StatusTooDeep。
 //  2. 输入在位置 q 处不再是合法 JSON 前缀时，[0,q) 是合法 JSON 前缀：所有解析器对它的
 //     字符串边界与容器结构的理解一致，q 处仍打开的容器数就是当前深度 d。q 之后的字节
 //     各解析器可能各有解释（例如 gjson 的宽松数字扫描会吞掉引号，导致字符串边界错位），
 //     所以保守地把 data[q:] 里所有 '[' 与 '{' 都当成可能的新层：d + 尾部开括号数 ≤ limit
-//     才放行。宽松解析器每深入一层都必须消费一个不同位置的开括号，因此该上界对任何解析器
-//     都成立；代价是极端畸形输入（非法 JSON 且出错点之后开括号很多）会被误判为过深。
+//     才放行，否则判为 StatusUnverifiable。宽松解析器每深入一层都必须消费一个不同位置的
+//     开括号，因此该上界对任何解析器都成立。
+//  3. 顶层第一个非空白字节不是 '{'/'[' 时（字符串、数字、字面量或其他字节），同样按第 2
+//     条统计其后全部开括号：gjson.Get 在顶层会跳过任意字节直到第一个 '{'/'['（包括跳进
+//     顶层字符串的内容），所以“顶层是字符串”时字符串内的括号也必须计入。
+//  4. 开头的 UTF-8 BOM 按空白处理：gjson.Parse 遇到它直接返回空结果，gjson.Get 跳过它，
+//     两者都不会因此看到与严格扫描不同的结构；合法性判定（ValidBytes）仍把 BOM 视为非法，
+//     与 gjson.ValidBytes 一致。
+//
+// 代价：极端畸形输入（非法 JSON 或顶层不是容器，且其后开括号超过上限）会被判为
+// StatusUnverifiable 而拒绝。
 package jsondepth
 
 import (
@@ -26,8 +36,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
-
-	"github.com/tidwall/gjson"
 )
 
 // DefaultMaxDepth 与 encoding/json 的嵌套上限一致。
@@ -36,9 +44,23 @@ const DefaultMaxDepth = 10000
 // MaxDepthEnv 覆盖默认上限；非法值（非整数、<1 或 > MaxAllowedDepth）回退默认。
 const MaxDepthEnv = "CODEX_MAX_JSON_NESTING_DEPTH"
 
-// MaxAllowedDepth 是环境变量允许的最大值。gjson 每层递归约 180 字节栈，100 万层约
-// 180MB，仍远低于 1GB 的 goroutine 栈上限；再大就重新打开崩溃面。
-const MaxAllowedDepth = 1000000
+// MaxAllowedDepth 是环境变量允许的最大值。gjson 的 Result.Value 每层递归约 560–670
+// 字节栈，且 Go 栈按 2 的幂增长、默认上限 1e9 字节（实际可用约 512 MiB），约 80 万层即
+// 溢出；Value 还是 O(n·d) 的（每层重扫子串），5 万层已需约 1.7 秒 CPU。20000 层约 13MB
+// 栈，留足余量。
+const MaxAllowedDepth = 20000
+
+// Status 是 Check 的结论。
+type Status int
+
+const (
+	// StatusOK：任何解析器在该输入上的嵌套深度都不超过上限。
+	StatusOK Status = iota
+	// StatusTooDeep：输入的合法 JSON 前缀内嵌套深度就已超过上限。
+	StatusTooDeep
+	// StatusUnverifiable：输入不是合法 JSON（或顶层不是容器），且无法确认深度在上限内。
+	StatusUnverifiable
+)
 
 var (
 	maxDepthOnce sync.Once
@@ -76,31 +98,51 @@ func SetMaxDepthForTesting(n int) (restore func()) {
 	return func() { maxDepthVal.Store(prev) }
 }
 
-// TooDeep 报告 data 是否超过生效上限（见包注释中的保守判定）。
+// Check 用生效上限判定 data（见包注释的不变量）。
+func Check(data []byte) Status {
+	return CheckLimit(data, MaxDepth())
+}
+
+// CheckLimit 用给定上限判定 data。线性时间、不做堆分配。
+func CheckLimit(data []byte, limit int) Status {
+	if limit < 1 {
+		limit = 1
+	}
+	// 每深入一层至少要消费一个字节；总字节数不超过 limit 时任何解析器的深度都不可能
+	// 超限，直接放行。
+	if len(data) <= limit {
+		return StatusOK
+	}
+	status, _ := scan(data, limit)
+	return status
+}
+
+// Within 报告 CheckLimit(data, limit) == StatusOK。
+func Within(data []byte, limit int) bool {
+	return CheckLimit(data, limit) == StatusOK
+}
+
+// TooDeep 报告 data 未通过生效上限的检查（StatusTooDeep 或 StatusUnverifiable）。
 func TooDeep(data []byte) bool {
-	return !Within(data, MaxDepth())
+	return Check(data) != StatusOK
 }
 
 // TooDeepString 是 TooDeep 的 string 版本，不复制数据。
 func TooDeepString(s string) bool {
-	return !Within(stringBytes(s), MaxDepth())
+	return Check(stringBytes(s)) != StatusOK
 }
 
-// ValidBytes 等价于 gjson.ValidBytes，但先做深度检查：过深视为不合法，
-// 从而保证 gjson 的递归校验器不会在超深输入上栈溢出。
+// ValidBytes 在 Check 通过时与 gjson.ValidBytes 的结果逐输入一致，未通过时返回 false。
+// 只扫描一遍：深度检查用的严格 RFC 8259 扫描本身就是校验器（与 gjson 的语法一致，
+// 有差分测试与 fuzz 覆盖），不再调用递归的 gjson.ValidBytes。
 func ValidBytes(data []byte) bool {
-	if TooDeep(data) {
-		return false
-	}
-	return gjson.ValidBytes(data)
+	status, valid := scan(data, MaxDepth())
+	return status == StatusOK && valid
 }
 
-// Valid 等价于 gjson.Valid，但先做深度检查。
+// Valid 是 ValidBytes 的 string 版本，不复制数据。
 func Valid(s string) bool {
-	if TooDeepString(s) {
-		return false
-	}
-	return gjson.Valid(s)
+	return ValidBytes(stringBytes(s))
 }
 
 func stringBytes(s string) []byte {
@@ -120,8 +162,8 @@ const (
 	stAfterValue           // 值之后：',' 或闭合括号；顶层则只允许空白
 )
 
-// stackWords 覆盖默认上限的栈位图大小，放在调用栈上避免堆分配。
-const stackWords = (DefaultMaxDepth + 63) / 64
+// stackWords 覆盖允许的最大上限的栈位图大小，放在调用栈上避免堆分配。
+const stackWords = (MaxAllowedDepth + 63) / 64
 
 // strStop 标记字符串内需要特殊处理的字节：'"'、'\\' 与控制字符。
 var strStop = func() (t [256]bool) {
@@ -139,28 +181,33 @@ func isHex(c byte) bool {
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 
-// Within 报告 data 的嵌套深度是否不超过 limit（limit < 1 时按 1 处理）。
-// 线性时间；limit ≤ DefaultMaxDepth 时不做堆分配。
-func Within(data []byte, limit int) bool {
+func tailStatus(data []byte, q, depth, limit int) (Status, bool) {
+	if tailWithin(data, q, depth, limit) {
+		return StatusOK, false
+	}
+	return StatusUnverifiable, false
+}
+
+// scan 一遍完成深度判定与严格的 JSON 合法性判定。valid 仅在 status == StatusOK 时有意义。
+func scan(data []byte, limit int) (status Status, valid bool) {
 	if limit < 1 {
 		limit = 1
 	}
-	// 每深入一层至少要消费一个字节；总字节数不超过 limit 时任何解析器的深度都不可能
-	// 超限，直接放行。
-	if len(data) <= limit {
-		return true
+	if limit > MaxAllowedDepth {
+		limit = MaxAllowedDepth
 	}
-
-	var local [stackWords]uint64
-	stack := local[:]
-	if need := (limit + 64) / 64; need > len(stack) {
-		stack = make([]uint64, need)
-	}
+	var stack [stackWords]uint64
 
 	n := len(data)
+	i := 0
+	bom := false
+	if n >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
+		bom = true
+		i = 3
+	}
 	depth := 0
 	state := stValue
-	i := 0
+	top := true // 尚未遇到顶层第一个值
 	for i < n {
 		c := data[i]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
@@ -175,10 +222,19 @@ func Within(data []byte, limit int) bool {
 				state = stAfterValue
 				continue
 			}
+			if top {
+				top = false
+				if c != '{' && c != '[' {
+					// 顶层不是容器：保守统计其后全部开括号（见包注释第 3 条）。
+					if !tailWithin(data, i, 0, limit) {
+						return StatusUnverifiable, false
+					}
+				}
+			}
 			switch {
 			case c == '{' || c == '[':
 				if depth >= limit {
-					return false
+					return StatusTooDeep, false
 				}
 				w, b := depth>>6, uint(depth&63)
 				if c == '{' {
@@ -194,32 +250,32 @@ func Within(data []byte, limit int) bool {
 			case c == '"':
 				j, ok := scanString(data, i+1)
 				if !ok {
-					return tailWithin(data, j, depth, limit)
+					return tailStatus(data, j, depth, limit)
 				}
 				i = j
 			case c == '-' || isDigit(c):
 				j, ok := scanNumber(data, i)
 				if !ok {
-					return tailWithin(data, j, depth, limit)
+					return tailStatus(data, j, depth, limit)
 				}
 				i = j
 			case c == 't':
 				if !hasLiteral(data, i, "true") {
-					return tailWithin(data, i, depth, limit)
+					return tailStatus(data, i, depth, limit)
 				}
 				i += 4
 			case c == 'f':
 				if !hasLiteral(data, i, "false") {
-					return tailWithin(data, i, depth, limit)
+					return tailStatus(data, i, depth, limit)
 				}
 				i += 5
 			case c == 'n':
 				if !hasLiteral(data, i, "null") {
-					return tailWithin(data, i, depth, limit)
+					return tailStatus(data, i, depth, limit)
 				}
 				i += 4
 			default:
-				return tailWithin(data, i, depth, limit)
+				return tailStatus(data, i, depth, limit)
 			}
 			state = stAfterValue
 		case stKeyOrObjEnd, stKey:
@@ -230,27 +286,27 @@ func Within(data []byte, limit int) bool {
 				continue
 			}
 			if c != '"' {
-				return tailWithin(data, i, depth, limit)
+				return tailStatus(data, i, depth, limit)
 			}
 			j, ok := scanString(data, i+1)
 			if !ok {
-				return tailWithin(data, j, depth, limit)
+				return tailStatus(data, j, depth, limit)
 			}
 			i = j
 			state = stColon
 		case stColon:
 			if c != ':' {
-				return tailWithin(data, i, depth, limit)
+				return tailStatus(data, i, depth, limit)
 			}
 			i++
 			state = stValue
 		case stAfterValue:
 			if depth == 0 {
 				// 顶层值之后出现非空白：剩余部分按畸形尾部保守计数。
-				return tailWithin(data, i, depth, limit)
+				return tailStatus(data, i, depth, limit)
 			}
-			top := depth - 1
-			inObject := stack[top>>6]&(1<<uint(top&63)) != 0
+			t := depth - 1
+			inObject := stack[t>>6]&(1<<uint(t&63)) != 0
 			switch {
 			case c == ',':
 				i++
@@ -264,12 +320,12 @@ func Within(data []byte, limit int) bool {
 				i++
 				state = stAfterValue
 			default:
-				return tailWithin(data, i, depth, limit)
+				return tailStatus(data, i, depth, limit)
 			}
 		}
 	}
-	// 输入在合法前缀处截断（未闭合）：前缀内的深度已逐步检查过。
-	return true
+	// 扫到末尾：合法前缀内的深度已逐步检查过。只有一个完整的顶层值、没有 BOM 才合法。
+	return StatusOK, !bom && depth == 0 && state == stAfterValue
 }
 
 // tailWithin 处理从 q 开始不再是合法 JSON 前缀的情况：保守地把尾部所有开括号计入深度。
