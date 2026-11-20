@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -684,7 +685,13 @@ func ValidateMessages() ValidationRule {
 		// 索引访问每次都从头扫描，大 messages 数组上是 O(N²)（同 ValidateInput）。
 		// 两种取法只在合法 JSON 上逐元素一致；畸形 JSON（这里尚未校验整体合法性）
 		// 保留原来的按下标取值，报错逐字节不变。
-		if !gjson.Valid(value.Raw) {
+		//
+		// 合法性必须用 encoding/json 判定，不能用 gjson.Valid：后者递归下降且无深度
+		// 上限，超深嵌套（如 1600 万个 "["）会直接栈溢出、整个进程崩溃，而入口处的
+		// 全文校验可能在更靠前的非法字节上就已提前返回、从未深入这一段。
+		// encoding/json 的扫描器是显式栈的状态机，嵌套超过 10000 层即判非法，
+		// 这时走下面与改动前相同的按下标循环。
+		if !json.Valid(stringBytesView(value.Raw)) {
 			for i := 0; i < int(value.Get("#").Int()); i++ {
 				if err := check(i,
 					value.Get(fmt.Sprintf("%d.role", i)).String(),
@@ -707,6 +714,15 @@ func ValidateMessages() ValidationRule {
 		})
 		return verr
 	}
+}
+
+// stringBytesView 返回与 s 共享内存的只读字节视图，避免为校验复制大段 messages。
+// 调用方不得修改返回的切片。
+func stringBytesView(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // ValidateInput validates the input array for Responses API
