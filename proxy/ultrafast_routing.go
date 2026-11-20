@@ -28,14 +28,27 @@ func isUltrafastTier(tier string) bool {
 // Keep the original intent separate from the mutable per-attempt billing tier.
 // Installing false as well as true makes this state local to each WS turn.
 func prepareUltrafastRequest(c *gin.Context, body []byte) ([]byte, *Error) {
-	normalized, ultra, err := normalizeUltrafastBody(body)
+	return prepareUltrafastRequestWithLookup(c, body, nil)
+}
+
+// prepareUltrafastRequestWithLookup 同 prepareUltrafastRequest；tiers 非 nil 时复用并
+// 记录这份请求体的 service_tier / serviceTier 原值，供后续未改写的同一份 body 使用。
+func prepareUltrafastRequestWithLookup(c *gin.Context, body []byte, tiers *serviceTierFieldLookup) ([]byte, *Error) {
+	normalized, ultra, err := normalizeUltrafastBodyWithLookup(body, tiers)
 	c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ultrafastRequestKey{}, ultra))
 	return normalized, err
 }
 
 func normalizeUltrafastBody(body []byte) ([]byte, bool, *Error) {
-	snake := gjson.GetBytes(body, "service_tier").String()
-	camel := gjson.GetBytes(body, "serviceTier").String()
+	return normalizeUltrafastBodyWithLookup(body, nil)
+}
+
+func normalizeUltrafastBodyWithLookup(body []byte, tiers *serviceTierFieldLookup) ([]byte, bool, *Error) {
+	if tiers == nil {
+		tiers = &serviceTierFieldLookup{}
+	}
+	snake := tiers.snakeFor(body)
+	camel := tiers.camelFor(body)
 	ultra := isUltrafastTier(snake) || isUltrafastTier(camel)
 	if !ultra {
 		return body, false, nil
@@ -47,6 +60,54 @@ func normalizeUltrafastBody(body []byte) ([]byte, bool, *Error) {
 	body, _ = sjson.SetBytes(body, "service_tier", "ultrafast")
 	body, _ = sjson.DeleteBytes(body, "serviceTier")
 	return body, true, nil
+}
+
+// serviceTierFieldLookup 缓存某一份请求体顶层 service_tier / serviceTier 的
+// gjson.GetBytes(...).String() 结果。两者常缺失或排在大 input 之后，每次查找都要扫完
+// 全文。只在传入的正是记录时那份切片（同一底层数组、同长度）时复用；请求体被改写后
+// 总是换成新切片，此时按新 body 重新查找。零值可直接使用。
+type serviceTierFieldLookup struct {
+	body       []byte
+	snake      string
+	camel      string
+	snakeKnown bool
+	camelKnown bool
+}
+
+func (l *serviceTierFieldLookup) reset(body []byte) {
+	if (l.snakeKnown || l.camelKnown) && sameByteSlice(l.body, body) {
+		return
+	}
+	*l = serviceTierFieldLookup{body: body}
+}
+
+func (l *serviceTierFieldLookup) snakeFor(body []byte) string {
+	l.reset(body)
+	if !l.snakeKnown {
+		l.snake = gjson.GetBytes(body, "service_tier").String()
+		l.snakeKnown = true
+	}
+	return l.snake
+}
+
+func (l *serviceTierFieldLookup) camelFor(body []byte) string {
+	l.reset(body)
+	if !l.camelKnown {
+		l.camel = gjson.GetBytes(body, "serviceTier").String()
+		l.camelKnown = true
+	}
+	return l.camel
+}
+
+// extractServiceTierWithLookup 与 extractServiceTier 同口径。
+func extractServiceTierWithLookup(body []byte, tiers *serviceTierFieldLookup) string {
+	if tiers == nil {
+		return extractServiceTier(body)
+	}
+	if tier := tiers.snakeFor(body); tier != "" {
+		return tier
+	}
+	return tiers.camelFor(body)
 }
 
 func requestedUltrafast(ctx context.Context) bool {

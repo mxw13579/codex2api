@@ -4179,7 +4179,9 @@ func (h *Handler) Responses(c *gin.Context) {
 	})
 	h.capturePromptRequestIngress(c, rawBody)
 	var tierErr *Error
-	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	// 顶层 service_tier / serviceTier 的查找结果在 rawBody 未被改写的区间内复用。
+	var tierFields serviceTierFieldLookup
+	rawBody, tierErr = prepareUltrafastRequestWithLookup(c, rawBody, &tierFields)
 	if tierErr != nil {
 		sendServiceTierError(c, tierErr)
 		return
@@ -4293,7 +4295,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	rawBody = normalizeServiceTierField(rawBody)
+	rawBody = normalizeServiceTierFieldWithLookup(rawBody, &tierFields)
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -4318,7 +4320,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	quotaFailover := false
 	ruleIdentity := h.payloadRuleIdentity(c)
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
+	serviceTier := extractServiceTierWithLookup(rawBody, &tierFields)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}
@@ -8004,7 +8006,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	h.capturePromptRequestIngress(c, rawBody)
 	var tierErr *Error
-	rawBody, tierErr = prepareUltrafastRequest(c, rawBody)
+	// 顶层 service_tier / serviceTier 的查找结果在 rawBody 未被改写的区间内复用。
+	var tierFields serviceTierFieldLookup
+	rawBody, tierErr = prepareUltrafastRequestWithLookup(c, rawBody, &tierFields)
 	if tierErr != nil {
 		sendServiceTierError(c, tierErr)
 		return
@@ -8071,7 +8075,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	rememberContinuousRetryPolicyForRequest(c, continuousRetryPolicy)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	ruleIdentity := h.payloadRuleIdentity(c)
-	serviceTier := extractServiceTier(rawBody)
+	serviceTier := extractServiceTierWithLookup(rawBody, &tierFields)
 	if serviceTier != "" {
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 	}

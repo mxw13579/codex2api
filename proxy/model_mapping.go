@@ -176,26 +176,39 @@ func applyReasoningEffortModelToBody(rawBody []byte, entry ReasoningEffortModel)
 func (h *Handler) applyBaseModelMappingToBody(rawBody []byte, supportedModels []string) ([]byte, string, string, bool) {
 	originalModel := strings.TrimSpace(gjson.GetBytes(rawBody, "model").String())
 	effectiveModel := originalModel
-	if originalModel == "" || !gjson.ValidBytes(rawBody) || h == nil || h.store == nil {
+	if originalModel == "" || h == nil || h.store == nil {
+		return rawBody, originalModel, effectiveModel, false
+	}
+
+	// 别名与映射的判定只取决于模型名与配置，与请求体无关，先算出来。两者都不改写
+	// 时结果与请求体是否为合法 JSON 无关（都原样返回），可以省掉全文 ValidBytes。
+	entry, aliasOK := resolveReasoningEffortModelAlias(originalModel, h.store.GetReasoningEffortModels(), supportedModels)
+	modelForMapping := originalModel
+	if aliasOK {
+		modelForMapping = entry.Model
+	}
+	mappedModel, ok := resolveConfiguredModelMapping(modelForMapping, h.store.GetCodexModelMapping(), supportedModels)
+	remap := ok && mappedModel != "" && !strings.EqualFold(mappedModel, modelForMapping)
+	if !aliasOK && !remap {
+		return rawBody, originalModel, effectiveModel, false
+	}
+	if !gjson.ValidBytes(rawBody) {
 		return rawBody, originalModel, effectiveModel, false
 	}
 
 	updatedBody := rawBody
-	modelForMapping := originalModel
 	mappingApplied := false
-	if entry, ok := resolveReasoningEffortModelAlias(originalModel, h.store.GetReasoningEffortModels(), supportedModels); ok {
+	if aliasOK {
 		var err error
 		updatedBody, err = applyReasoningEffortModelToBody(updatedBody, entry)
 		if err != nil {
 			return rawBody, originalModel, effectiveModel, false
 		}
-		modelForMapping = entry.Model
 		effectiveModel = entry.Model
 		mappingApplied = !strings.EqualFold(originalModel, entry.Model)
 	}
 
-	mappedModel, ok := resolveConfiguredModelMapping(modelForMapping, h.store.GetCodexModelMapping(), supportedModels)
-	if ok && mappedModel != "" && !strings.EqualFold(mappedModel, modelForMapping) {
+	if remap {
 		var err error
 		updatedBody, err = sjson.SetBytes(updatedBody, "model", mappedModel)
 		if err != nil {
