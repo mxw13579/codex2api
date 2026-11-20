@@ -44,11 +44,11 @@ const DefaultMaxDepth = 10000
 // MaxDepthEnv 覆盖默认上限；非法值（非整数、<1 或 > MaxAllowedDepth）回退默认。
 const MaxDepthEnv = "CODEX_MAX_JSON_NESTING_DEPTH"
 
-// MaxAllowedDepth 是环境变量允许的最大值。gjson 的 Result.Value 每层递归约 560–670
-// 字节栈，且 Go 栈按 2 的幂增长、默认上限 1e9 字节（实际可用约 512 MiB），约 80 万层即
-// 溢出；Value 还是 O(n·d) 的（每层重扫子串），5 万层已需约 1.7 秒 CPU。20000 层约 13MB
-// 栈，留足余量。
-const MaxAllowedDepth = 20000
+// MaxAllowedDepth 是环境变量允许的最大值，与默认值相同：只允许调低、不允许调高。
+// 入口放行的请求随后还会经过 encoding/json（json.Unmarshal/json.Valid 固定 10000 层上限），
+// 调高只会让这些判断走失败分支。另外 gjson 的 Result.Value 每层递归约 560–670 字节栈、
+// 复杂度 O(n·d)，上限越高纵深防御的余量越小。
+const MaxAllowedDepth = DefaultMaxDepth
 
 // Status 是 Check 的结论。
 type Status int

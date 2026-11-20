@@ -274,6 +274,7 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | --- | --- |
 | `CODEX_PORT` | HTTP port, default `8080` |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | HTTP request body limit in MB, default `48` |
+| `CODEX_MAX_JSON_NESTING_DEPTH` | Maximum JSON nesting depth for request bodies and WebSocket frames, default and maximum `10000` (can only be lowered; values outside 1–10000 fall back to the default). Deeper requests get `400 json_nesting_too_deep` |
 | `ADMIN_SECRET` | Admin dashboard secret. When set, `/admin` prompts for authentication |
 | `DATABASE_DRIVER` | Database driver: `postgres` or `sqlite` |
 | `DATABASE_PATH` | SQLite database file path, used when `DATABASE_DRIVER=sqlite` |

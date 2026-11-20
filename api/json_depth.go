@@ -116,6 +116,12 @@ func jsonDepthExemptUpload(method, path, contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(contentType), "multipart/form-data")
 }
 
+// isAnthropicMessagesPath 决定深度错误是否用 Anthropic 错误格式。口径与各 handler 自己
+// 对“请求体不是合法 JSON”的实际返回一致：/v1/messages、/messages 返回 Anthropic 格式
+// （rejectAnthropicMessagesRequest）；count_tokens 的 handler（handleLocalTokenCount）
+// 对非法 JSON 返回的是 OpenAI 风格 api.SendError，所以这里不把 count_tokens 算进来。
+// proxy.requestUsesAnthropicErrorEnvelope 把 count_tokens 算作 Anthropic 格式，只用于
+// NewAPI 策略/会话锁这类与请求体无关的拒绝，与这里的判定对象不同。
 func isAnthropicMessagesPath(path string) bool {
 	path = strings.TrimRight(path, "/")
 	return path == "/v1/messages" || path == "/messages"

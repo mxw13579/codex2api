@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
-	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -285,7 +284,7 @@ func responsesToolsToChat(tools gjson.Result) []any {
 		if tool.Get("type").String() != "function" {
 			return true
 		}
-		if jsondepth.TooDeepString(tool.Raw) {
+		if resultTooDeep(tool) {
 			// 下面的 Value 是无深度上限的递归；过深的工具按“无法转换”跳过（入口之外的第二道防线）。
 			return true
 		}
@@ -420,7 +419,7 @@ func responsesTextFormatToChat(format gjson.Result) (any, error) {
 		if name == "" || !schema.IsObject() {
 			return nil, fmt.Errorf("Responses text.format json_schema requires name and schema")
 		}
-		if jsondepth.TooDeepString(schema.Raw) {
+		if resultTooDeep(schema) {
 			return nil, errGrokJSONTooDeep
 		}
 		jsonSchema := map[string]any{"name": name, "schema": schema.Value()}
@@ -449,7 +448,7 @@ func responsesTextFormatToMessages(format gjson.Result) (any, error) {
 		if name == "" || !schema.IsObject() {
 			return nil, fmt.Errorf("Responses text.format json_schema requires name and schema")
 		}
-		if jsondepth.TooDeepString(schema.Raw) {
+		if resultTooDeep(schema) {
 			return nil, errGrokJSONTooDeep
 		}
 		jsonSchema := map[string]any{"name": name, "schema": schema.Value()}
@@ -576,7 +575,7 @@ func convertResponsesToChatRequest(body []byte) ([]byte, error) {
 	}
 	for _, field := range []string{"temperature", "top_p", "max_output_tokens", "max_tokens", "max_completion_tokens", "stop", "seed", "presence_penalty", "frequency_penalty"} {
 		if value := root.Get(field); value.Exists() {
-			if jsondepth.TooDeepString(value.Raw) {
+			if resultTooDeep(value) {
 				return nil, errGrokJSONTooDeep
 			}
 			name := field
@@ -743,7 +742,7 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 		var converted []any
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			// 过深的 parameters 按“无法转换”跳过，不做无深度上限的 Value 递归展开。
-			if tool.Get("type").String() == "function" && !jsondepth.TooDeepString(tool.Get("parameters").Raw) {
+			if tool.Get("type").String() == "function" && !resultTooDeep(tool.Get("parameters")) {
 				converted = append(converted, map[string]any{"name": tool.Get("name").String(), "description": tool.Get("description").String(), "input_schema": tool.Get("parameters").Value()})
 			}
 			return true
@@ -777,7 +776,7 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 	if stop := root.Get("stop"); stop.Exists() {
 		if stop.Type == gjson.String {
 			out["stop_sequences"] = []string{stop.String()}
-		} else if stop.IsArray() && !jsondepth.TooDeepString(stop.Raw) {
+		} else if stop.IsArray() && !resultTooDeep(stop) {
 			out["stop_sequences"] = stop.Value()
 		} else {
 			return nil, fmt.Errorf("Responses stop must be a string or string array for Messages")
@@ -785,7 +784,7 @@ func convertResponsesToMessagesRequest(body []byte) ([]byte, error) {
 	}
 	for _, field := range []string{"temperature", "top_p"} {
 		if value := root.Get(field); value.Exists() {
-			if jsondepth.TooDeepString(value.Raw) {
+			if resultTooDeep(value) {
 				return nil, errGrokJSONTooDeep
 			}
 			out[field] = value.Value()

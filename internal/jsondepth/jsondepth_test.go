@@ -190,8 +190,10 @@ func TestParseMaxDepth(t *testing.T) {
 		"-5":      DefaultMaxDepth,
 		"2000000": DefaultMaxDepth,
 		"64":      64,
-		" 20000 ": 20000,
-		"20001":   DefaultMaxDepth, // 超过 MaxAllowedDepth
+		" 9000 ":  9000,
+		"10000":   10000,
+		"10001":   DefaultMaxDepth, // 超过 MaxAllowedDepth：只允许调低
+		"20000":   DefaultMaxDepth,
 		"1000000": DefaultMaxDepth,
 	}
 	for raw, want := range cases {

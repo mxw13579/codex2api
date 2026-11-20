@@ -1015,9 +1015,12 @@ func stripImageGenerationToolsFromArray(tools []gjson.Result) ([]interface{}, bo
 			removed = true
 			continue
 		}
-		if jsondepth.TooDeepString(tool.Raw) {
-			// Value 是无深度上限的递归：过深时放弃改写（按“未移除”处理，请求体原样保留）。
-			return nil, false
+		if resultTooDeep(tool) {
+			// Value 是无深度上限的递归，不能展开过深的对象/数组。这里是策略执行点，不能
+			// 放弃改写把 image_generation 原样放行：丢弃这个过深元素，其余照常剥离。
+			// 入口深度检查已保证正常请求走不到这里，这是纵深防御。
+			removed = true
+			continue
 		}
 		kept = append(kept, tool.Value())
 	}

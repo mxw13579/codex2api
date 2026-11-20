@@ -115,8 +115,12 @@ func TestJSONDepthGuardExemptMultipartUploadsPass(t *testing.T) {
 func TestValueCallSitesPrecheckDepth(t *testing.T) {
 	deep := deepClosed(30000)
 	tool := gjson.Parse(`{"type":"function","name":"f","parameters":` + deep + `}`)
-	if kept, removed := stripImageGenerationToolsFromArray([]gjson.Result{tool}); removed || kept != nil {
-		t.Fatalf("too deep tool must leave the body unchanged: removed=%v kept=%v", removed, kept)
+	// strip 是策略执行点：过深的对象元素被丢弃，其余照常剥离，绝不原样放行 image_generation。
+	imageTool := gjson.Parse(`{"type":"image_generation"}`)
+	keptTool := gjson.Parse(`{"type":"function","name":"g"}`)
+	kept, removed := stripImageGenerationToolsFromArray([]gjson.Result{imageTool, tool, keptTool})
+	if !removed || len(kept) != 1 || gjson.GetBytes(mustJSON(t, kept), "0.name").String() != "g" {
+		t.Fatalf("too deep tool must be dropped while stripping continues: removed=%v kept=%v", removed, kept)
 	}
 	if payloadValueEquals(gjson.Parse(deep), nil) {
 		t.Fatalf("too deep value must not match")
