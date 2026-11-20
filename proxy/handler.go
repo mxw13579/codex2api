@@ -2039,7 +2039,12 @@ func requestCompactionMetaForHTTP(c *gin.Context, body []byte) requestCompaction
 // content, tool output, or arbitrary stringified JSON.
 func requestBodyCompactionMeta(body []byte) requestCompactionMeta {
 	meta := requestCompactionMeta{}
-	input := jsonbody.GetView(body, "input")
+	// 触发器与历史项的 type（compaction_trigger / compaction / context_compaction）
+	// 都含 compaction；原文里不存在其字面或转义形式时 input 不可能命中，跳过整段遍历。
+	input := gjson.Result{}
+	if jsonBytesMayContainText(body, "compaction", true) {
+		input = jsonbody.GetView(body, "input")
+	}
 	inspect := func(item gjson.Result) {
 		switch {
 		case gjsonResultIsCompactionTrigger(item):
