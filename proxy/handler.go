@@ -4345,13 +4345,25 @@ func (h *Handler) Responses(c *gin.Context) {
 	if codexResponsesBodyHasHostedWebSearch(rawBody) {
 		markResponsesWSContinuationCapable(respCacheOwner, rawBody)
 	}
+	// 走 WS 上游时每个 attempt 都要判断自然语言生图意图（需整包 Unmarshal）。预处理
+	// 本就要 Unmarshal 同一份 rawBody，这里让它顺带算出结果；rawBody 之后被改写
+	// （续链展开、配额换号回放等）即视为失效，退回按当前 rawBody 重新计算。
+	naturalImageIntentMemo := responsesNaturalImageIntentMemo{}
+	var naturalImageIntentOut *bool
+	if h.shouldUseWebsocketForHTTP() {
+		naturalImageIntentOut = &naturalImageIntentMemo.value
+	}
 	var bodyPreparation responsesBodyPreparation
 	if searchReplay != nil {
 		// Defer opaque replay until account provenance has been checked. Never
 		// route a logical ID through the ordinary relay/cache-miss bypass.
-		bodyPreparation.Body, bodyPreparation.ExpandedInputRaw = prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{forceStoreFalse: true})
+		bodyPreparation.Body, bodyPreparation.ExpandedInputRaw = prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{forceStoreFalse: true, naturalImageIntent: naturalImageIntentOut})
 	} else {
-		bodyPreparation = prepareResponsesBodyForOwnerDetailed(rawBody, respCacheOwner)
+		bodyPreparation = prepareResponsesBodyForOwnerDetailedWithIntent(rawBody, respCacheOwner, naturalImageIntentOut)
+	}
+	if naturalImageIntentOut != nil {
+		naturalImageIntentMemo.body = rawBody
+		naturalImageIntentMemo.known = true
 	}
 	finishSearchContextCommit := func() {}
 	defer func() { finishSearchContextCommit() }()
@@ -4768,7 +4780,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !badRequestRetry.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
-		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
+		if useWebsocket && (responsesBodyRequestsImageGeneration(rawBody) || naturalImageIntentMemo.get(rawBody)) {
 			useWebsocket = false
 		}
 		// 加速档走 HTTP，保证每个请求的 routing hint 与自身档位一致。
