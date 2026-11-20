@@ -756,6 +756,32 @@ func rawResponsesBodyShouldForceHTTPForImageGeneration(body []byte) bool {
 	return responsesBodyRequestsImageGeneration(body) || responsesBodyHasNaturalImageGenerationIntent(body)
 }
 
+// responsesNaturalImageIntentMemo 缓存 responsesBodyHasNaturalImageGenerationIntent
+// 对某一份请求体的结果。只在传入的正是记录时那份切片（同一底层数组、同长度）时复用；
+// 请求体被改写后都会换成新切片，此时重新计算并记住新结果。
+type responsesNaturalImageIntentMemo struct {
+	body  []byte
+	value bool
+	known bool
+}
+
+func (m *responsesNaturalImageIntentMemo) get(body []byte) bool {
+	if m.known && sameByteSlice(m.body, body) {
+		return m.value
+	}
+	m.body = body
+	m.value = responsesBodyHasNaturalImageGenerationIntent(body)
+	m.known = true
+	return m.value
+}
+
+func sameByteSlice(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	return len(a) == 0 || &a[0] == &b[0]
+}
+
 func responsesBodyHasNaturalImageGenerationIntent(body []byte) bool {
 	var parsed map[string]any
 	if err := json.Unmarshal(body, &parsed); err != nil {
@@ -1003,6 +1029,14 @@ func stripImageGenerationToolsFromArray(tools []gjson.Result) ([]interface{}, bo
 //     工具选择保持不变。
 //  4. 清理网关自己追加的图片桥接 instructions，保留用户自带的 instructions 内容。
 func stripResponsesImageGenerationCapabilities(body []byte) []byte {
+	// 以下四步各自改写的必要条件：1/2 要有解码后为 image_generation 或 image_gen 的
+	// 字符串，3 要有与之大小写不敏感相等的 tool_choice，4 要有桥接标记（其子串
+	// codex2api-codex-image-generation）。原文里两者都不可能出现时 body 必然原样返回。
+	if !jsonBytesMayContainText(body, "image_gen", true) &&
+		!jsonBytesMayContainText(body, "codex2api-codex-image-generation", false) {
+		return body
+	}
+
 	// 1. 顶层 tools[]
 	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
 		if kept, removed := stripImageGenerationToolsFromArray(tools.Array()); removed {
@@ -1052,7 +1086,10 @@ func stripResponsesInputImageTools(body []byte) []byte {
 	// The wildcard admits whitespace around the type, matching the existing
 	// TrimSpace policy, and decodes JSON escapes. It returns only a candidate
 	// carrier rather than copying the entire input just to learn none exists.
-	if !gjson.GetBytes(body, `input.#(type%"*additional_tools*")`).Exists() {
+	// The cheap prefilter is a necessary condition of that match (escape-aware,
+	// case-sensitive like match.Match) and skips the input scan entirely.
+	if !jsonBytesMayContainText(body, "additional_tools", false) ||
+		!gjson.GetBytes(body, `input.#(type%"*additional_tools*")`).Exists() {
 		return body
 	}
 	input := gjson.GetBytes(body, "input")

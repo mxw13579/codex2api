@@ -2417,6 +2417,13 @@ type responsesBodyPreparation struct {
 }
 
 func prepareResponsesBodyForOwnerDetailed(rawBody []byte, owner string) responsesBodyPreparation {
+	return prepareResponsesBodyForOwnerDetailedWithIntent(rawBody, owner, nil)
+}
+
+// prepareResponsesBodyForOwnerDetailedWithIntent 同 prepareResponsesBodyForOwnerDetailed；
+// naturalImageIntent 非 nil 时顺带写入 responsesBodyHasNaturalImageGenerationIntent(rawBody)
+// 的结果（复用预处理已做的那次 Unmarshal；Unmarshal 失败时两者都为 false）。
+func prepareResponsesBodyForOwnerDetailedWithIntent(rawBody []byte, owner string, naturalImageIntent *bool) responsesBodyPreparation {
 	prevID := gjson.GetBytes(rawBody, "previous_response_id").String()
 	preparation := responsesBodyPreparation{PreviousResponseID: prevID}
 	if prevID != "" {
@@ -2442,6 +2449,7 @@ func prepareResponsesBodyForOwnerDetailed(rawBody []byte, owner string) response
 		expandPreviousResponse: false,
 		cacheOwner:             owner,
 		cachedResponseItems:    cachedItems,
+		naturalImageIntent:     naturalImageIntent,
 	})
 	preparation.Body = preparedBody
 	preparation.ExpandedInputRaw = expandedInputRaw
@@ -3173,9 +3181,18 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 // ==================== 向后兼容: 辅助函数 ====================
 
 func normalizeServiceTierField(body []byte) []byte {
-	tier := strings.TrimSpace(gjson.GetBytes(body, "service_tier").String())
+	return normalizeServiceTierFieldWithLookup(body, nil)
+}
+
+// normalizeServiceTierFieldWithLookup 同 normalizeServiceTierField；tiers 非 nil 时
+// 复用同一份 body 已查过的字段值（见 serviceTierFieldLookup）。
+func normalizeServiceTierFieldWithLookup(body []byte, tiers *serviceTierFieldLookup) []byte {
+	if tiers == nil {
+		tiers = &serviceTierFieldLookup{}
+	}
+	tier := strings.TrimSpace(tiers.snakeFor(body))
 	if tier == "" {
-		tier = strings.TrimSpace(gjson.GetBytes(body, "serviceTier").String())
+		tier = strings.TrimSpace(tiers.camelFor(body))
 	}
 	if tier == "" {
 		return body

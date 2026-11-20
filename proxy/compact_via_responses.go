@@ -43,6 +43,11 @@ func appendCompactionTriggerToResponsesBody(body []byte) []byte {
 // endpoint to body-signal compaction. Plain /responses preparation uses false:
 // it repairs the order only when the client already supplied a trigger.
 func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
+	// 没有任何字符串能解码成 compaction_trigger（大小写不敏感）时，input 里不可能
+	// 有直接触发器：不补触发器的调用必然原样返回 body，省掉整段 input 的解析。
+	if !addIfMissing && !bodyMayContainCompactionTriggerType(body) {
+		return body
+	}
 	trigger := json.RawMessage(`{"type":"compaction_trigger"}`)
 	input := jsonbody.GetView(body, "input")
 	switch {
@@ -128,6 +133,13 @@ func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
 	default:
 		return body
 	}
+}
+
+// bodyMayContainCompactionTriggerType 是 isDirectCompactionTrigger /
+// gjsonResultIsCompactionTrigger 判定为真的必要条件：type 经 TrimSpace 后与
+// compaction_trigger 大小写不敏感相等，原文必含其字面或 \u 转义形式。
+func bodyMayContainCompactionTriggerType(body []byte) bool {
+	return jsonBytesMayContainText(body, "compaction_trigger", true)
 }
 
 func isDirectCompactionTrigger(item gjson.Result) bool {
