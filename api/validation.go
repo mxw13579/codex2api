@@ -651,9 +651,8 @@ func ValidateMessages() ValidationRule {
 			"tool":      true,
 		}
 
-		for i := 0; i < int(value.Get("#").Int()); i++ {
+		check := func(i int, role string, content, toolCalls gjson.Result) *ValidationError {
 			msgPath := fmt.Sprintf("%s.%d", path, i)
-			role := value.Get(fmt.Sprintf("%d.role", i)).String()
 			if role == "" {
 				return &ValidationError{
 					Field:   msgPath + ".role",
@@ -668,8 +667,6 @@ func ValidateMessages() ValidationRule {
 					Code:    "invalid_message_role",
 				}
 			}
-			content := value.Get(fmt.Sprintf("%d.content", i))
-			toolCalls := value.Get(fmt.Sprintf("%d.tool_calls", i))
 			if !content.Exists() && role != "tool" {
 				// Allow assistant messages that have tool_calls to omit content
 				if !(role == "assistant" && toolCalls.Exists()) {
@@ -680,8 +677,35 @@ func ValidateMessages() ValidationRule {
 					}
 				}
 			}
+			return nil
 		}
-		return nil
+
+		// 单次 ForEach 遍历，避免按下标 value.Get("i.role") 随机访问——gjson 数组按
+		// 索引访问每次都从头扫描，大 messages 数组上是 O(N²)（同 ValidateInput）。
+		// 两种取法只在合法 JSON 上逐元素一致；畸形 JSON（这里尚未校验整体合法性）
+		// 保留原来的按下标取值，报错逐字节不变。
+		if !gjson.Valid(value.Raw) {
+			for i := 0; i < int(value.Get("#").Int()); i++ {
+				if err := check(i,
+					value.Get(fmt.Sprintf("%d.role", i)).String(),
+					value.Get(fmt.Sprintf("%d.content", i)),
+					value.Get(fmt.Sprintf("%d.tool_calls", i)),
+				); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		var verr *ValidationError
+		i := 0
+		value.ForEach(func(_, msg gjson.Result) bool {
+			if verr = check(i, msg.Get("role").String(), msg.Get("content"), msg.Get("tool_calls")); verr != nil {
+				return false
+			}
+			i++
+			return true
+		})
+		return verr
 	}
 }
 
