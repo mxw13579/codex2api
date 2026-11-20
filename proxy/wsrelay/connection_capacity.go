@@ -224,19 +224,3 @@ func (m *Manager) reserveAccountConnectionCapacity(input connectionCapacityReque
 		return slot
 	}
 }
-
-func (m *Manager) closeCapacityConnections() {
-	var connections []*WsConnection
-	m.capacityMu.Lock()
-	for _, slots := range m.connectionSlots {
-		for _, wc := range slots {
-			if wc != nil {
-				connections = append(connections, wc)
-			}
-		}
-	}
-	m.capacityMu.Unlock()
-	for _, wc := range connections {
-		m.discardConnectionFor(wc, closeManagerShutdown)
-	}
-}

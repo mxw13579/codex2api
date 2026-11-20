@@ -442,13 +442,9 @@ func (m *Manager) Stop() {
 }
 
 // closeAll 关闭所有连接
+// 连接并发关闭且单条、整体都有期限，避免对端半死时逐条串行阻塞拖慢进程退出。
 func (m *Manager) closeAll() {
-	m.closeCapacityConnections()
-	m.connections.Range(func(key, value any) bool {
-		wc := value.(*WsConnection)
-		m.discardConnectionFor(wc, closeManagerShutdown)
-		return true
-	})
+	m.closeAllConnectionsWithin(closeManagerShutdown, boundedCloseForceAfter, shutdownCloseWait)
 	m.respConnMu.Lock()
 	m.respConnBindings = nil
 	m.respConnMu.Unlock()

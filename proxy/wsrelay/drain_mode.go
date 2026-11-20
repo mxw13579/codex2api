@@ -123,7 +123,8 @@ func (m *Manager) drainIdleConnectionLocked(wc *WsConnection) drainOutcome {
 	// 与绑定检查原子完成：禁止晚到的绑定把连接重新留住。
 	wc.responseBindingsDisabled = true
 	m.respConnMu.Unlock()
-	m.discardConnectionFor(wc, closeDrainMode)
+	// 持锁关闭：单条关闭限时，防止半死连接的 TLS close_notify 写阻塞长时间占住账号锁。
+	m.discardConnectionBounded(wc, closeDrainMode, boundedCloseForceAfter)
 	return drainOutcomeClosed
 }
 
