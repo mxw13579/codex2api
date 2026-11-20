@@ -193,7 +193,7 @@ func (h *Handler) applyBaseModelMappingToBody(rawBody []byte, supportedModels []
 	if !aliasOK && !remap {
 		return rawBody, originalModel, effectiveModel, false
 	}
-	if !gjson.ValidBytes(rawBody) {
+	if !jsondepth.ValidBytes(rawBody) {
 		return rawBody, originalModel, effectiveModel, false
 	}
 
