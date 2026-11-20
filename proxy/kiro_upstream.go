@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
@@ -205,7 +206,7 @@ func kiroOpenUpstream(ctx context.Context, account *auth.Account, model string, 
 
 func kiroIsThinkingSignatureInvalid(body string) bool {
 	const code = "THINKING_SIGNATURE_INVALID"
-	if !gjson.Valid(body) {
+	if !jsondepth.Valid(body) {
 		return strings.TrimSpace(body) == code
 	}
 	parsed := gjson.Parse(body)
@@ -545,7 +546,7 @@ func kiroErrorReasons(body string) []string {
 }
 
 func kiroBodyHasReason(body string, reasons ...string) bool {
-	if !gjson.Valid(body) {
+	if !jsondepth.Valid(body) {
 		for _, reason := range reasons {
 			if strings.Contains(body, reason) {
 				return true
@@ -572,7 +573,7 @@ func kiroIsBearerTokenInvalid(body string) bool {
 }
 
 func kiroIsAccountRateLimited(body string) bool {
-	if gjson.Valid(body) {
+	if jsondepth.Valid(body) {
 		switch gjson.Get(body, "reason").String() {
 		case "USER_REQUEST_RATE_EXCEEDED", "CREDIT_CONSUMPTION_RATE_EXCEEDED", "SERVICE_REQUEST_RATE_EXCEEDED":
 			return true
@@ -589,7 +590,7 @@ func kiroIsAccountRateLimited(body string) bool {
 }
 
 func kiroIsAccountSuspended(body string) bool {
-	if strings.Contains(body, "TEMPORARILY_SUSPENDED") && (!gjson.Valid(body) || kiroBodyHasReason(body, "TEMPORARILY_SUSPENDED")) {
+	if strings.Contains(body, "TEMPORARILY_SUSPENDED") && (!jsondepth.Valid(body) || kiroBodyHasReason(body, "TEMPORARILY_SUSPENDED")) {
 		return true
 	}
 	lower := strings.ToLower(body)
@@ -603,7 +604,7 @@ func kiroIsGatewayTimeout(body string) bool {
 
 func kiroIsClientValidationError(body string) bool {
 	if strings.Contains(body, "TOOL_USE_RESULT_MISMATCH") || strings.Contains(body, "TOOL_SCHEMA_INVALID") {
-		if !gjson.Valid(body) || kiroBodyHasReason(body, "TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID") {
+		if !jsondepth.Valid(body) || kiroBodyHasReason(body, "TOOL_USE_RESULT_MISMATCH", "TOOL_SCHEMA_INVALID") {
 			return true
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -119,6 +120,12 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 			_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrCodeInvalidRequest, "unsupported websocket message type", api.ErrorTypeInvalidRequest))
 			continue
 		}
+		if jsondepth.TooDeep(payload) {
+			// 在任何解析之前拦截；与其他非法帧一样回错误事件并保留连接。
+			frameMemory.Release()
+			_ = writeResponsesWSError(conn, api.NewJSONNestingTooDeepError())
+			continue
+		}
 		payload, forwardedEventID := stripNewAPIPolicyWebSocketEventID(payload)
 
 		ack, forward, apiErr := normalizeRealtimeTextClientEvent(&state, payload)
@@ -197,7 +204,7 @@ func normalizeRealtimeTextClientEvent(state *realtimeTextSession, raw []byte) (a
 		return nil, nil, api.NewAPIError(api.ErrCodeServerError, "realtime session state is unavailable", api.ErrorTypeServer)
 	}
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || len(trimmed) > security.MaxRequestBodySize || !gjson.ValidBytes(trimmed) {
+	if len(trimmed) == 0 || len(trimmed) > security.MaxRequestBodySize || !jsondepth.ValidBytes(trimmed) {
 		return nil, nil, api.NewAPIError(api.ErrCodeInvalidRequest, "invalid realtime websocket request payload", api.ErrorTypeInvalidRequest)
 	}
 	eventType := strings.TrimSpace(gjson.GetBytes(trimmed, "type").String())

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -94,7 +95,7 @@ func resolveCodexExecutionLane(headers http.Header, body []byte, clientThreadID 
 // 头缺失或不是合法 JSON 时回退请求体 client_metadata 内嵌的同名字符串。
 func extractCodexRequestKind(headers http.Header, body []byte) string {
 	if headers != nil {
-		if raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader)); raw != "" && gjson.Valid(raw) {
+		if raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader)); raw != "" && jsondepth.Valid(raw) {
 			return normalizeCodexRequestKind(gjson.Get(raw, "request_kind"))
 		}
 	}
@@ -102,7 +103,7 @@ func extractCodexRequestKind(headers http.Header, body []byte) string {
 		return ""
 	}
 	embedded := gjson.GetBytes(body, "client_metadata."+strings.ToLower(codexTurnMetadataHeader))
-	if embedded.Type != gjson.String || !gjson.Valid(embedded.String()) {
+	if embedded.Type != gjson.String || !jsondepth.Valid(embedded.String()) {
 		return ""
 	}
 	return normalizeCodexRequestKind(gjson.Get(embedded.String(), "request_kind"))

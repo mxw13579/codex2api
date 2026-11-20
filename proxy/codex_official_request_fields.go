@@ -4,6 +4,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -20,7 +21,7 @@ func codexOfficialRequestFieldsEnabled() bool {
 }
 
 func hasCodexOfficialRequestMetadata(installationID, turnMetadata string) bool {
-	if strings.TrimSpace(installationID) == "" || !gjson.Valid(turnMetadata) {
+	if strings.TrimSpace(installationID) == "" || !jsondepth.Valid(turnMetadata) {
 		return false
 	}
 	meta := gjson.Parse(turnMetadata)

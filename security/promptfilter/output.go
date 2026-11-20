@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -130,14 +131,14 @@ func (s *OutputScanner) appendSemantic(data []byte) {
 
 func (s *OutputScanner) consumeRecords(data []byte) ([]byte, bool) {
 	trimmed := bytes.TrimSpace(data)
-	if len(s.recordBuffer) == 0 && gjson.ValidBytes(trimmed) {
+	if len(s.recordBuffer) == 0 && jsondepth.ValidBytes(trimmed) {
 		return extractOutputRecord(trimmed, false)
 	}
 	if len(s.recordBuffer) == 0 && !bytes.Contains(data, []byte("data:")) && len(trimmed) > 0 && trimmed[0] != '{' && trimmed[0] != '[' {
 		return append([]byte(nil), data...), false
 	}
 	s.recordBuffer = append(s.recordBuffer, data...)
-	if complete := bytes.TrimSpace(s.recordBuffer); gjson.ValidBytes(complete) {
+	if complete := bytes.TrimSpace(s.recordBuffer); jsondepth.ValidBytes(complete) {
 		semantic, terminal := extractOutputRecord(complete, false)
 		s.recordBuffer = nil
 		return semantic, terminal
@@ -170,7 +171,7 @@ func extractOutputRecord(record []byte, allowDone bool) ([]byte, bool) {
 	if allowDone && bytes.Equal(record, []byte("[DONE]")) {
 		return nil, true
 	}
-	if !gjson.ValidBytes(record) {
+	if !jsondepth.ValidBytes(record) {
 		return append([]byte(nil), record...), false
 	}
 	parsed := gjson.ParseBytes(record)
@@ -186,7 +187,7 @@ func ExtractOutputText(data []byte) string {
 		if strings.HasPrefix(line, "data:") {
 			line = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		}
-		if line == "" || line == "[DONE]" || !gjson.Valid(line) {
+		if line == "" || line == "[DONE]" || !jsondepth.Valid(line) {
 			continue
 		}
 		parsed := gjson.Parse(line)

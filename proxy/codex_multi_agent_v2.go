@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -187,7 +188,7 @@ func prepareCodexMultiAgentV2Request(body []byte) ([]byte, bool, error) {
 	if !bytes.Contains(body, codexCollaborationNamespaceBytes) {
 		return body, false, nil
 	}
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return body, false, fmt.Errorf("invalid JSON request body")
 	}
 
@@ -438,7 +439,7 @@ func restoreCodexMultiAgentV2Response(payload []byte, state *codexMultiAgentV2St
 			return payload
 		}
 	}
-	if !gjson.ValidBytes(payload) {
+	if !jsondepth.ValidBytes(payload) {
 		return payload
 	}
 
@@ -594,7 +595,7 @@ func ensureCodexPlaintextFunctionArgs(updated []byte, path, name string, item gj
 		return updated, false, nil
 	}
 	arguments := strings.TrimSpace(argumentsResult.String())
-	if arguments == "" || !gjson.Valid(arguments) {
+	if arguments == "" || !jsondepth.Valid(arguments) {
 		return updated, false, nil
 	}
 	message := gjson.Get(arguments, "message")

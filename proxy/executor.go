@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/codex2api/security"
 	"github.com/google/uuid"
@@ -1134,7 +1135,7 @@ func codexClientInstallationID(requestBody []byte) string {
 }
 
 func ensureCodexClientInstallationMetadata(requestBody []byte, account *auth.Account, headers http.Header) ([]byte, bool) {
-	if !gjson.ValidBytes(requestBody) || codexClientInstallationID(requestBody) != "" {
+	if !jsondepth.ValidBytes(requestBody) || codexClientInstallationID(requestBody) != "" {
 		return requestBody, false
 	}
 

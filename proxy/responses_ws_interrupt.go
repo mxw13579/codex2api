@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -127,7 +128,7 @@ func failPendingResponsesWSInterrupt(ctx context.Context, conn *websocket.Conn) 
 
 func responsesWSClientEventType(raw []byte) (string, *api.APIError) {
 	root := gjson.ParseBytes(raw)
-	if !gjson.ValidBytes(raw) || !root.IsObject() {
+	if !jsondepth.ValidBytes(raw) || !root.IsObject() {
 		return "", api.NewAPIError(api.ErrCodeInvalidRequest, "websocket request payload must be a JSON object", api.ErrorTypeInvalidRequest)
 	}
 	if err := validateResponsesWSEnvelopeFields(root); err != nil {
@@ -211,7 +212,7 @@ func (r *responsesWSInterruptRegistry) handle(conn *websocket.Conn, raw []byte, 
 func validateResponsesWSInterrupt(raw []byte) (string, *api.APIError) {
 	root := gjson.ParseBytes(raw)
 	id, mode := root.Get("response_id"), root.Get("mode")
-	if !gjson.ValidBytes(raw) || !root.IsObject() || id.Type != gjson.String || strings.TrimSpace(id.String()) == "" || len(id.String()) > responsesWSLineageMaxIDBytes {
+	if !jsondepth.ValidBytes(raw) || !root.IsObject() || id.Type != gjson.String || strings.TrimSpace(id.String()) == "" || len(id.String()) > responsesWSLineageMaxIDBytes {
 		return "", api.NewAPIError(api.ErrCodeInvalidRequest, "response.interrupt requires a nonempty string response_id", api.ErrorTypeInvalidRequest)
 	}
 	if mode.Type != gjson.String || mode.String() != "discard_partial_items" {

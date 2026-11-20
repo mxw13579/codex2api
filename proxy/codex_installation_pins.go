@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -59,7 +60,7 @@ func FinalizeCodexIdentityHeaders(headers http.Header, account *auth.Account) {
 	}
 	deleteHeaderCaseInsensitive(headers, codexInstallationIDHeader)
 	raw := headers.Get(codexTurnMetadataHeader)
-	if gjson.Valid(raw) && gjson.Get(raw, "tool_namespaces_info").Exists() {
+	if jsondepth.Valid(raw) && gjson.Get(raw, "tool_namespaces_info").Exists() {
 		if bounded, err := sjson.Delete(raw, "tool_namespaces_info"); err == nil {
 			headers.Set(codexTurnMetadataHeader, bounded)
 		}

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -76,7 +77,7 @@ func PrepareCodexFingerprintHeaders(account *auth.Account, headers http.Header, 
 		out = make(http.Header)
 	}
 	embedded := metadata.Get("x-codex-turn-metadata")
-	if out.Get(codexTurnMetadataHeader) == "" && embedded.Type == gjson.String && gjson.Valid(embedded.String()) && gjson.Parse(embedded.String()).IsObject() {
+	if out.Get(codexTurnMetadataHeader) == "" && embedded.Type == gjson.String && jsondepth.Valid(embedded.String()) && gjson.Parse(embedded.String()).IsObject() {
 		out.Set(codexTurnMetadataHeader, embedded.String())
 	}
 	session, thread := extractClientCodexIdentity(out)

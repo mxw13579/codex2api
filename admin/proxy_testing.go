@@ -17,6 +17,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -262,7 +263,7 @@ func doProxyProbeRequest(
 }
 
 func parseIPAPIProbeBody(body []byte, latencyMs int) proxyProbeResult {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return proxyProbeResult{
 			LatencyMs: latencyMs,
 			Error:     "代理检测服务返回了无效响应",
@@ -316,7 +317,7 @@ func parseProxyProbeEchoBody(body []byte, latencyMs int) proxyProbeResult {
 }
 
 func parseProxyProbeExitIP(body []byte) (string, error) {
-	if gjson.ValidBytes(body) {
+	if jsondepth.ValidBytes(body) {
 		parsed := gjson.ParseBytes(body)
 		for _, key := range []string{"ip", "query"} {
 			ip := strings.TrimSpace(parsed.Get(key).String())
@@ -415,7 +416,7 @@ func fetchIPAPIGeo(ctx context.Context, ip, lang string) (country, region, city,
 		proxyProbeIPAPIFields,
 	)
 	body, err := fetchProxyProbeGeoBody(ctx, probeURL)
-	if err != nil || !gjson.ValidBytes(body) {
+	if err != nil || !jsondepth.ValidBytes(body) {
 		return "", "", "", "", false
 	}
 	result := gjson.ParseBytes(body)
@@ -429,7 +430,7 @@ func fetchIPAPIGeo(ctx context.Context, ip, lang string) (country, region, city,
 func fetchIPWhoisGeo(ctx context.Context, ip string) (country, region, city, isp string) {
 	probeURL := "https://ipwho.is/" + url.PathEscape(ip)
 	body, err := fetchProxyProbeGeoBody(ctx, probeURL)
-	if err != nil || !gjson.ValidBytes(body) {
+	if err != nil || !jsondepth.ValidBytes(body) {
 		return "", "", "", ""
 	}
 	result := gjson.ParseBytes(body)

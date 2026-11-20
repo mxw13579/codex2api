@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 )
@@ -175,7 +176,7 @@ func fallbackGrokInlineCompaction(ctx context.Context, resp *http.Response, body
 	if parseErr != nil {
 		return grokCompactionSummaryFailure(resp, parseErr.Error(), terminal)
 	}
-	if len(terminal) == 0 || !gjson.ValidBytes(terminal) {
+	if len(terminal) == 0 || !jsondepth.ValidBytes(terminal) {
 		return grokCompactionSummaryFailure(resp, "Grok compaction summary ended without response.completed", terminal)
 	}
 	var summary strings.Builder

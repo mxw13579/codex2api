@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -207,7 +208,7 @@ func antigravityJSONModeRejection(resp *http.Response, model string) (*http.Resp
 // unwrapping the Anthropic error document the backend embeds for Claude.
 func antigravityUpstreamErrorMessage(body []byte) string {
 	message := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
-	if gjson.Valid(message) {
+	if jsondepth.Valid(message) {
 		if inner := strings.TrimSpace(gjson.Get(message, "error.message").String()); inner != "" {
 			return inner
 		}

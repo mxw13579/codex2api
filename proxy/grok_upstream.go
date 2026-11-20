@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -475,7 +476,7 @@ func recordGrokRateLimitHeaders(account *auth.Account, header http.Header) {
 // sanitizeGrokRequestBody 剥离 Codex 管道注入的、Grok 上游不接受的字段。
 // prompt_cache_key 要留下：cli-chat-proxy 接受它，并用它做前缀缓存路由。
 func sanitizeGrokRequestBody(body []byte) []byte {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return body
 	}
 	for _, path := range []string{"client_metadata", "service_tier", "safety_identifier"} {

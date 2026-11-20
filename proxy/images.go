@@ -28,6 +28,7 @@ import (
 	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/imageupscale"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
@@ -2591,7 +2592,7 @@ func appendImageModelText(builder *strings.Builder, text string) {
 }
 
 func collectImageModelText(builder *strings.Builder, payload []byte) {
-	if builder == nil || len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if builder == nil || len(payload) == 0 || !jsondepth.ValidBytes(payload) {
 		return
 	}
 	collectItem := func(item gjson.Result) {

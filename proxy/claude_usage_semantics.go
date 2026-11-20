@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -38,7 +39,7 @@ func applyAnthropicUsageSemantics(usage *UsageInfo) {
 // claudeFirstCacheControlTTL 返回请求里第一个 cache_control 块声明的 ttl（按 Anthropic 的
 // 处理顺序 tools → system → messages）。空串表示没有显式 ttl（默认 5 分钟）。
 func claudeFirstCacheControlTTL(body []byte) string {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return ""
 	}
 	var ttl string

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -269,7 +270,7 @@ func extractClientCodexSessionID(headers http.Header) string {
 	}
 	// 客户端未发会话头时，退回 turn metadata 里自报的会话标识。
 	raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader))
-	if raw == "" || !gjson.Valid(raw) {
+	if raw == "" || !jsondepth.Valid(raw) {
 		return ""
 	}
 	for _, path := range []string{"session_id", "thread_id"} {
@@ -377,7 +378,7 @@ func extractClientCodexIdentity(headers http.Header) (sessionID, threadID string
 	}
 	threadID = strings.TrimSpace(headers.Get(codexThreadIDHeader))
 	raw := strings.TrimSpace(headers.Get(codexTurnMetadataHeader))
-	if raw == "" || !gjson.Valid(raw) {
+	if raw == "" || !jsondepth.Valid(raw) {
 		return sessionID, threadID
 	}
 	if sessionID == "" {
@@ -427,7 +428,7 @@ func ApplyCodexFingerprintToBody(body []byte, account *auth.Account, downstreamH
 // 用 sjson 原地替换而非 map 反序列化再序列化：后者会按字典序重排键、丢掉原始键序，
 // 这个形状差异本身就是可识别特征。未出现的键不会被补上。
 func rewriteCodexTurnMetadataJSON(raw string, ids *codexFingerprintIDs) (string, bool) {
-	if ids == nil || !gjson.Valid(raw) {
+	if ids == nil || !jsondepth.Valid(raw) {
 		return raw, false
 	}
 	updates := [][2]string{{"installation_id", ids.installationID}}

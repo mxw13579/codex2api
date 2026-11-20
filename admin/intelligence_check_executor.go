@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy"
 	"github.com/tidwall/gjson"
 )
@@ -299,7 +300,7 @@ func readIntelligenceStream(body io.Reader, claude bool) (result intelligenceExe
 		}
 	}
 	err := proxy.ReadSSEStreamWithEvent(io.LimitReader(body, 16*1024*1024), func(event string, data []byte) bool {
-		if !gjson.ValidBytes(data) {
+		if !jsondepth.ValidBytes(data) {
 			result.Error = "上游返回无效事件"
 			return false
 		}

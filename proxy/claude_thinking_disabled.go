@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -18,7 +19,7 @@ func claudeModelThinkingAlwaysOn(model string) bool {
 // dropClaudeDisabledThinking 在发送前移除思考常开模型上的 thinking.type=disabled。
 // 其它模型原样保留（Opus 5 在 effort<=high 时接受 disabled，由上游裁决）。
 func dropClaudeDisabledThinking(body []byte) ([]byte, bool) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body, false
 	}
 	if !claudeModelThinkingAlwaysOn(gjson.GetBytes(body, "model").String()) {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -348,7 +349,7 @@ func readChannelMonitorSSE(body io.Reader, start time.Time) channelMonitorRespon
 
 func readChannelMonitorJSON(body []byte) channelMonitorResponseRead {
 	result := channelMonitorResponseRead{}
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		result.Failure = "上游返回了无效 JSON"
 		return result
 	}

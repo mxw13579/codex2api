@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
-	"github.com/tidwall/gjson"
+	"github.com/codex2api/internal/jsondepth"
 )
 
 type GrokControlPlaneFactKind string
@@ -129,7 +129,7 @@ func FetchGrokControlPlaneFact(ctx context.Context, account *auth.Account, proxy
 	if len(body) > maxFactBody {
 		return result, fmt.Errorf("Grok %s response exceeds %d bytes", kind, maxFactBody)
 	}
-	if resp.StatusCode != http.StatusNoContent && len(strings.TrimSpace(string(body))) > 0 && !gjson.ValidBytes(body) {
+	if resp.StatusCode != http.StatusNoContent && len(strings.TrimSpace(string(body))) > 0 && !jsondepth.ValidBytes(body) {
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return result, fmt.Errorf("Grok %s response is not JSON (status %d)", kind, resp.StatusCode)
 		}

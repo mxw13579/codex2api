@@ -3,6 +3,7 @@ package proxy
 import (
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/security"
 	"github.com/tidwall/gjson"
 )
@@ -15,7 +16,7 @@ type upstreamErrorFields struct {
 
 // 只提取约定的字符串字段；不把 detail 对象、校验器 input/ctx 或整个响应序列化为错误信息。
 func extractUpstreamErrorFields(body []byte) upstreamErrorFields {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return upstreamErrorFields{}
 	}
 	firstValue := func(allowNumber bool, paths ...string) string {

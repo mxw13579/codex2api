@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -35,7 +36,7 @@ func (t *anthropicStreamTranslator) finishFunctionToolInput(final gjson.Result) 
 		t.toolInputError = fmt.Errorf("function tool arguments do not match streamed deltas")
 		return nil
 	}
-	if candidate != "" && (!gjson.Valid(candidate) || !gjson.Parse(candidate).IsObject()) {
+	if candidate != "" && (!jsondepth.Valid(candidate) || !gjson.Parse(candidate).IsObject()) {
 		t.toolInputError = fmt.Errorf("function tool arguments must contain a valid JSON object")
 		return nil
 	}

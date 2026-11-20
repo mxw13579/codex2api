@@ -134,7 +134,7 @@ func HTTPStatusCode(code ErrorCode) int {
 		return http.StatusConflict
 	case ErrCodeInvalidRequest, ErrCodeInvalidParameter, ErrCodeMissingField, ErrCodeInvalidFieldType,
 		ErrCodeInvalidFieldFormat, ErrCodeUnsupportedFeature, ErrCodeContextLengthExceeded, ErrCodeUnsupportedModel,
-		ErrCodeInvalidStreamID, ErrCodeWebsocketStreamLimit:
+		ErrCodeInvalidStreamID, ErrCodeWebsocketStreamLimit, ErrCodeJSONNestingTooDeep:
 		return http.StatusBadRequest
 	case ErrCodeServiceUnavailable:
 		return http.StatusServiceUnavailable

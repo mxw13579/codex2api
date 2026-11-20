@@ -14,6 +14,7 @@ import (
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/outputguard"
 	"github.com/gin-gonic/gin"
@@ -146,7 +147,7 @@ func (h *Handler) GeminiModelsAction(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request body too large", api.ErrorTypeInvalidRequest))
 		return
 	}
-	if !gjson.ValidBytes(rawBody) {
+	if !jsondepth.ValidBytes(rawBody) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Invalid JSON in request body", api.ErrorTypeInvalidRequest))
 		return
 	}

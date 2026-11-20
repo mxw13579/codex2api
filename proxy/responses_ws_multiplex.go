@@ -228,6 +228,12 @@ func (h *Handler) runResponsesWSMultiplex(c *gin.Context, conn *websocket.Conn, 
 				_ = writeResponsesWSError(conn, api.NewAPIError(api.ErrCodeInvalidRequest, "unsupported websocket message type", api.ErrorTypeInvalidRequest))
 				return
 			}
+			if message.tooDeep {
+				// 与“不是 JSON 对象”的非法帧相同：回错误帧并保留连接。
+				message.releaseQueueBudget()
+				_ = writeResponsesWSError(conn, api.NewJSONNestingTooDeepError())
+				continue
+			}
 			eventType, eventErr := responsesWSClientEventType(message.payload)
 			if eventErr != nil {
 				message.releaseQueueBudget()

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -72,10 +73,10 @@ func buildCodexTelemetryProfile(client codexTelemetryClient, input codexTelemetr
 // codexTurnMetadata 读取请求体或请求头中的 turn metadata。
 func codexTurnMetadata(body []byte, headers map[string][]string) gjson.Result {
 	raw := gjson.GetBytes(body, "client_metadata.x-codex-turn-metadata")
-	if raw.Type == gjson.String && gjson.Valid(raw.String()) {
+	if raw.Type == gjson.String && jsondepth.Valid(raw.String()) {
 		return gjson.Parse(raw.String())
 	}
-	if value := strings.TrimSpace(firstHeaderValue(headers, codexTurnMetadataHeader)); gjson.Valid(value) {
+	if value := strings.TrimSpace(firstHeaderValue(headers, codexTurnMetadataHeader)); jsondepth.Valid(value) {
 		return gjson.Parse(value)
 	}
 	return gjson.Result{}

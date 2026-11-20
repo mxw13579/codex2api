@@ -14,6 +14,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -674,7 +675,7 @@ func (h *Handler) forwardGrokImagesRequest(c *gin.Context, inboundEndpoint, imag
 		out, readErr := readAllWithContinuousRetryKeepalive(c.Request.Context(), io.LimitReader(resp.Body, grokImagesResponseLimit))
 		resp.Body.Close()
 		imageCount := int(gjson.GetBytes(out, "data.#").Int())
-		if readErr != nil || !gjson.ValidBytes(out) || imageCount <= 0 {
+		if readErr != nil || !jsondepth.ValidBytes(out) || imageCount <= 0 {
 			// 上游 200 但没有任何产物:按可疑失败换号重试。
 			h.store.Release(account)
 			if c.Request.Context().Err() != nil {
