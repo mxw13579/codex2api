@@ -24,6 +24,12 @@ import (
 // 返回 (pinged, failed)：成功 Ping 数 与 失败数（失败的空闲连接会被 SendHeartbeat
 // 关闭并移除；快照后恰好被请求取走的连接只摘池，不关 socket，见 issue #436）。
 func (m *Manager) PingIdleConnections() (pinged int, failed int) {
+	return m.pingIdleConnections(context.Background())
+}
+
+// pingIdleConnections 与 PingIdleConnections 相同，但在 ctx 取消后不再开始新的 Ping：
+// 停止保活时只需让本轮尽快结束，不必把剩余空闲连接逐条 Ping 完。
+func (m *Manager) pingIdleConnections(ctx context.Context) (pinged int, failed int) {
 	if m == nil || weakNetworkModeEnabled() {
 		return 0, 0
 	}
@@ -55,6 +61,9 @@ func (m *Manager) PingIdleConnections() (pinged int, failed int) {
 	})
 
 	for _, wc := range idle {
+		if ctx.Err() != nil {
+			break
+		}
 		if err := ping(wc); err != nil {
 			failed++
 			continue
@@ -102,12 +111,13 @@ func (t *KeepaliveTask) Start() {
 	log.Printf("[WS-Keepalive] 保活常驻任务已启动（实际是否发送 Ping 取决于运行时开关）")
 }
 
+// keepaliveTickGranularity 固定为较小值，循环内根据配置的 intervalSec 决定是否真正执行，
+// 这样间隔配置热更新无需重启 ticker。仅测试会改小。
+var keepaliveTickGranularity = 5 * time.Second
+
 func (t *KeepaliveTask) loop() {
 	defer t.wg.Done()
-	// tick 粒度固定为较小值，循环内根据配置的 intervalSec 决定是否真正执行，
-	// 这样间隔配置热更新无需重启 ticker。
-	const tickGranularity = 5 * time.Second
-	ticker := time.NewTicker(tickGranularity)
+	ticker := time.NewTicker(keepaliveTickGranularity)
 	defer ticker.Stop()
 
 	var lastRun time.Time
@@ -125,7 +135,7 @@ func (t *KeepaliveTask) loop() {
 			}
 			lastRun = now
 			started := time.Now()
-			pinged, failed := t.manager.PingIdleConnections()
+			pinged, failed := t.manager.pingIdleConnections(t.ctx)
 			if pinged > 0 || failed > 0 {
 				log.Printf("[WS-Keepalive] 保活完成: pinged=%d failed=%d elapsed_ms=%d", pinged, failed, time.Since(started).Milliseconds())
 			}
@@ -144,11 +154,34 @@ func (t *KeepaliveTask) intervalSecOrDefault() int {
 	return sec
 }
 
-// Stop 停止常驻任务并等待 goroutine 退出。
-func (t *KeepaliveTask) Stop() {
+// keepaliveStopWait 是 Stop 等待正在进行的那一轮 Ping 结束的上限。
+// 单条 Ping 写超时为 10 秒；停止时不值得等它写完：随后 Manager.Stop 会关闭全部
+// 连接，被阻塞的写会因底层连接关闭而立即返回，后台 goroutine 随之退出。
+const keepaliveStopWait = time.Second
+
+// Stop 停止常驻任务：取消后台循环（不再开始新的 Ping），并最多等待
+// keepaliveStopWait 让正在进行的那一轮结束。返回 true 表示 goroutine 已退出。
+func (t *KeepaliveTask) Stop() bool {
 	if t == nil {
-		return
+		return true
 	}
+	return t.stopWithin(keepaliveStopWait)
+}
+
+func (t *KeepaliveTask) stopWithin(limit time.Duration) bool {
 	t.cancel()
-	t.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		log.Printf("[WS-Keepalive] 停止时仍有 Ping 写阻塞，超过 %s 不再等待，交给连接池关闭连接打断", limit)
+		return false
+	}
 }
