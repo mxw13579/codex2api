@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -54,7 +55,7 @@ func prepareGrokUpstreamBodyWithCompaction(body []byte, preservedCompaction comp
 		return prepareGrokUpstreamBodyWithCompaction(guarded, preservedCompaction, reasoningMenu)
 	}
 	result := grokPreflightResult{Body: body, TurnIndex: 1}
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return result
 	}
 	root := gjson.GetBytes(body, "@this")

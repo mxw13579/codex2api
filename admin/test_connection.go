@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -849,12 +850,14 @@ func extractCompletedOutputText(data []byte) string {
 
 func extractOutputItemText(item gjson.Result) string {
 	var b strings.Builder
-	writeTextFromOutputItem(&b, item)
+	writeTextFromOutputItem(&b, item, 0)
 	return b.String()
 }
 
-func writeTextFromOutputItem(b *strings.Builder, item gjson.Result) {
-	if !item.Exists() {
+// writeTextFromOutputItem 递归读取上游返回的 output 项；depth 超过 JSON 嵌套上限即停止，
+// 防止异常上游用超深嵌套撑爆递归栈（渠道监控会自动探测上游）。
+func writeTextFromOutputItem(b *strings.Builder, item gjson.Result, depth int) {
+	if !item.Exists() || depth > jsondepth.MaxDepth() {
 		return
 	}
 	switch item.Get("type").String() {
@@ -865,7 +868,7 @@ func writeTextFromOutputItem(b *strings.Builder, item gjson.Result) {
 	default:
 		if output := item.Get("output"); output.IsArray() {
 			output.ForEach(func(_, child gjson.Result) bool {
-				writeTextFromOutputItem(b, child)
+				writeTextFromOutputItem(b, child, depth+1)
 				return true
 			})
 		}

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -221,7 +222,7 @@ func buildEnvelopeWithBudget(body []byte, endpoint string, requestedModel string
 	if transport != TransportWebSocket {
 		transport = TransportHTTP
 	}
-	if requestedModel = strings.TrimSpace(requestedModel); requestedModel == "" && gjson.ValidBytes(body) {
+	if requestedModel = strings.TrimSpace(requestedModel); requestedModel == "" && jsondepth.ValidBytes(body) {
 		requestedModel = strings.TrimSpace(gjson.GetBytes(body, "model").String())
 	}
 	envelope := RequestEnvelope{
@@ -236,7 +237,7 @@ func buildEnvelopeWithBudget(body []byte, endpoint string, requestedModel string
 		envelope.AdapterUnclassified = true
 		return envelope
 	}
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return envelope
 	}
 
@@ -849,19 +850,25 @@ func (b *envelopeBuilder) finalize() {
 }
 
 func (b *envelopeBuilder) appendResult(origin SegmentOrigin, role string, result gjson.Result) {
-	if !result.Exists() || result.Type == gjson.Null {
+	b.appendResultDepth(origin, role, result, 0)
+}
+
+// appendResultDepth 递归展开内容块；depth 是相对起点的 JSON 嵌套层数，超过 JSON 嵌套上限
+// 即停止深入。入口已拒绝超深请求体，这里是纵深防御，正常深度内行为不变。
+func (b *envelopeBuilder) appendResultDepth(origin SegmentOrigin, role string, result gjson.Result, depth int) {
+	if !result.Exists() || result.Type == gjson.Null || depth > jsondepth.MaxDepth() {
 		return
 	}
 	switch {
 	case result.IsArray():
 		for _, item := range result.Array() {
-			b.appendResult(origin, role, item)
+			b.appendResultDepth(origin, role, item, depth+1)
 		}
 	case result.IsObject():
 		blockType := strings.ToLower(strings.TrimSpace(result.Get("type").String()))
 		switch blockType {
 		case "tool_result", "function_call_output", "computer_call_output", "mcp_call_output":
-			b.appendResult(OriginToolOutput, "tool", firstExistingResult(result, "output", "content", "text"))
+			b.appendResultDepth(OriginToolOutput, "tool", firstExistingResult(result, "output", "content", "text"), depth+1)
 		case "tool_use", "function_call", "computer_call", "mcp_call":
 			b.appendToolArguments(result, role)
 		case "encrypted_content":
@@ -881,10 +888,10 @@ func (b *envelopeBuilder) appendResult(origin SegmentOrigin, role string, result
 				b.append(origin, role, text.String())
 			}
 			if content := result.Get("content"); content.Exists() {
-				b.appendResult(origin, role, content)
+				b.appendResultDepth(origin, role, content, depth+1)
 			}
 		}
-		b.appendAttachmentReferences(result, role)
+		b.appendAttachmentReferencesDepth(result, role, depth)
 	case result.Type == gjson.String:
 		b.append(origin, role, result.String())
 	}
@@ -1303,12 +1310,17 @@ func (b *envelopeBuilder) appendToolArguments(result gjson.Result, role string) 
 }
 
 func (b *envelopeBuilder) appendAttachmentReferences(result gjson.Result, role string) {
-	if !result.Exists() || result.Type == gjson.Null {
+	b.appendAttachmentReferencesDepth(result, role, 0)
+}
+
+// appendAttachmentReferencesDepth 同 appendResultDepth：超过 JSON 嵌套上限即停止深入。
+func (b *envelopeBuilder) appendAttachmentReferencesDepth(result gjson.Result, role string, depth int) {
+	if !result.Exists() || result.Type == gjson.Null || depth > jsondepth.MaxDepth() {
 		return
 	}
 	if result.IsArray() {
 		for _, item := range result.Array() {
-			b.appendAttachmentReferences(item, role)
+			b.appendAttachmentReferencesDepth(item, role, depth+1)
 		}
 		return
 	}
@@ -1325,10 +1337,10 @@ func (b *envelopeBuilder) appendAttachmentReferences(result gjson.Result, role s
 			if value.Type == gjson.String {
 				b.append(OriginAttachmentRefs, role, value.String())
 			} else if value.IsObject() {
-				b.appendAttachmentReferences(value, role)
+				b.appendAttachmentReferencesDepth(value, role, depth+1)
 			}
 		case "attachments", "source", "images", "input_images", "mask":
-			b.appendAttachmentReferences(value, role)
+			b.appendAttachmentReferencesDepth(value, role, depth+1)
 		}
 		return true
 	})

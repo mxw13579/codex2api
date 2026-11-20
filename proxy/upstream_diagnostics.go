@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/security"
 	"github.com/tidwall/gjson"
 )
@@ -97,7 +98,7 @@ func summarizeUpstreamRequest(body []byte) upstreamRequestSummary {
 		s.Omitted = "too_large"
 		return s
 	}
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		s.Omitted = "not_json"
 		return s
 	}
@@ -273,7 +274,7 @@ func (b *upstreamDiagnosticBody) finish(closed bool) {
 	b.diagnostic.BodyFormat = "non_json"
 	if len(b.prefix) == 0 {
 		b.diagnostic.BodyFormat = "empty"
-	} else if gjson.ValidBytes(b.prefix) {
+	} else if jsondepth.ValidBytes(b.prefix) {
 		b.diagnostic.BodyFormat = "json"
 	}
 	fields := extractUpstreamErrorFields(b.prefix)

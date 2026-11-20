@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -21,7 +22,7 @@ func NormalizeResponsesTerminalEvent(payload []byte) []byte {
 	default:
 		return payload
 	}
-	if !gjson.ValidBytes(payload) {
+	if !jsondepth.ValidBytes(payload) {
 		return invalidResponsesTerminalEvent()
 	}
 

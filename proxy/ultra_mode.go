@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 
@@ -90,7 +91,7 @@ func ultraModeTurnKey(headers http.Header, body []byte) string {
 	if raw == "" && headers != nil {
 		raw = strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata"))
 	}
-	if raw == "" || !gjson.Valid(raw) {
+	if raw == "" || !jsondepth.Valid(raw) {
 		return ""
 	}
 	return strings.TrimSpace(gjson.Get(raw, "turn_id").String())

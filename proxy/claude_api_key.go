@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -72,7 +73,7 @@ func executeClaudeAPIKeyMessages(ctx context.Context, account *auth.Account, bod
 	if err != nil {
 		return nil, ErrBadRequest(err.Error())
 	}
-	if !gjson.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
+	if !jsondepth.ValidBytes(body) || !gjson.ParseBytes(body).IsObject() {
 		return nil, ErrBadRequest("Claude request body must be a JSON object")
 	}
 	if proxyOverride != "" {

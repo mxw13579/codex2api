@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/codex2api/api"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/tidwall/gjson"
 )
@@ -14,7 +15,7 @@ import (
 // first duplicate object member while encoding/json maps select the last one.
 // Scan keys only, without re-encoding values or changing native relay numbers.
 func responsesHTTPContextEnvelopeError(raw []byte) *api.APIError {
-	if !gjson.ValidBytes(raw) {
+	if !jsondepth.ValidBytes(raw) {
 		return nil // The normal request validator owns malformed JSON errors.
 	}
 	root := jsonbody.View(raw)

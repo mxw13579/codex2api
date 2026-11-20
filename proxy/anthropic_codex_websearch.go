@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -1230,7 +1231,7 @@ func (b *anthropicCodexWebSearch) run(ctx context.Context, resp *http.Response, 
 			failed := []byte(`{"type":"response.failed","response":{"object":"response","status":"failed"}}`)
 			failed, _ = sjson.SetBytes(failed, "response.status_code", resp.StatusCode)
 			upstreamError := gjson.GetBytes(raw, "error")
-			if gjson.ValidBytes(raw) && upstreamError.IsObject() {
+			if jsondepth.ValidBytes(raw) && upstreamError.IsObject() {
 				failed, _ = sjson.SetRawBytes(failed, "response.error", []byte(upstreamError.Raw))
 			} else {
 				failed, _ = sjson.SetBytes(failed, "response.error.message", usageLogErrorMessage(resp.StatusCode, raw))
@@ -1260,7 +1261,7 @@ func (b *anthropicCodexWebSearch) executeSearch(ctx context.Context, call gjson.
 	arguments := call.Get("arguments").String()
 	queryValue := gjson.Get(arguments, "query")
 	query := strings.TrimSpace(queryValue.String())
-	if !gjson.Valid(arguments) || queryValue.Type != gjson.String || len(arguments) > 64<<10 {
+	if !jsondepth.Valid(arguments) || queryValue.Type != gjson.String || len(arguments) > 64<<10 {
 		query = ""
 	}
 	id := call.Get("id").String()

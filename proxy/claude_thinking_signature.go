@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -45,7 +46,7 @@ func stripClaudeThinkingBlocks(body []byte) ([]byte, int) {
 
 // filterClaudeThinkingBlocks 对每条 content 为数组的 assistant 消息按 keep 过滤块。
 func filterClaudeThinkingBlocks(body []byte, keep func(gjson.Result) bool) ([]byte, int) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body, 0
 	}
 	messages := gjson.GetBytes(body, "messages")

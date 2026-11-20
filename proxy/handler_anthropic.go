@@ -13,6 +13,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/outputguard"
 	"github.com/gin-gonic/gin"
@@ -572,7 +573,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 
 	// 验证 JSON
-	if !gjson.ValidBytes(rawBody) {
+	if !jsondepth.ValidBytes(rawBody) {
 		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "Invalid JSON in request body")
 		return
 	}

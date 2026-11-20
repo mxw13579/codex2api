@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -17,7 +18,7 @@ func normalizeUpstreamResponsesTerminalEvent(event string, data []byte) (string,
 		return event, data
 	}
 	if gjson.GetBytes(data, "type").String() == "" {
-		if !gjson.ValidBytes(data) {
+		if !jsondepth.ValidBytes(data) {
 			return "response.failed", invalidResponsesTerminalEvent()
 		}
 		updated, err := sjson.SetBytes(data, "type", eventType)

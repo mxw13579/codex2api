@@ -40,6 +40,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -592,7 +593,7 @@ func claudeInvisibleRune(r rune) bool {
 // 请求,而 macOS 文件系统用的是 NFD——归一会把 NFD 路径改写成预组合形态,模型
 // 照抄回来的路径就找不到那个文件了。净化只做纯删除,不改写任何可见文字。
 func sanitizeClaudeRequestText(body []byte) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body
 	}
 	text := string(body)
@@ -610,7 +611,7 @@ func sanitizeClaudeRequestText(body []byte) []byte {
 		return body
 	}
 	out := []byte(b.String())
-	if !gjson.ValidBytes(out) {
+	if !jsondepth.ValidBytes(out) {
 		return body
 	}
 	return out
@@ -621,7 +622,7 @@ func sanitizeClaudeRequestText(body []byte) []byte {
 // inject the trusted Claude Code system preamble; callers may do that after
 // Prompt Filter has captured the user-visible request text.
 func normalizeClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig) ([]byte, error) {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body, nil
 	}
 	cfg = auth.NormalizeClaudeSecurityConfig(cfg)
@@ -779,7 +780,7 @@ func prepareClaudeRequestBody(body []byte, cfg auth.ClaudeSecurityConfig, id cla
 // metadata.user_id = JSON 字符串 {"device_id","account_uuid","session_id"}。
 // 已有 Claude 身份对象按选中账号和唯一会话更新，保留其余字段；业务 user_id 保留。
 func injectClaudeMetadataUserID(body []byte, id claudeBodyIdentity) []byte {
-	if len(body) == 0 || !gjson.ValidBytes(body) {
+	if len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body
 	}
 	identity := claudeMetadataIdentity(body)
@@ -876,7 +877,7 @@ func buildClaudeBetaHeader(incoming http.Header, cfg auth.ClaudeSecurityConfig, 
 		ordered = append(ordered, v)
 	}
 
-	if body != nil && gjson.ValidBytes(body) {
+	if body != nil && jsondepth.ValidBytes(body) {
 		// 核心标记(haiku 不发 claude-code beta,对齐 CLI _re() 行为)。
 		if !strings.Contains(strings.ToLower(gjson.GetBytes(body, "model").String()), "haiku") {
 			add(auth.ClaudeCodeBeta, false)
@@ -1060,7 +1061,7 @@ func alignClaudeBillingBlock(body []byte, userAgent string) []byte {
 // 兼容三种入站形态:无 system / system 为字符串 / system 为块数组;已存在的块
 // 不重复注入。
 func injectClaudeCodeSystemPrompt(body []byte) []byte {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return body
 	}
 	system := gjson.GetBytes(body, "system")

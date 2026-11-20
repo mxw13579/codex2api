@@ -6,6 +6,7 @@ package jsonbody
 import (
 	"unsafe"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -45,7 +46,7 @@ func DeletePaths(body []byte, paths ...string) []byte {
 	}
 	// TopLevel uses gjson's permissive parser. Do not trust negative presence
 	// results on malformed input, where it may differ from per-path lookups.
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return deletePathsSequential(body, paths)
 	}
 	values, ok := TopLevel(body, paths...)

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -473,6 +474,10 @@ func payloadValueEquals(result gjson.Result, want any) bool {
 	if !result.Exists() {
 		return want == nil && result.Type == gjson.Null
 	}
+	if jsondepth.TooDeepString(result.Raw) {
+		// Value 是无深度上限的递归；过深的值不可能等于配置值，直接按不匹配处理。
+		return false
+	}
 	return reflect.DeepEqual(result.Value(), want)
 }
 
@@ -481,7 +486,7 @@ func payloadValueEquals(result gjson.Result, want any) bool {
 // 改写失败的单条动作跳过，不影响其余规则。
 func ApplyPayloadRulesToBody(body []byte, model string, headers http.Header, identity *PayloadRuleIdentity) []byte {
 	rs := CurrentPayloadRules()
-	if rs.IsEmpty() || len(body) == 0 || !gjson.ValidBytes(body) {
+	if rs.IsEmpty() || len(body) == 0 || !jsondepth.ValidBytes(body) {
 		return body
 	}
 	out := body

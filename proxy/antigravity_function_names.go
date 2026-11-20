@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -110,7 +111,7 @@ func antigravityRestoreGeminiFunctionName(reverse map[string]string, sanitized s
 }
 
 func antigravityFunctionNamesFromGeminiRequest(rawJSON []byte) []string {
-	if len(rawJSON) == 0 || !gjson.ValidBytes(rawJSON) {
+	if len(rawJSON) == 0 || !jsondepth.ValidBytes(rawJSON) {
 		return nil
 	}
 	tools := gjson.GetBytes(rawJSON, "tools")

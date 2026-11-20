@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -279,7 +280,7 @@ func (h *Handler) probeUsageViaClaudeMessages(ctx context.Context, account *auth
 	// Anthropic normally uses a non-2xx status for errors, but a proxy or
 	// compatibility layer may wrap a native error in HTTP 200. Do not mark
 	// such a response as a successful sample.
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return fmt.Errorf("Claude Messages probe returned an invalid JSON payload")
 	}
 	typeName := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "type").String()))

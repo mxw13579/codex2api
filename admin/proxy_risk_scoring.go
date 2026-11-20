@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
@@ -356,7 +357,7 @@ func (client *proxyRiskScoringClient) checkIP(ctx context.Context, ip string) (d
 }
 
 func parseProxyRiskScoringResponse(body []byte, latencyMS int) (database.ProxyRiskScoreSnapshot, *proxyRiskCredits, error) {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return database.ProxyRiskScoreSnapshot{Status: database.ProxyRiskScoringStatusError(), LatencyMS: latencyMS, Error: "评分服务返回了无效 JSON"}, nil, errors.New("评分服务返回了无效 JSON")
 	}
 	root := gjson.ParseBytes(body)

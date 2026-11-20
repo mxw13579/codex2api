@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -297,7 +298,7 @@ func parseGrokCatalogItem(item gjson.Result) (GrokModelCatalogItem, bool) {
 // It retains hidden/unsupported entries; visibility is an account-auth decision
 // performed separately by VisibleGrokModelIDs.
 func ParseGrokModelCatalog(body []byte, _ bool) ([]GrokModelCatalogItem, error) {
-	if !gjson.ValidBytes(body) {
+	if !jsondepth.ValidBytes(body) {
 		return nil, fmt.Errorf("Grok 模型目录不是有效 JSON")
 	}
 	root := gjson.ParseBytes(body)

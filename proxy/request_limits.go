@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 
@@ -16,7 +17,7 @@ import (
 // encoding/json matches struct fields case-insensitively. Both parsers must
 // agree on the single canonical field before it is counted or decoded.
 func rejectDuplicateJSONField(c *gin.Context, rawBody []byte, field string) bool {
-	if c == nil || len(rawBody) == 0 || !gjson.ValidBytes(rawBody) {
+	if c == nil || len(rawBody) == 0 || !jsondepth.ValidBytes(rawBody) {
 		return false
 	}
 	root := jsonbody.View(rawBody)

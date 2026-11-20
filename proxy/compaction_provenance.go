@@ -17,6 +17,7 @@ import (
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -230,7 +231,7 @@ func gjsonResultHasEncryptedCompaction(result gjson.Result) bool {
 }
 
 func compactionEncryptedContentsFromPayload(payload []byte) []string {
-	if !compactionPayloadMayContainEncryptedState(payload) || !gjson.ValidBytes(payload) {
+	if !compactionPayloadMayContainEncryptedState(payload) || !jsondepth.ValidBytes(payload) {
 		return nil
 	}
 	root := gjson.ParseBytes(payload)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/tidwall/gjson"
 )
 
@@ -222,7 +223,7 @@ func codexTelemetryEnabled() bool {
 
 // codexTelemetryEligible 判断请求是否应模拟官方 Codex 遥测。
 func codexTelemetryEligible(body []byte, headers http.Header) bool {
-	if !codexTelemetryEnabled() || headers == nil || !gjson.ValidBytes(body) {
+	if !codexTelemetryEnabled() || headers == nil || !jsondepth.ValidBytes(body) {
 		return false
 	}
 	if !strings.HasPrefix(CodexBaseURL, "https://chatgpt.com/backend-api/codex") {

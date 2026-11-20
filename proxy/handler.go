@@ -28,6 +28,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/jsondepth"
 	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/outputguard"
@@ -1139,7 +1140,7 @@ func mergeGrokNativeUsage(current, next *UsageInfo) *UsageInfo {
 }
 
 func protocolNonStreamFailure(protocol GrokProtocol, payload []byte) (streamOutcome, bool) {
-	if len(bytes.TrimSpace(payload)) == 0 || !gjson.ValidBytes(payload) {
+	if len(bytes.TrimSpace(payload)) == 0 || !jsondepth.ValidBytes(payload) {
 		return streamOutcome{
 			logStatusCode: logStatusUpstreamStreamBreak, failureKind: "transport",
 			failureMessage: "Upstream returned an invalid JSON response", failurePayload: append([]byte(nil), payload...), penalize: true,
@@ -2077,7 +2078,7 @@ func requestBodyCompactionMeta(body []byte) requestCompactionMeta {
 
 func turnMetadataIndicatesCompaction(raw string) bool {
 	raw = strings.TrimSpace(raw)
-	if raw == "" || !gjson.Valid(raw) {
+	if raw == "" || !jsondepth.Valid(raw) {
 		return false
 	}
 	root := gjson.Parse(raw)
@@ -2787,7 +2788,7 @@ func capacityShedHandlingDisabled() bool {
 // （server_is_overloaded / slow_down）。复用 sanitizeCapacityShedEventForClient
 // 的三条 code path，供分类与失败上报两侧共用。
 func isCapacityShedPayload(payload []byte) bool {
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !jsondepth.ValidBytes(payload) {
 		return false
 	}
 	for _, path := range []string{"error.code", "response.error.code", "response.status_details.error.code"} {
@@ -2811,7 +2812,7 @@ func sanitizeCapacityShedEventForClient(eventType string, payload []byte) []byte
 	default:
 		return payload
 	}
-	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+	if len(payload) == 0 || !jsondepth.ValidBytes(payload) {
 		return payload
 	}
 	updated := payload
@@ -3082,7 +3083,7 @@ func imageGenerationOutputKey(item gjson.Result) string {
 }
 
 func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
-	if len(data) == 0 || !gjson.ValidBytes(data) {
+	if len(data) == 0 || !jsondepth.ValidBytes(data) {
 		return nil, false
 	}
 	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
@@ -3127,7 +3128,7 @@ func responseOutputItemDoneKey(item gjson.Result) string {
 }
 
 func extractResponseOutputItemDone(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
-	if len(data) == 0 || !gjson.ValidBytes(data) {
+	if len(data) == 0 || !jsondepth.ValidBytes(data) {
 		return nil, false
 	}
 	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
@@ -3280,7 +3281,7 @@ func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMe
 	}
 	outputs := make([]json.RawMessage, 0, len(outputItems))
 	for _, rawItem := range outputItems {
-		if len(rawItem) == 0 || !gjson.ValidBytes(rawItem) {
+		if len(rawItem) == 0 || !jsondepth.ValidBytes(rawItem) {
 			continue
 		}
 		outputs = append(outputs, rawItem)
@@ -3291,7 +3292,7 @@ func restoreMissingResponseOutputs(responseJSON []byte, outputItems []json.RawMe
 	if terminalCount >= int64(len(outputs)) {
 		return responseJSON
 	}
-	if firstNonSpace(responseJSON) != '{' || !gjson.ValidBytes(responseJSON) {
+	if firstNonSpace(responseJSON) != '{' || !jsondepth.ValidBytes(responseJSON) {
 		return responseJSON
 	}
 	encoded, err := json.Marshal(outputs)
@@ -3357,7 +3358,7 @@ func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.
 	}
 
 	for _, rawImage := range imageOutputs {
-		if len(rawImage) == 0 || !gjson.ValidBytes(rawImage) {
+		if len(rawImage) == 0 || !jsondepth.ValidBytes(rawImage) {
 			continue
 		}
 		item := gjson.ParseBytes(rawImage)
@@ -5595,7 +5596,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if !isStream && nonStreamFailure != nil && readErr == nil {
 				status := safeGrokNativeHTTPStatus(outcome.logStatusCode)
 				if !writeCommittedResponsesRetryError(c, outcome.failureMessage) {
-					if len(nonStreamResponseBody) > 0 && gjson.ValidBytes(nonStreamResponseBody) {
+					if len(nonStreamResponseBody) > 0 && jsondepth.ValidBytes(nonStreamResponseBody) {
 						c.Data(status, nonStreamContentType, nonStreamResponseBody)
 					} else {
 						c.JSON(status, gin.H{
